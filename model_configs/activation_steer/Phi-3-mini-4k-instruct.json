@@ -1,0 +1,9 @@
+{
+    "steering": {
+        "method":"adjust_rs",
+        "coefficient": 1,
+        "optimal_layer": 8,
+        "vector_path": "/u/cyko1/vllm_hooks/steering_vectors/phi3_format.pt",
+        "apply_at_all_positions": true
+    }
+}
