@@ -1,0 +1,4 @@
+vllm>=0.5
+torch>=2.0
+numpy>=1.24
+blake3

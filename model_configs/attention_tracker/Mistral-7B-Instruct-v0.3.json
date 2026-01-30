@@ -1,0 +1,15 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "mistral-7b-0.3",
+        "model_id": "mistralai/Mistral-7B-Instruct-v0.3"
+    },
+    "params": {
+        "temperature": 0.1,
+        "max_output_tokens": 32,
+        "important_heads": [[4, 16], [5, 20], [5, 21], [7, 24], [7, 25], [7, 26], [7, 27], [8, 15], [8, 23], [8, 24], [9, 5], [9, 7], [9, 18], [10, 3], [11, 18], [11, 28], [12, 17], [12, 20], [13, 10], [13, 23], [14, 9], [14, 20], [14, 27], [15, 4], [15, 28]]
+    },
+    "hookq":{
+        "hookq_mode": "last_token"
+    }
+}
