@@ -12,6 +12,7 @@ class HookLLM:
         self,
         model: str,
         worker_name: str = None,
+        backend: Optional[str] = None,
         analyzer_name: str = None,
         config_file: str = None,
         download_dir: str = '~/.cache',
@@ -26,6 +27,7 @@ class HookLLM:
         self.analyzer_name = analyzer_name
         self.enable_hook = enable_hook
         self.enforce_eager = enforce_eager
+        self.backend = self._resolve_backend(backend, vllm_kwargs)
 
         if hook_dir is not None:
             HOOK_DIR = hook_dir
@@ -50,8 +52,17 @@ class HookLLM:
             import vllm.plugins
             from vllm_hook_plugins import PluginRegistry
             vllm.plugins.load_general_plugins()
-            
-            worker = PluginRegistry.get_worker(worker_name).path
+            self.worker_name = self._resolve_worker_name(
+                PluginRegistry, worker_name, self.backend
+            )
+            worker_entry = PluginRegistry.get_worker(self.worker_name)
+            if worker_entry is None:
+                available = ", ".join(sorted(PluginRegistry.list_workers()))
+                raise ValueError(
+                    f"Worker '{self.worker_name}' is not registered. "
+                    f"Available workers: {available}"
+                )
+            worker = worker_entry.path
 
         self.llm = LLM(
             model=model,
@@ -68,6 +79,42 @@ class HookLLM:
         if analyzer_name:
             self.analyzer = PluginRegistry.get_analyzer(analyzer_name).analyzer
             self.analyzer = self.analyzer(self._hook_dir, self.layer_to_heads)
+
+    @staticmethod
+    def _resolve_backend(
+        backend: Optional[str], vllm_kwargs: Dict
+    ) -> str:
+        if backend:
+            return backend.lower()
+
+        device = vllm_kwargs.get("device")
+        if isinstance(device, str) and device:
+            return device.lower()
+
+        env_backend = os.environ.get("VLLM_HOOK_BACKEND")
+        if env_backend:
+            return env_backend.lower()
+
+        return "default"
+
+    @staticmethod
+    def _resolve_worker_name(
+        PluginRegistry, worker_name: str, backend: str
+    ) -> str:
+        candidates = []
+        if backend not in {"", "default", "auto", None}:
+            candidates.append(f"{worker_name}_{backend}")
+        candidates.append(worker_name)
+
+        for candidate in candidates:
+            if PluginRegistry.get_worker(candidate) is not None:
+                return candidate
+
+        available = ", ".join(sorted(PluginRegistry.list_workers()))
+        raise ValueError(
+            f"No worker registered for '{worker_name}' with backend '{backend}'. "
+            f"Tried: {', '.join(candidates)}. Available workers: {available}"
+        )
 
     
     def load_config(self, config_file: str):
@@ -110,9 +157,9 @@ class HookLLM:
             prompts = [prompts]
 
         if hook:
-            if "probe" in self.worker_name:
+            if self.worker_name and "probe" in self.worker_name:
                 return self.generate_with_encode_hook(prompts, sampling_params, cleanup, **kwargs)
-            elif "steer" in self.worker_name:
+            elif self.worker_name and "steer" in self.worker_name:
                 return self.generate_with_decode_hook(prompts, sampling_params, cleanup, **kwargs)
 
         else:
