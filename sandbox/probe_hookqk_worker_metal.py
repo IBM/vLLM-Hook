@@ -20,7 +20,7 @@ import mlx.nn as nn
 # - q_proj returns full hidden width
 # - k_proj / v_proj return KV width
 PROJ_PATTERNS = [
-    re.compile(r"^model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj)$"),
+    re.compile(r"^model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj)$"),
 ]
 
 

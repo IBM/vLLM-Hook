@@ -30,6 +30,9 @@ class HookLLM:
         self.enable_hook = enable_hook
         self.enforce_eager = enforce_eager
         self.backend = self._resolve_backend(backend, vllm_kwargs)
+        self._vllm_kwargs = dict(vllm_kwargs)
+        self._plugin_registry = None
+        self._last_generate_used_hooks = False
 
         if hook_dir is not None:
             HOOK_DIR = hook_dir
@@ -47,39 +50,36 @@ class HookLLM:
         self.layer_to_heads = {}
         if config_file:
             self.load_config(config_file)
+
+        if self.backend == "metal":
+            os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+            os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0")
         
 
-        worker = None
         if worker_name:
             import vllm.plugins
             from vllm_hook_plugins import PluginRegistry
             vllm.plugins.load_general_plugins()
+            self._plugin_registry = PluginRegistry
             self.worker_name = self._resolve_worker_name(
                 PluginRegistry, worker_name, self.backend
             )
-            worker_entry = PluginRegistry.get_worker(self.worker_name)
-            if worker_entry is None:
-                available = ", ".join(sorted(PluginRegistry.list_workers()))
-                raise ValueError(
-                    f"Worker '{self.worker_name}' is not registered. "
-                    f"Available workers: {available}"
-                )
-            worker = worker_entry.path
-
-        self.llm = LLM(
-            model=model,
-            download_dir=download_dir,
-            worker_cls=worker,
-            enforce_eager = enforce_eager,
-            **vllm_kwargs
-        )
+        self._resolved_download_dir = download_dir
+        self.llm = self._build_llm(use_hook_worker=False)
             
         self.tokenizer = self.llm.get_tokenizer()
         self.llm_engine = self.llm.llm_engine
 
         self.analyzer = None
         if analyzer_name:
-            self.analyzer = PluginRegistry.get_analyzer(analyzer_name).analyzer
+            if self._plugin_registry is None:
+                import vllm.plugins
+                from vllm_hook_plugins import PluginRegistry
+                vllm.plugins.load_general_plugins()
+                self._plugin_registry = PluginRegistry
+            self.analyzer = self._plugin_registry.get_analyzer(analyzer_name).analyzer
             self.analyzer = self.analyzer(self._hook_dir, self.layer_to_heads)
 
     @staticmethod
@@ -125,6 +125,43 @@ class HookLLM:
             f"Tried: {', '.join(candidates)}. Available workers: {available}"
         )
 
+    def _should_use_hook_worker(self) -> bool:
+        if not self.worker_name:
+            return False
+        if self.backend == "metal":
+            return os.environ.get("VLLM_DISABLE_METAL_HOOKS", "0") != "1"
+        return True
+
+    def _build_llm(self, use_hook_worker: bool) -> LLM:
+        worker = None
+        if use_hook_worker and self._should_use_hook_worker():
+            worker_entry = self._plugin_registry.get_worker(self.worker_name)
+            if worker_entry is None:
+                available = ", ".join(sorted(self._plugin_registry.list_workers()))
+                raise ValueError(
+                    f"Worker '{self.worker_name}' is not registered. "
+                    f"Available workers: {available}"
+                )
+            worker = worker_entry.path
+
+        llm_kwargs = dict(
+            model=self.model_name,
+            download_dir=self._resolved_download_dir,
+            enforce_eager=self.enforce_eager,
+            **self._vllm_kwargs,
+        )
+        if worker is not None:
+            llm_kwargs["worker_cls"] = worker
+
+        return LLM(**llm_kwargs)
+
+    def _dispose_llm(self, llm: Optional[LLM]) -> None:
+        if llm is None:
+            return
+        engine = getattr(llm, "llm_engine", None)
+        if engine is not None and hasattr(engine, "shutdown"):
+            engine.shutdown()
+
     
     def load_config(self, config_file: str):
         with open(config_file, 'r') as f:
@@ -165,48 +202,59 @@ class HookLLM:
         if not isinstance(prompts, list):
             prompts = [prompts]
 
+        if hook and not self._should_use_hook_worker():
+            self._last_generate_used_hooks = False
+            if sampling_params is None:
+                sampling_params = SamplingParams(**kwargs)
+            return self.llm.generate(prompts, sampling_params)
+
         if hook:
+            self._last_generate_used_hooks = True
             if self.worker_name and "probe" in self.worker_name:
                 return self.generate_with_encode_hook(prompts, sampling_params, cleanup, **kwargs)
             elif self.worker_name and "steer" in self.worker_name:
                 return self.generate_with_decode_hook(prompts, sampling_params, cleanup, **kwargs)
 
         else:
+            self._last_generate_used_hooks = False
             if sampling_params is None:
                 sampling_params = SamplingParams(**kwargs)
             return self.llm.generate(prompts, sampling_params)
     
     def generate_with_encode_hook(self, prompts, sampling_params, cleanup, **kwargs):
+        hook_llm = None
+        try:
+            self._setup_hooks(cleanup)
 
-        self._setup_hooks(cleanup)
-        
-        # prefill with hooks
-        prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
-        self.llm.generate(prompts, prefill_params)
-        
-        self._cleanup_hooks()
-        output = None
-        # generation without hooks
+            # On Metal, keep the hooked prefill isolated from the normal engine.
+            hook_llm = self._build_llm(use_hook_worker=True)
+            prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
+            hook_llm.generate(prompts, prefill_params)
+        finally:
+            self._cleanup_hooks()
+            self._dispose_llm(hook_llm)
+
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
-        output = self.llm.generate(prompts, sampling_params)
-        
-        return output
+        return self.llm.generate(prompts, sampling_params)
     
     def generate_with_decode_hook(self, prompts, sampling_params, cleanup, **kwargs):
         
         # prefill without hooks
         prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
         self.llm.generate(prompts, prefill_params)
-        
-        self._setup_hooks(cleanup)
-        
-        # generation with hooks
-        if sampling_params is None:
-            sampling_params = SamplingParams(**kwargs)
-        output = self.llm.generate(prompts, sampling_params)
-    
-        self._cleanup_hooks()
+
+        hook_llm = None
+        try:
+            self._setup_hooks(cleanup)
+            hook_llm = self._build_llm(use_hook_worker=True)
+
+            if sampling_params is None:
+                sampling_params = SamplingParams(**kwargs)
+            output = hook_llm.generate(prompts, sampling_params)
+        finally:
+            self._cleanup_hooks()
+            self._dispose_llm(hook_llm)
 
         return output
     
@@ -218,6 +266,12 @@ class HookLLM:
         if self.analyzer is None:
             print("No analyzer configured")
             return None
+        if not self._last_generate_used_hooks:
+            raise RuntimeError(
+                "No hook artifacts are available for analysis. "
+                "Hook workers were disabled for the last generate call; "
+                "unset VLLM_DISABLE_METAL_HOOKS or rerun with hooks enabled."
+            )
         
         return self.analyzer.analyze(analyzer_spec)
     

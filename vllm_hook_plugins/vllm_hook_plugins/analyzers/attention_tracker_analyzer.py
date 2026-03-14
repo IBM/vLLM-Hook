@@ -43,7 +43,9 @@ class AttntrackerAnalyzer:
             important_head_indices = self.layer_to_heads[layer_num]
             
             for i in range(bs):
-                q_last = qk_data['q'][i]  # [4096]
+                q_last = qk_data['q'][i]
+                if q_last.ndim == 2:
+                    q_last = q_last[-1]
                 k_all = qk_data['k_all'][i]    # [seq_len, 1024]
                 
                 seq_len = k_all.shape[0]
@@ -87,7 +89,7 @@ class AttntrackerAnalyzer:
                 attention_tensor = layer_data['attention']  # [num_heads, seq_len]
                 
                 for i, _ in enumerate(head_indices):
-                    head_attention = attention_tensor[i, :].numpy()  # [seq_len]
+                    head_attention = attention_tensor[i, :].float().numpy()  # [seq_len]
                     
                     # Get instruction and data attention
                     inst_attn = head_attention[input_range[0][0]:input_range[0][1]]
