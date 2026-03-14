@@ -28,9 +28,9 @@ max_debug = 3
 hook_count = 0
 
 for name, module in model.named_modules():
-    #Only hook the MLP itself. This prevents trying to hook its children
+    #Only hook the self attention module itself. This prevents trying to hook its children
     #which would fail because we've already wrapped the parent
-    if name.endswith(".mlp") and "layers" in name: 
+    if name.endswith(".self_attn") and "layers" in name: 
         parts = name.split(".")
         parent = model
         
@@ -59,6 +59,60 @@ for name, module in model.named_modules():
         
 print(f"\nRegistration complete: wrapped {hook_count} modules")
 print("Running inference...")
+
+# House analogy inspection:
+# - address: where the model looks up a layer
+# - outer house: the wrapper currently living at that address
+# - inner house: the original layer stored inside the wrapper
+sample_layer_idx = 22
+sample_address = f"model.model.layers.{sample_layer_idx}.self_attn"
+outer_house = model.model.layers[sample_layer_idx].self_attn
+inner_house = outer_house.layer
+
+print("\nHouse Analogy Inspection")
+print(f"[address] {sample_address}")
+print(f"[outer house] object at address now: {type(outer_house).__name__}")
+print(f"[inner house] original layer stored inside wrapper: {type(inner_house).__name__}")
+print(f"[occupant] original layer object: {inner_house}")
+
+print("\nOccupants of the original house")
+print("[occupant] attribute names on original layer:")
+for attr_name in sorted(
+    name for name in dir(inner_house)
+    if not name.startswith("__")
+)[:40]:
+    print(f"  - {attr_name}")
+
+print("\nModule directory tools on the original house")
+print("[named_modules] houses inside the original house:")
+for child_name, child_module in inner_house.named_modules():
+    label = child_name if child_name else "<original house itself>"
+    print(f"  - {label}: {type(child_module).__name__}")
+
+print("\n[leaf_modules] smallest houses inside the original house:")
+for item in inner_house.leaf_modules():
+    print(f"  - {type(item).__name__}: {item}")
+
+print(
+    "\n[analogy] these tools are house directories. "
+    "They help you find houses inside the building, but they are not the door."
+)
+
+print("\n[occupant] original layer parameters:")
+def print_parameter_tree(node, prefix=""):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            next_prefix = f"{prefix}.{key}" if prefix else key
+            print_parameter_tree(value, next_prefix)
+        return
+
+    shape = getattr(node, "shape", None)
+    if shape is not None:
+        print(f"  - {prefix}: shape={shape}")
+    else:
+        print(f"  - {prefix}: type={type(node).__name__}")
+
+print_parameter_tree(inner_house.parameters())
 
 #5. Run a forward pass
 prompt = "The quick brown fox"

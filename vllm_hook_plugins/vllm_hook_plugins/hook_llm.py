@@ -2,6 +2,8 @@ import os
 import json
 import glob
 import uuid
+import platform
+from importlib.util import find_spec
 from typing import Optional, Dict, List
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
@@ -94,6 +96,13 @@ class HookLLM:
         env_backend = os.environ.get("VLLM_HOOK_BACKEND")
         if env_backend:
             return env_backend.lower()
+
+        if (
+            platform.system() == "Darwin"
+            and platform.machine() == "arm64"
+            and find_spec("vllm_metal") is not None
+        ):
+            return "metal"
 
         return "default"
 
@@ -218,6 +227,9 @@ class HookLLM:
             for p in glob.glob(os.path.join(self._hook_dir, "**", "qk.pt"), recursive=True):
                 os.remove(p)
                 print("Cleaned up previous qk cache.")
+            for p in glob.glob(os.path.join(self._hook_dir, "**", "qkv.pt"), recursive=True):
+                os.remove(p)
+                print("Cleaned up previous qkv cache.")
             if os.path.exists(self._run_id_file):
                 os.remove(self._run_id_file)
 

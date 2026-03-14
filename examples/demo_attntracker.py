@@ -40,8 +40,9 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: 
 
 if __name__ == "__main__":
 
-    cache_dir = "/dccstor/pyrite/irene/"
+    cache_dir = os.path.expanduser("~/.cache/vllm-hook")
     model = 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' # 'mistralai/Mistral-7B-Instruct-v0.3' # 
+    backend = os.environ.get("VLLM_HOOK_BACKEND")
     
     dtype_map = {
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
@@ -52,6 +53,7 @@ if __name__ == "__main__":
     llm = HookLLM(
         model=model,
         worker_name="probe_hook_qk",
+        backend=backend,
         analyzer_name="attn_tracker",
         config_file=f'model_configs/attention_tracker/{model.split("/")[-1]}.json',
         download_dir=cache_dir,

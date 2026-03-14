@@ -2,13 +2,10 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-import torch
-from vllm.distributed import parallel_state as ps
-from vllm.forward_context import get_forward_context
-from vllm.v1.worker.gpu_worker import Worker as V1Worker
-
 import mlx.nn as nn
+import torch
+from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.worker import MetalWorker
 
 # House analogy:
 # - outer house: model.layers.<i>.self_attn
@@ -41,12 +38,6 @@ def match_qkv_proj(name: str) -> Optional[Tuple[int, str]]:
     return None
 
 
-def to_torch_cpu(value):
-    if hasattr(value, "detach") and hasattr(value, "cpu"):
-        return value.detach().cpu()
-    return torch.from_numpy(np.asarray(value))
-
-
 class MLXHookWrapper(nn.Module):
     # House analogy:
     # Relative to self_attn, this wrapper becomes the new inner house at the
@@ -66,8 +57,7 @@ class MLXHookWrapper(nn.Module):
         return output
 
 
-class ProbeHookQKWorker(V1Worker):
-
+class ProbeHookQKWorkerMetal(MetalWorker):
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)
 
@@ -89,7 +79,7 @@ class ProbeHookQKWorker(V1Worker):
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens")
-        tp_rank = int(ps.get_tensor_model_parallel_rank())
+        tp_rank = int(self.rank)
 
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
             print("Missing hook environment variables")
@@ -124,82 +114,90 @@ class ProbeHookQKWorker(V1Worker):
         # This is the recording room inside the wrapper inner house. It should
         # see visitors after they leave the original q_proj / k_proj / v_proj
         # inner-inner house, not before they enter it.
-        def qkv_hook(input_args, output, module_name):
-            # Recording room is closed unless the hook flag is present.
-            if not os.path.exists(self.hook_flag):
-                return None
-            if not os.path.exists(self.run_id_file):
-                raise RuntimeError("run_id not found")
+        def qkv_hook(_input_args, output, module_name):
+            try:
+                # Recording room is closed unless the hook flag is present.
+                if not os.path.exists(self.hook_flag):
+                    return None
+                if not os.path.exists(self.run_id_file):
+                    raise RuntimeError("run_id not found")
 
-            # Each run gets its own notebook so visitors from different runs are
-            # not mixed together.
-            run_id = open(self.run_id_file).read().strip().split("\n")[-1]
-            ctx = get_forward_context()
-            metadata = getattr(ctx, "attn_metadata", None)
-            if metadata is None:
-                return None
+                # Each run gets its own notebook so visitors from different runs are
+                # not mixed together.
+                run_id = open(self.run_id_file).read().strip().split("\n")[-1]
 
-            # seq_lens tells the recording room where each request begins and
-            # ends inside the combined stream of visitors.
-            seq_lens = getattr(metadata, "seq_lens", None)
-            if seq_lens is None:
-                return None
+                proj_info = match_qkv_proj(module_name)
+                if proj_info is None:
+                    return None
+                layer_num, proj_kind = proj_info
 
-            proj_info = match_qkv_proj(module_name)
-            if proj_info is None:
-                return None
-            layer_num, proj_kind = proj_info
-
-            # 'output' is the projected visitor that has already left q_proj,
-            # k_proj, or v_proj. This is the person we want to write down.
-            value = to_torch_cpu(output)
-            if value.ndim < 2:
-                return None
-            seq_lens = to_torch_cpu(seq_lens)
-            last_indices = torch.cumsum(seq_lens, dim=0)
-            batch_size = len(last_indices)
-            last_indices = torch.cat(
-                [torch.tensor([0], dtype=last_indices.dtype), last_indices]
-            )
-
-            cache = self._run_cache.get(run_id)
-            if cache is None:
-                cache = {"config": self._conf, "qkv_cache": {}}
-                self._run_cache[run_id] = cache
-
-            # Keep a separate notebook per projection house:
-            # q_proj visitors go in the q notebook, k_proj in the k notebook,
-            # and v_proj in the v notebook.
-            layer_cache = cache["qkv_cache"].setdefault(
-                module_name,
-                {
-                    "layer_num": layer_num,
-                    "proj_kind": proj_kind,
-                    "shape": tuple(value.shape),
-                    "tokens": [],
-                },
-            )
-
-            if self.hookq_mode == "all_tokens":
-                layer_cache["tokens"].extend(
-                    [
-                        value[last_indices[i] : last_indices[i + 1], :].clone()
-                        for i in range(batch_size)
-                    ]
+                # 'output' is the projected visitor that has already left q_proj,
+                # k_proj, or v_proj. This is the person we want to write down.
+                value = mlx_to_torch(output, device="cpu")
+                print(
+                    f"[qkv_hook] module={module_name} proj={proj_kind} "
+                    f"torch_shape={tuple(value.shape)}"
                 )
-            elif self.hookq_mode == "last_token":
-                layer_cache["tokens"].extend(
-                    list(value[last_indices[1:] - 1, :].clone())
-                )
-            else:
-                raise NotImplementedError(self.hookq_mode)
+                if value.ndim < 2:
+                    return None
 
-            # Save the notes to disk. The recorded visitor is a copy; the real
-            # visitor already continues through attention unchanged.
-            run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
-            os.makedirs(run_dir, exist_ok=True)
-            cache_path = os.path.join(run_dir, "qkv.pt")
-            torch.save(cache, cache_path)
+                cache = self._run_cache.get(run_id)
+                if cache is None:
+                    cache = {"config": self._conf, "qkv_cache": {}}
+                    self._run_cache[run_id] = cache
+
+                # Keep a separate notebook per projection house:
+                # q_proj visitors go in the q notebook, k_proj in the k notebook,
+                # and v_proj in the v notebook.
+                layer_cache = cache["qkv_cache"].setdefault(
+                    module_name,
+                    {
+                        "layer_num": layer_num,
+                        "proj_kind": proj_kind,
+                        "shape": tuple(value.shape),
+                        "tokens": [],
+                    },
+                )
+
+                # Projection outputs on Metal are available directly at the hook
+                # boundary, so we can slice by shape without forward_context.
+                if value.ndim == 3:
+                    # Prefill shape: (batch, seq, dim)
+                    batch_size = value.shape[0]
+                    if self.hookq_mode == "all_tokens":
+                        layer_cache["tokens"].extend(
+                            [value[i].clone() for i in range(batch_size)]
+                        )
+                    elif self.hookq_mode == "last_token":
+                        layer_cache["tokens"].extend(
+                            [value[i, -1, :].clone() for i in range(batch_size)]
+                        )
+                    else:
+                        raise NotImplementedError(self.hookq_mode)
+                elif value.ndim == 2:
+                    # Decode shape may already be (batch, dim).
+                    layer_cache["tokens"].extend(
+                        [value[i].clone() for i in range(value.shape[0])]
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unexpected projection output rank {value.ndim} for {module_name}"
+                    )
+
+                # Save the notes to disk. The recorded visitor is a copy; the real
+                # visitor already continues through attention unchanged.
+                run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
+                os.makedirs(run_dir, exist_ok=True)
+                cache_path = os.path.join(run_dir, "qkv.pt")
+                torch.save(cache, cache_path)
+            except Exception as exc:
+                shape = getattr(output, "shape", None)
+                print(
+                    f"[qkv_hook] failure module={module_name} "
+                    f"output_type={type(output).__name__} "
+                    f"output_shape={shape} error={type(exc).__name__}: {exc}"
+                )
+                raise
 
         # register hooks on projection modules
         matched = []
@@ -212,7 +210,7 @@ class ProbeHookQKWorker(V1Worker):
             if proj_info is None:
                 continue
 
-            layer_num, proj_kind = proj_info
+            layer_num, _proj_kind = proj_info
             discovered_proj_modules.append(name)
             if self.important_layers and layer_num not in self.important_layers:
                 continue
@@ -236,10 +234,6 @@ class ProbeHookQKWorker(V1Worker):
 
             # target_name is the specific projection address hanging off the
             # self_attn outer house.
-            # For example:
-            # - q_proj
-            # - k_proj
-            # - v_proj
             target_name = parts[-1]
             wrapped_module = MLXHookWrapper(module=module, name=name, hook_fn=qkv_hook)
             self._original_modules[name] = module
@@ -268,8 +262,6 @@ class ProbeHookQKWorker(V1Worker):
         print(f"Installed {len(self._hooks)} projection hooks on layers: {matched}")
 
     def _uninstall_hooks(self):
-        # House analogy:
-        # Put the original inner-inner houses back at their original addresses.
         for entry in reversed(self._hooks):
             setattr(entry["parent"], entry["target_name"], entry["original_module"])
         self._hooks.clear()
