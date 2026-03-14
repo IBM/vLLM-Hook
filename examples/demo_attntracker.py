@@ -9,6 +9,25 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm_hook_plugins import HookLLM
 
+def debug_token_layout(tokenizer, text: str, input_range):
+    token_ids = tokenizer.encode(text)
+    print(f"Computed input_range: {input_range}")
+    print(f"Token count: {len(token_ids)}")
+    for idx, token_id in enumerate(token_ids):
+        token_text = tokenizer.decode([token_id]).replace("\n", "\\n")
+        markers = []
+        if input_range[0][0] <= idx < input_range[0][1]:
+            markers.append("INST")
+        if input_range[1][0] < 0:
+            data_start = len(token_ids) + input_range[1][0]
+            data_end = len(token_ids) + input_range[1][1]
+        else:
+            data_start, data_end = input_range[1]
+        if data_start <= idx < data_end:
+            markers.append("DATA")
+        marker_text = ",".join(markers) if markers else "-"
+        print(f"[tok {idx:02d}] id={token_id} marker={marker_text} text={token_text!r}")
+
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: str, data: str):
     """Following https://github.com/khhung-906/Attention-Tracker/blob/main/models/attn_model.py"""
     messages = [
@@ -90,6 +109,7 @@ if __name__ == "__main__":
         
         # Apply chat template and get ranges
         text, input_range = apply_chat_template_and_get_ranges(llm.tokenizer, model, instruction, data)
+        debug_token_layout(llm.tokenizer, text, input_range)
 
         t0 = time.time()
         output = llm.generate(text, temperature=0.1, max_tokens=50)

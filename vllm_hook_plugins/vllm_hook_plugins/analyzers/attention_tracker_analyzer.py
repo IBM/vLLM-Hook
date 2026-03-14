@@ -19,6 +19,7 @@ class AttntrackerAnalyzer:
     ) -> Optional[Dict]:
         
         run_id_file = os.environ.get("VLLM_RUN_ID")
+        print(f"[attn analyzer] input_range={analyzer_spec['input_range']} attn_func={analyzer_spec['attn_func']}")
 
         attention_weights = self.compute_attention_from_qk(run_id_file)
         score = self.attn2score(attention_weights, analyzer_spec['input_range'], analyzer_spec['attn_func'])
@@ -34,13 +35,19 @@ class AttntrackerAnalyzer:
         cache = load_and_merge_qk_cache(self.hook_dir, run_id)
         config = cache["config"]
         qk_cache = cache["qk_cache"]
+        print(f"[attn analyzer] cached modules={list(qk_cache.keys())}")
         bs = len(next(iter(qk_cache.values()))['q'])
+        print(f"[attn analyzer] inferred batch size from cache={bs}")
         batch_attention_weights = [dict() for _ in range(bs)]
 
         for layer_name, qk_data in qk_cache.items():
             layer_num = qk_data['layer_num']
                 
             important_head_indices = self.layer_to_heads[layer_num]
+            print(
+                f"[attn analyzer] layer={layer_num} module={layer_name} "
+                f"important_heads={important_head_indices}"
+            )
             
             for i in range(bs):
                 q_last = qk_data['q'][i]
@@ -84,7 +91,7 @@ class AttntrackerAnalyzer:
         batch_scores = []
         for attention, input_range in zip(batch_attention, batch_input_range):
             scores = []
-            for _, layer_data in attention.items():
+            for layer_name, layer_data in attention.items():
                 head_indices = layer_data['head_indices']
                 attention_tensor = layer_data['attention']  # [num_heads, seq_len]
                 
@@ -94,6 +101,16 @@ class AttntrackerAnalyzer:
                     # Get instruction and data attention
                     inst_attn = head_attention[input_range[0][0]:input_range[0][1]]
                     data_attn = head_attention[input_range[1][0]:input_range[1][1]]
+                    print(
+                        f"[attn analyzer] layer={layer_name} head={head_indices[i]} "
+                        f"seq_len={len(head_attention)} "
+                        f"inst_slice={input_range[0]} sum={np.sum(inst_attn):.6f} "
+                        f"data_slice={input_range[1]} sum={np.sum(data_attn):.6f}"
+                    )
+                    print(
+                        f"[attn analyzer] layer={layer_name} head={head_indices[i]} "
+                        f"first10={head_attention[:10]}"
+                    )
                     
                     # Calculate score based on function
                     if "sum" in attn_func:

@@ -2,6 +2,7 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+import mlx.core as mx
 import mlx.nn as nn
 import torch
 import math
@@ -162,6 +163,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._selected_layer = (
             min(self.important_layers) if self.important_layers else None
         )
+        self._sdpa_call_index = 0
 
         cfg = getattr(self.model_runner, "model_args", None) or {}
         num_h = int(cfg.get("num_attention_heads", getattr(model, "n_heads", 0)))
@@ -184,149 +186,117 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
         # House analogy:
-        # This is the recording room inside the wrapper inner house. It should
-        # see visitors after they leave the original q_proj / k_proj
-        # inner-inner house, not before they enter it.
-        def qkv_hook(_input_args, output, module_name):
+        # The original PyTorch worker recorded the documents handed into the
+        # inner control room `self_attn.attn`. Granite on MLX does not expose
+        # that room as a child module, so we stand at the actual doorway into
+        # the attention meeting: the `scaled_dot_product_attention(...)` call.
+        def cache_qk(run_id: str, layer_num: int, queries, keys) -> None:
+            module_name = f"model.layers.{layer_num}.self_attn.attn"
             try:
-                # Recording room is closed unless the hook flag is present.
-                if not os.path.exists(self.hook_flag):
-                    return None
-                if not os.path.exists(self.run_id_file):
-                    raise RuntimeError("run_id not found")
-
-                # Each run gets its own notebook so visitors from different runs are
-                # not mixed together.
-                run_id = open(self.run_id_file).read().strip().split("\n")[-1]
-
-                proj_info = match_qkv_proj(module_name)
-                if proj_info is None:
-                    return None
-                layer_num, proj_kind = proj_info
-
-                # 'output' is the projected visitor that has already left q_proj
-                # or k_proj. This is the person we want to write down.
-                value = mlx_to_torch(output, device="cpu")
-                print(
-                    f"[qkv_hook] module={module_name} proj={proj_kind} "
-                    f"torch_shape={tuple(value.shape)}"
-                )
-                if value.ndim < 2:
-                    return None
-
                 cache = self._run_cache.get(run_id)
                 if cache is None:
                     cache = {"config": self._conf, "qk_cache": {}}
                     self._run_cache[run_id] = cache
 
-                layer_name = module_name.rsplit(".", 1)[0]
                 layer_cache = cache["qk_cache"].setdefault(
-                    layer_name,
-                    {"layer_num": layer_num, "q": [], "k_all": []},
+                    module_name,
+                    {"layer_num": layer_num, "q": [], "k_all": [], "max_seq_len": -1},
                 )
 
-                # Projection outputs on Metal are available directly at the hook
-                # boundary, so we can slice by shape without forward_context.
-                if value.ndim == 3:
-                    # Prefill shape: (batch, seq, dim)
-                    batch_size = value.shape[0]
-                    q_tokens_all = [value[i].clone() for i in range(batch_size)]
-                    q_tokens_last = [value[i, -1, :].clone() for i in range(batch_size)]
-                elif value.ndim == 2:
-                    # Decode shape may already be (batch, dim).
-                    q_tokens_all = [value[i].clone() for i in range(value.shape[0])]
-                    q_tokens_last = q_tokens_all
-                else:
-                    raise RuntimeError(
-                        f"Unexpected projection output rank {value.ndim} for {module_name}"
-                    )
+                # House analogy:
+                # `queries` and `keys` here are the attention-ready documents
+                # already prepared for the meeting room. We flatten them back to
+                # the same notebook format the analyzer expects from the
+                # original worker.
+                q_flat = queries.transpose(0, 2, 1, 3).reshape(
+                    queries.shape[0], queries.shape[2], -1
+                )
+                k_flat = keys.transpose(0, 2, 1, 3).reshape(
+                    keys.shape[0], keys.shape[2], -1
+                )
 
-                if proj_kind == "q":
-                    if self.hookq_mode == "all_tokens":
-                        layer_cache["q"].extend(q_tokens_all)
-                    elif self.hookq_mode == "last_token":
-                        layer_cache["q"].extend(q_tokens_last)
-                    else:
-                        raise NotImplementedError(self.hookq_mode)
-                elif proj_kind == "k":
-                    layer_cache["k_all"].extend(q_tokens_all)
+                q_torch = mlx_to_torch(q_flat, device="cpu")
+                k_torch = mlx_to_torch(k_flat, device="cpu")
+                current_seq_len = int(q_torch.shape[1])
+                print(
+                    f"[qk_boundary] module={module_name} "
+                    f"q_shape={tuple(q_torch.shape)} k_shape={tuple(k_torch.shape)} "
+                    f"seq_len={current_seq_len}",
+                    flush=True,
+                )
+
+                # House analogy:
+                # The same room may host a few small side meetings as well as the
+                # main full-prompt meeting. For the analyzer we want the complete
+                # packet, so we keep only the longest sequence seen for a run/layer.
+                if current_seq_len < layer_cache["max_seq_len"]:
+                    print(
+                        f"[qk_boundary] skipping shorter capture for {module_name} "
+                        f"seq_len={current_seq_len} < max_seq_len={layer_cache['max_seq_len']}",
+                        flush=True,
+                    )
+                    return
+                if current_seq_len > layer_cache["max_seq_len"]:
+                    layer_cache["q"].clear()
+                    layer_cache["k_all"].clear()
+                    layer_cache["max_seq_len"] = current_seq_len
+
+                if self.hookq_mode == "all_tokens":
+                    layer_cache["q"].extend(
+                        [q_torch[i].clone() for i in range(q_torch.shape[0])]
+                    )
+                elif self.hookq_mode == "last_token":
+                    layer_cache["q"].extend(
+                        [q_torch[i, -1, :].clone() for i in range(q_torch.shape[0])]
+                    )
+                else:
+                    raise NotImplementedError(self.hookq_mode)
+
+                layer_cache["k_all"].extend(
+                    [k_torch[i].clone() for i in range(k_torch.shape[0])]
+                )
 
             except Exception as exc:
-                shape = getattr(output, "shape", None)
                 print(
-                    f"[qkv_hook] failure module={module_name} "
-                    f"output_type={type(output).__name__} "
-                    f"output_shape={shape} error={type(exc).__name__}: {exc}"
+                    f"[qk_boundary] failure module={module_name} "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
                 )
                 raise
 
-        # register hooks on projection modules
-        matched = []
-        discovered_proj_modules = []
-        for name, module in model.named_modules():
-            # model.named_modules() gives full street addresses for every house
-            # and sub-house in the model tree. Here we keep only projection
-            # addresses inside the self_attn outer house.
-            proj_info = match_qkv_proj(name)
-            if proj_info is None:
-                continue
+        import mlx_lm.models.granite as granite_mod
 
-            layer_num, _proj_kind = proj_info
-            discovered_proj_modules.append(name)
+        self._original_sdpa = granite_mod.scaled_dot_product_attention
+
+        def probing_sdpa(queries, keys, values, cache=None, scale=None, mask=None):
+            # House analogy:
+            # Each call to `scaled_dot_product_attention(...)` is one layer's
+            # control-room meeting. We count meetings as they happen and record
+            # only the selected layer's documents.
+            current_layer = self._sdpa_call_index
+            self._sdpa_call_index += 1
+
             if self._selected_layer is None:
-                self._selected_layer = layer_num
-            if layer_num != self._selected_layer:
-                continue
+                self._selected_layer = current_layer
 
-            parts = name.split(".")
-            parent = model
-            for part in parts[:-1]:
-                # Walk the address one step at a time until we reach the parent
-                # outer house that owns q_proj / k_proj.
-                #
-                # Example:
-                # name = model.layers.22.self_attn.q_proj
-                # parts[:-1] = ["model", "layers", "22", "self_attn"]
-                #
-                # After this loop:
-                # parent == model.layers[22].self_attn
-                if part.isdigit():
-                    parent = parent[int(part)]
-                else:
-                    parent = getattr(parent, part)
+            if (
+                current_layer == self._selected_layer
+                and os.path.exists(self.hook_flag)
+                and os.path.exists(self.run_id_file)
+            ):
+                run_id = open(self.run_id_file).read().strip().split("\n")[-1]
+                cache_qk(run_id, current_layer, queries, keys)
 
-            # target_name is the specific projection address hanging off the
-            # self_attn outer house.
-            target_name = parts[-1]
-            wrapped_module = MLXHookWrapper(module=module, name=name, hook_fn=qkv_hook)
-            self._original_modules[name] = module
-
-            # This is the actual swap:
-            # before: parent.q_proj == original inner house
-            # after:  parent.q_proj == wrapper inner house
-            #
-            # The original projection module is still kept inside the wrapper as
-            # the inner-inner house: wrapped_module.module.
-            setattr(parent, target_name, wrapped_module)
-            self._hooks.append(
-                {
-                    "name": name,
-                    "parent": parent,
-                    "target_name": target_name,
-                    "original_module": module,
-                }
+            return self._original_sdpa(
+                queries, keys, values, cache=cache, scale=scale, mask=mask
             )
-            matched.append(name)
 
-        print(
-            "Discovered projection houses inside self_attn: "
-            f"{discovered_proj_modules}"
-        )
+        granite_mod.scaled_dot_product_attention = probing_sdpa
         print(
             "Selected Metal hook layer: "
-            f"{self._selected_layer} (q_proj and k_proj only)"
+            f"{self._selected_layer} (scaled_dot_product_attention boundary)"
         )
-        print(f"Installed {len(self._hooks)} projection hooks on layers: {matched}")
+        print("Installed Granite attention boundary hook", flush=True)
 
     def _flush_run_cache(self) -> None:
         if not self._run_cache:
@@ -338,13 +308,27 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             os.makedirs(run_dir, exist_ok=True)
             cache_path = os.path.join(run_dir, "qk.pt")
             torch.save(cache, cache_path)
+            sample_counts = {
+                module_name: {
+                    "q": len(module_cache.get("q", [])),
+                    "k_all": len(module_cache.get("k_all", [])),
+                    "max_seq_len": module_cache.get("max_seq_len"),
+                }
+                for module_name, module_cache in cache["qk_cache"].items()
+            }
             print(
                 f"[metal-worker] flushed qk cache for run_id={run_id} "
-                f"modules={list(cache['qk_cache'].keys())}",
+                f"modules={list(cache['qk_cache'].keys())} "
+                f"sample_counts={sample_counts}",
                 flush=True,
             )
 
     def _uninstall_hooks(self):
+        if hasattr(self, "_original_sdpa"):
+            import mlx_lm.models.granite as granite_mod
+
+            granite_mod.scaled_dot_product_attention = self._original_sdpa
+            del self._original_sdpa
         for entry in reversed(self._hooks):
             setattr(entry["parent"], entry["target_name"], entry["original_module"])
         self._hooks.clear()
@@ -369,6 +353,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         if not self._execute_logged:
             self._stage("execute_model first entry")
             self._execute_logged = True
+        self._sdpa_call_index = 0
         result = super().execute_model(*args, **kwargs)
         try:
             self._flush_run_cache()
