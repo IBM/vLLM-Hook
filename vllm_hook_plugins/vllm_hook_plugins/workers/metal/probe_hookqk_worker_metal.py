@@ -13,10 +13,11 @@ from vllm_metal.v1.worker import MetalWorker
 
 class MLXHookWrapper(nn.Module):
     # Housing analogy:
-    # - the wrapped address is a house
-    # - once we replace it, this wrapper becomes the new outer house
-    # - the original module still exists as the inner house at `self.module`
-    # - visitors arrive at the outer house first, enter the recording room
+    # - the wrapped address is a house listed in the building directory
+    # - once we replace that address, this wrapper becomes the new outer house
+    # - the original module still lives inside as the inner house at
+    #   `self.module`
+    # - visitors reach the outer house first, step into the recording room
     #   via `hook_fn`, and then continue into the original inner house
     def __init__(self, module, name, hook_fn):
         super().__init__()
@@ -112,6 +113,13 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return result
 
     def _current_run_id(self) -> str | None:
+        # Housing analogy:
+        # - the recording room only writes when the building manager has posted
+        #   an "open notebook" sign for the current visit
+        # - `_capture_active` means the worker is in the real tenant visit, not
+        #   warmup or teardown traffic
+        # - `hook_flag` and `run_id_file` together tell the room which notebook
+        #   to write into for this run
         if not self._capture_active or not os.path.exists(self.hook_flag):
             return None
         if not os.path.exists(self.run_id_file):
@@ -119,6 +127,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return open(self.run_id_file).read().strip().split("\n")[-1]
 
     def _ensure_run_cache(self, run_id: str):
+        # Housing analogy:
+        # - each run gets its own notebook
+        # - the notebook keeps both the recorded visitor packets and the
+        #   building facts the scoring desk needs later
         cache = self._run_cache.get(run_id)
         if cache is None:
             cache = {
@@ -169,8 +181,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         # - `raw_x` is the visitor as it first enters the self-attention house
         # - `queries`, `keys`, and `values` are the specialized copies of that
         #   visitor after the house has routed it through q_proj/k_proj/v_proj
-        # - this method writes both the original visitor packet and the
-        #   specialized packets into the recording room notebook
+        # - this method files both the original visitor packet and the
+        #   specialized packets into the notebook under the same floor tab
         x_torch = mlx_to_torch(raw_x, device="cpu")
         q_flat = queries.transpose(0, 2, 1, 3).reshape(queries.shape[0], queries.shape[2], -1)
         k_flat = keys.transpose(0, 2, 1, 3).reshape(keys.shape[0], keys.shape[2], -1)
@@ -202,8 +214,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         # - this is the recording room attached to the `self_attn` house door
         # - visitors arrive as raw hidden states `x`
         # - we let the recording room compute the same q/k/v routes the house
-        #   would compute internally, so we can preserve the raw visitor packet
-        #   and also the projected packets without depending on a deeper door
+        #   itself would compute internally
+        # - that keeps the notebook aligned with the real house behavior while
+        #   avoiding any need for a deeper inner door that does not exist in
+        #   the installed Metal runtime
         raw_x = input_args[0]
         cache = input_args[2] if len(input_args) > 2 else None
         batch, seq_len, _ = raw_x.shape
@@ -282,7 +296,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         # - `named_modules()` is the building directory
         # - each entry maps an address to the house currently living there
         # - we search that directory for `*.self_attn` houses and replace each
-        #   target address with a wrapper outer house
+        #   tracked address with a wrapper outer house
+        # - each wrapper keeps the original attention house inside so teardown
+        #   can later restore the exact original resident to that address
         named_modules = dict(model.named_modules())
         for name, module in named_modules.items():
             if not name.endswith(".self_attn"):
@@ -312,6 +328,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             original_attn = module
 
             def attention_hook(input_args, _output, _module_name, layer_num=layer_idx, attn=original_attn):
+                # Housing analogy:
+                # - the wrapper's recording room checks whether there is an open
+                #   notebook for this visit
+                # - if so, it records the raw visitor and the projected Q/K/V
+                #   copies for this floor
                 run_id = self._current_run_id()
                 if run_id is None:
                     return None
@@ -352,6 +373,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             print("Installed Granite attention hook", flush=True)
 
     def _flush_run_cache(self) -> None:
+        # Housing analogy:
+        # - when the visit ends, the worker carries each in-memory notebook to
+        #   the archive room on disk and files it as `qkv.pt`
         if not self._run_cache:
             return
 
@@ -374,6 +398,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 )
 
     def _uninstall_hooks(self):
+        # Housing analogy:
+        # - teardown removes the temporary outer houses from each tracked
+        #   address
+        # - the original inner houses are moved back to the public address so
+        #   the next temporary engine starts from a clean building directory
         for entry in reversed(self._hooks):
             setattr(entry["parent"], entry["target_name"], entry["original_module"])
         self._hooks.clear()
@@ -392,6 +421,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return result
 
     def execute_model(self, *args, **kwargs):
+        # Housing analogy:
+        # - `execute_model` is when the building opens for a real tenant visit
+        # - capture is only active during this window
+        # - once the visit ends, any filled notebooks are sent to the archive
+        #   room before returning control
         if not self._execute_logged:
             self._stage("execute_model first entry")
             self._execute_logged = True
