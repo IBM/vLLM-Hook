@@ -26,6 +26,8 @@ class MLXHookWrapper(nn.Module):
         self.hook_fn = hook_fn
 
     def __call__(self, *args, **kwargs):
+        # Let the original attention house do its real work, then hand the
+        # visit details to the recording room hook before returning.
         output = self.module(*args, **kwargs)
         self.hook_fn(args, output, self.name)
         return output
@@ -33,6 +35,8 @@ class MLXHookWrapper(nn.Module):
 
 class ProbeHookQKWorkerMetal(MetalWorker):
     def _stage(self, message: str) -> None:
+        # Shared debug-print helper so all optional worker traces use the same
+        # prefix and can be silenced together.
         if not getattr(self, "_debug_hook", False):
             return
         pid = os.getpid()
@@ -44,6 +48,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
     def __init__(self, *args, **kwargs):
+        # Track whether the current execution window should be recorded and
+        # whether we have already emitted the one-time execute_model trace.
         self._execute_logged = False
         self._capture_active = False
         self._debug_hook = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
@@ -51,6 +57,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._stage("worker __init__ complete")
 
     def init_device(self) -> None:
+        # Use the simplified Metal setup when running a single process, but
+        # preserve the normal distributed worker path for larger world sizes.
         self._stage(
             "init_device start "
             f"distributed_init_method={self.distributed_init_method}"
@@ -68,6 +76,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._stage("init_device complete")
 
     def _init_device_single_process(self) -> None:
+        # Set up MLX, the torch-facing Metal device, and the model runner for
+        # the common single-process case.
         if self.metal_config.use_mlx:
             import mlx.core as mx
 
@@ -93,6 +103,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
     def load_model(self, *args, **kwargs):
+        # Load the underlying model first, then install the temporary wrappers
+        # that let this worker observe self_attn traffic for one hooked engine.
         self._stage("load_model start")
         try:
             result = super().load_model(*args, **kwargs)
@@ -240,11 +252,19 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._record_qkv(run_id, layer_num, raw_x, queries, keys, values)
 
     def _install_hooks(self):
+        # `model_runner.model` is the live MLX model object that will actually
+        # be executed. If it is missing, there is nothing concrete to wrap.
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
             return
 
+        # These env vars are the worker-side control plane for one hooked run:
+        # - `hook_flag` says whether capture is currently armed
+        # - `hook_dir` tells us where notebooks should be archived
+        # - `run_id_file` tells us which notebook belongs to the active visit
+        # - `hookq_mode` controls whether Q is stored for all tokens or only
+        #   the last token
         self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
@@ -266,6 +286,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._matched_hook_modules = []
         self._capture_boundary = "self_attn"
 
+        # Gather the structural facts the analyzer will need later to interpret
+        # the recorded Q/K/V packets. We prefer `model_args`, but fall back to
+        # live model attributes when necessary because different runtime builds
+        # expose these values in different places.
         cfg = getattr(self.model_runner, "model_args", None) or {}
         layers_obj = getattr(getattr(model, "model", model), "layers", None)
         if layers_obj is None:
@@ -280,6 +304,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             print("Could not infer model dimensions for Metal hook installation")
             return
         head_dim = hidden // num_h
+
+        # `_conf` is the notebook header: enough shape metadata for the
+        # analyzer to reconstruct attention from archived Q/K/V packets later.
         self._conf = dict(
             num_attention_heads=num_h,
             num_key_value_heads=num_kv,
@@ -301,10 +328,14 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         #   can later restore the exact original resident to that address
         named_modules = dict(model.named_modules())
         for name, module in named_modules.items():
+            # Only `*.self_attn` addresses are valid outer-house targets for
+            # this worker. Everything else in the building directory is ignored.
             if not name.endswith(".self_attn"):
                 continue
 
             parts = name.split(".")
+            # We only want modules that clearly belong to `layers.<idx>` so we
+            # can map them back to the configured tracked floors.
             if "layers" not in parts:
                 continue
             layers_pos = parts.index("layers")
@@ -312,14 +343,19 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 continue
 
             layer_idx = int(parts[layers_pos + 1])
+            # Skip floors that are not in the configured layer/head shortlist.
             if layer_idx not in self.important_layers:
                 continue
+            # The runtime must expose the projection and rope occupants we need
+            # to rebuild attention-ready Q/K/V at the self_attn door.
             if not all(
                 hasattr(module, attr)
                 for attr in ("q_proj", "k_proj", "v_proj", "rope", "n_heads", "n_kv_heads")
             ):
                 continue
 
+            # We replace the module at `parent.target_name`, so we need the
+            # parent house object as well as the current resident.
             parent_name, target_name = name.rsplit(".", 1)
             parent = named_modules.get(parent_name)
             if parent is None:
@@ -339,6 +375,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 self._capture_from_self_attn(run_id, layer_num, attn, input_args)
                 return None
 
+            # Install the wrapper at the public address and remember enough
+            # information to restore the original house during teardown.
             wrapped_attn = MLXHookWrapper(
                 module=original_attn,
                 name=name,
@@ -354,10 +392,14 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             )
             self._matched_hook_modules.append(name)
 
+        # If nothing matched, the worker cannot observe any self_attn traffic,
+        # so later analysis would have no notebook to read.
         if not self._matched_hook_modules:
             print("Could not locate self_attn modules for Metal attention hook")
             return
 
+        # Report the exact wrapped addresses so it is obvious which floors were
+        # actually instrumented for this temporary engine.
         print(
             f"Installed {len(self._matched_hook_modules)} hooks on layers: "
             f"{self._matched_hook_modules}",
@@ -408,6 +450,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._hooks.clear()
 
     def _parse_layer_heads(self) -> Dict[int, List[int]]:
+        # Parse the `layer:head,head;layer:head` env-var format into the layer
+        # lookup the worker uses to decide which floors to wrap and score.
         layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
         result = {}
         for part in layer_heads.split(";"):

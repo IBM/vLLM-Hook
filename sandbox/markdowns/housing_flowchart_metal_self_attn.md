@@ -1,6 +1,6 @@
 # Flow Chart For The Current Metal Worker
 
-This flow chart matches the current `self_attn`-wrapper Metal worker and uses the same housing analogy as [housing_analogy_metal_self_attn.md](/Users/timothyburley/opensource/vLLM-Hook/sandbox/housing_analogy_metal_self_attn.md).
+This flow chart matches the current `self_attn`-wrapper Metal worker and uses the same housing analogy as [housing_analogy_metal_self_attn.md](/Users/timothyburley/opensource/vLLM-Hook/sandbox/markdowns/housing_analogy_metal_self_attn.md).
 
 ## Compact View
 
