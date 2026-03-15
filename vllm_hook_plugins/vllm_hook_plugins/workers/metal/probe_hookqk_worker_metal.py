@@ -178,9 +178,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 "tokens": [],
             },
         )
-        layer_cache["tokens"].extend([tokens[i].clone() for i in range(tokens.shape[0])])
+        layer_cache["tokens"].extend(
+            [tokens[i].clone() for i in range(tokens.shape[0])]
+        )
 
-    def _record_qkv(
+    def _record_qkv(  # qkv_hook in non metal worker.
         self,
         run_id: str,
         layer_num: int,
@@ -195,15 +197,30 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         #   visitor after the house has routed it through q_proj/k_proj/v_proj
         # - this method files both the original visitor packet and the
         #   specialized packets into the notebook under the same floor tab
+        # `raw_x` already has the analyzer-friendly `[batch, seq, hidden]`
+        # layout, so it can be bridged to CPU as-is.
         x_torch = mlx_to_torch(raw_x, device="cpu")
-        q_flat = queries.transpose(0, 2, 1, 3).reshape(queries.shape[0], queries.shape[2], -1)
+        # Q/K/V arrive here in the attention-worker layout
+        # `[batch, heads, seq, head_dim]`.
+        # The notebook stores the flatter analyzer layout
+        # `[batch, seq, heads * head_dim]`, so we transpose seq back to the
+        # middle and then collapse the head dimensions.
+        q_flat = queries.transpose(0, 2, 1, 3).reshape(
+            queries.shape[0], queries.shape[2], -1
+        )
         k_flat = keys.transpose(0, 2, 1, 3).reshape(keys.shape[0], keys.shape[2], -1)
-        v_flat = values.transpose(0, 2, 1, 3).reshape(values.shape[0], values.shape[2], -1)
+        v_flat = values.transpose(0, 2, 1, 3).reshape(
+            values.shape[0], values.shape[2], -1
+        )
+        # Archive everything on CPU so the on-disk notebook does not depend on
+        # the lifetime of MLX tensors or Metal device state.
         q_torch = mlx_to_torch(q_flat, device="cpu")
         k_torch = mlx_to_torch(k_flat, device="cpu")
         v_torch = mlx_to_torch(v_flat, device="cpu")
 
         self._append_proj_tokens(run_id, layer_num, "x", x_torch)
+        # Q is the only packet kind whose storage width changes with
+        # `hookq_mode`: either keep the whole packet or just the last page.
         if self.hookq_mode == "all_tokens":
             self._append_proj_tokens(run_id, layer_num, "q", q_torch)
         elif self.hookq_mode == "last_token":
@@ -221,7 +238,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 flush=True,
             )
 
-    def _capture_from_self_attn(self, run_id: str, layer_num: int, attn_module, input_args) -> None:
+    def _capture_from_self_attn(
+        self, run_id: str, layer_num: int, attn_module, input_args
+    ) -> None:
         # Housing analogy:
         # - this is the recording room attached to the `self_attn` house door
         # - visitors arrive as raw hidden states `x`
@@ -230,18 +249,35 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         # - that keeps the notebook aligned with the real house behavior while
         #   avoiding any need for a deeper inner door that does not exist in
         #   the installed Metal runtime
+        # The wrapped `self_attn` call receives `(x, mask, cache)`. We only
+        # need the raw hidden-state visitor plus the cache offset information
+        # to rebuild the same attention-ready Q/K/V packets the house will use.
         raw_x = input_args[0]
         cache = input_args[2] if len(input_args) > 2 else None
         batch, seq_len, _ = raw_x.shape
 
-        queries = attn_module.q_proj(raw_x).reshape(batch, seq_len, attn_module.n_heads, -1)
-        keys = attn_module.k_proj(raw_x).reshape(batch, seq_len, attn_module.n_kv_heads, -1)
-        values = attn_module.v_proj(raw_x).reshape(batch, seq_len, attn_module.n_kv_heads, -1)
+        # Run the same projection occupants the real house uses. Right after
+        # projection the tensors are still in `[batch, seq, heads, head_dim]`.
+        queries = attn_module.q_proj(raw_x).reshape(
+            batch, seq_len, attn_module.n_heads, -1
+        )
+        keys = attn_module.k_proj(raw_x).reshape(
+            batch, seq_len, attn_module.n_kv_heads, -1
+        )
+        values = attn_module.v_proj(raw_x).reshape(
+            batch, seq_len, attn_module.n_kv_heads, -1
+        )
 
+        # Switch into the attention-worker layout `[batch, heads, seq, head_dim]`
+        # before applying rope, because that is the layout the live house uses
+        # internally for attention.
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
+        # Q and K must pass through the same positional checkpoint as the live
+        # attention path. During prefill/decode, `cache.offset` keeps rope
+        # aligned with the already-seen prefix.
         if cache is not None:
             queries = attn_module.rope(queries, offset=cache.offset)
             keys = attn_module.rope(keys, offset=cache.offset)
@@ -249,6 +285,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             queries = attn_module.rope(queries)
             keys = attn_module.rope(keys)
 
+        # At this point the packets match the real attention-ready values, so
+        # the notebook can archive them without depending on a deeper hook.
         self._record_qkv(run_id, layer_num, raw_x, queries, keys, values)
 
     def _install_hooks(self):
@@ -295,7 +333,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         if layers_obj is None:
             layers_obj = getattr(model, "layers", None)
         self._num_hidden_layers = int(
-            cfg.get("num_hidden_layers", len(layers_obj) if layers_obj is not None else 0)
+            cfg.get(
+                "num_hidden_layers", len(layers_obj) if layers_obj is not None else 0
+            )
         )
         num_h = int(cfg.get("num_attention_heads", getattr(model, "n_heads", 0)))
         num_kv = int(cfg.get("num_key_value_heads", num_h))
@@ -350,7 +390,14 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             # to rebuild attention-ready Q/K/V at the self_attn door.
             if not all(
                 hasattr(module, attr)
-                for attr in ("q_proj", "k_proj", "v_proj", "rope", "n_heads", "n_kv_heads")
+                for attr in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "rope",
+                    "n_heads",
+                    "n_kv_heads",
+                )
             ):
                 continue
 
@@ -363,7 +410,13 @@ class ProbeHookQKWorkerMetal(MetalWorker):
 
             original_attn = module
 
-            def attention_hook(input_args, _output, _module_name, layer_num=layer_idx, attn=original_attn):
+            def attention_hook(
+                input_args,
+                _output,
+                _module_name,
+                layer_num=layer_idx,
+                attn=original_attn,
+            ):
                 # Housing analogy:
                 # - the wrapper's recording room checks whether there is an open
                 #   notebook for this visit
@@ -418,16 +471,26 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         # Housing analogy:
         # - when the visit ends, the worker carries each in-memory notebook to
         #   the archive room on disk and files it as `qkv.pt`
+        # - the archive is grouped first by run, then by tensor-parallel rank,
+        #   so multiple workers can file notebooks for the same visit without
+        #   overwriting each other
         if not self._run_cache:
             return
 
         tp_rank = int(self.rank)
         for run_id, cache in self._run_cache.items():
+            # Each run gets its own directory, and each worker writes inside
+            # `tp_rank_<n>` so later merge logic can collect the right notebook
+            # fragments for that run.
             run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
             os.makedirs(run_dir, exist_ok=True)
             cache_path = os.path.join(run_dir, "qkv.pt")
+            # `torch.save` is the archive step: the entire notebook header plus
+            # all filed packet sections are serialized in one artifact.
             torch.save(cache, cache_path)
             if self._debug_hook:
+                # Debug mode summarizes how many request packets were filed in
+                # each notebook section so batch behavior is easy to inspect.
                 sample_counts = {
                     module_name: len(module_cache.get("tokens", []))
                     for module_name, module_cache in cache["qkv_cache"].items()
@@ -470,15 +533,26 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         # - capture is only active during this window
         # - once the visit ends, any filled notebooks are sent to the archive
         #   room before returning control
+        # The one-time `_execute_logged` banner keeps debug logs readable
+        # without repeating the same startup line on every execution call.
         if not self._execute_logged:
             self._stage("execute_model first entry")
             self._execute_logged = True
+        # Wrappers consult `_capture_active` through `_current_run_id()`, so
+        # this flag is the top-level switch that distinguishes real execution
+        # traffic from warmup/setup/teardown traffic.
         self._capture_active = True
         try:
+            # The underlying Metal worker performs the real forward/generation
+            # work while wrapper houses opportunistically record visits.
             result = super().execute_model(*args, **kwargs)
         finally:
+            # Always drop the capture flag, even if model execution raises, so
+            # later calls do not accidentally keep writing into the notebook.
             self._capture_active = False
         try:
+            # Archive any notebooks filled during this execution window before
+            # returning the model result to the caller.
             self._flush_run_cache()
         except Exception as exc:
             self._stage(f"flush_run_cache failed: {type(exc).__name__}: {exc}")
