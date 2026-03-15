@@ -66,10 +66,6 @@ if __name__ == "__main__":
     backend = os.environ.get("VLLM_HOOK_BACKEND")
     debug = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
     config_basename = f'{model.split("/")[-1]}.json'
-    if backend == "metal" and model == "ibm-granite/granite-3.1-8b-instruct":
-        # TODO: Delete this demo-level override once HookLLM selects the
-        # Metal-specific Granite attention-tracker config internally.
-        config_basename = "granite-3.1-8b-instruct-metal.json"
     
     dtype_map = {
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
