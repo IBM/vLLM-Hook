@@ -1,0 +1,93 @@
+digraph worker_control_flow_metal_self_attn {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.22",
+    nodesep="0.28",
+    ranksep="0.42",
+    splines=ortho,
+    fontname="Helvetica"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#3b5870",
+    fillcolor="#eef4fa",
+    fontcolor="#1f2933",
+    margin="0.10,0.08"
+  ];
+
+  edge [
+    color="#657b8f",
+    penwidth=1.15,
+    arrowsize=0.7
+  ];
+
+  start [label="Worker starts up\nand reads debug settings\n(__init__)", fillcolor="#dfeaf6"];
+  init  [label="Worker sets up devices\n(init_device)", fillcolor="#dfeaf6"];
+  fast  [shape=diamond, label="Single-process run?", fillcolor="#fff4d8", color="#8a6f35"];
+  single [label="Use Metal fast path\nset MLX device\nset torch device\ncreate model runner\n(_init_device_single_process)", fillcolor="#dfeaf6"];
+  superinit [label="Use normal device setup path\n(super().init_device)", fillcolor="#dfeaf6"];
+
+  load [label="Load the model\n(load_model)", fillcolor="#e5f3e2", color="#466b3f"];
+  superload [label="Finish base model loading\n(super().load_model)", fillcolor="#e5f3e2", color="#466b3f"];
+  install [label="Prepare hook installation\n(_install_hooks)", fillcolor="#e5f3e2", color="#466b3f"];
+  ready [shape=diamond, label="Do we have what we need?\nhook files, model dimensions,\nand tracked attention blocks", fillcolor="#fff4d8", color="#8a6f35"];
+  hooks [label="Wrap each tracked attention block\nwith an outer observer\n(MLXHookWrapper)", fillcolor="#e5f3e2", color="#466b3f"];
+  installed [label="Announce hook setup result", fillcolor="#e5f3e2", color="#466b3f"];
+
+  exec [label="Start model execution\n(execute_model)", fillcolor="#f7efe0", color="#8a6f35"];
+  active [label="Turn capture on\nrun the real model", fillcolor="#f7efe0", color="#8a6f35"];
+  wrapper [label="A wrapped attention block is called\nrun the real block\nthen run the observer\n(MLXHookWrapper.__call__)", fillcolor="#efe7f7", color="#71518d"];
+  gate [shape=diamond, label="Should this visit be recorded?\ncapture on and run ID available\n(_current_run_id)", fillcolor="#fff4d8", color="#8a6f35"];
+
+  capture [label="Read the raw attention input\nbuild Q, K, and V\nreshape them\napply positional rotation to Q and K\n(_capture_from_self_attn)", fillcolor="#efe7f7", color="#71518d"];
+  record [label="Convert the captured values\ninto CPU tensors for storage\n(_record_qkv)", fillcolor="#efe7f7", color="#71518d"];
+  append [label="Store raw input, Q, K, and V\none request packet per sample\n(_append_proj_tokens + _ensure_run_cache)", fillcolor="#efe7f7", color="#71518d"];
+
+  finish [label="Turn capture off", fillcolor="#f7efe0", color="#8a6f35"];
+  flush [label="Write the run notebook to disk\nas qkv.pt\n(_flush_run_cache)", fillcolor="#f3e7f7", color="#7b4c8b"];
+  dispose [label="Dispose the temporary hooked engine\n(HookLLM._dispose_llm)", fillcolor="#f7f2e7", color="#8b6f35"];
+  teardown [label="Ask the worker to restore\noriginal attention blocks\n(engine.collective_rpc -> _uninstall_hooks)", fillcolor="#f7f2e7", color="#8b6f35"];
+  done [label="Return the model result", fillcolor="#f3e7f7", color="#7b4c8b"];
+
+  start -> init -> fast;
+  fast -> single [xlabel="yes", fontcolor="#7b5d2d"];
+  fast -> superinit [xlabel="no", fontcolor="#7b5d2d"];
+
+  single -> load;
+  superinit -> load;
+  load -> superload -> install -> ready;
+  ready -> hooks [xlabel="yes", fontcolor="#7b5d2d"];
+  ready -> installed [xlabel="early return", fontcolor="#7b5d2d"];
+  hooks -> installed;
+
+  installed -> exec -> active -> wrapper -> gate;
+  gate -> finish [xlabel="no", fontcolor="#7b5d2d"];
+  gate -> capture [xlabel="yes", fontcolor="#7b5d2d"];
+  capture -> record -> append -> finish;
+  finish -> flush -> dispose -> teardown -> done;
+
+  {
+    rank=same;
+    start; init; fast; single; superinit;
+  }
+
+  {
+    rank=same;
+    load; superload; install; ready; hooks; installed;
+  }
+
+  {
+    rank=same;
+    exec; active; wrapper; gate; capture; record; append;
+  }
+
+  {
+    rank=same;
+    finish; flush; dispose; teardown; done;
+  }
+}

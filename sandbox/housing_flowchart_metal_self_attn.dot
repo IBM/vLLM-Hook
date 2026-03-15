@@ -1,0 +1,81 @@
+digraph metal_self_attn_housing_flow {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.22",
+    nodesep="0.28",
+    ranksep="0.42",
+    splines=ortho,
+    fontname="Helvetica"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#355c4a",
+    fillcolor="#eef6f1",
+    fontcolor="#1f2a24",
+    margin="0.10,0.08"
+  ];
+
+  edge [
+    color="#5c6f65",
+    penwidth=1.15,
+    arrowsize=0.7
+  ];
+
+  start [label="HookLLM opens the building\ncreates a new notebook\nand opens the recording room", fillcolor="#dfeee6"];
+  load  [label="Metal worker enters the building\nreads which floors matter", fillcolor="#dfeee6"];
+  wrap  [label="Building directory finds each\ntracked self_attn house\ninstall temporary outer houses", fillcolor="#dfeee6"];
+
+  exec  [label="Visitors are allowed in\ncapture is active", fillcolor="#f6efe0", color="#8b6f3d"];
+  door  [label="A visitor packet x arrives at\na self_attn front door", fillcolor="#f6efe0", color="#8b6f3d"];
+  room  [label="The recording room checks\nwhich notebook run this belongs to", fillcolor="#f6efe0", color="#8b6f3d"];
+  gate  [shape=diamond, label="Is the recording room\nopen for this visit?", fillcolor="#fff7db", color="#8b6f3d"];
+  openp [label="Open path", fillcolor="#fff7db", color="#8b6f3d"];
+  closedp [label="Closed path", fillcolor="#fff7db", color="#8b6f3d"];
+
+  raw   [label="Write down the raw visitor\npacket x", fillcolor="#e8edf8", color="#51658f"];
+  proj  [label="Make three specialist copies\nQ visitor\nK visitor\nV visitor", fillcolor="#e8edf8", color="#51658f"];
+  shape [label="Arrange the copied packets\ninto attention layout", fillcolor="#e8edf8", color="#51658f"];
+  rope  [label="Send Q and K through the\nposition checkpoint\nuse cache offset if needed", fillcolor="#e8edf8", color="#51658f"];
+  note  [label="File x q k v into the notebook\none request packet per sample", fillcolor="#e8edf8", color="#51658f"];
+
+  inner [label="Send the real visitor into\nthe original inner house", fillcolor="#f6efe0", color="#8b6f3d"];
+  real  [label="The inner house performs\nreal attention work", fillcolor="#f6efe0", color="#8b6f3d"];
+  stop  [label="Capture closes for this run", fillcolor="#f6efe0", color="#8b6f3d"];
+
+  archive [label="Archive the notebook as\nqkv.pt", fillcolor="#f3e7f8", color="#7b4d8b"];
+  restore [label="When the temporary hooked engine\nis disposed, remove the temporary\nouter houses and restore the original houses", fillcolor="#f7f2e7", color="#8b6f3d"];
+  score [label="The scoring desk reads the notes\nthrough the normalized qk view", fillcolor="#f3e7f8", color="#7b4d8b"];
+
+  start -> load -> wrap;
+  wrap -> exec -> door -> room -> gate;
+  gate -> openp;
+  gate -> closedp;
+  openp -> raw -> proj -> shape -> rope -> note -> inner;
+  closedp -> inner;
+  inner -> real -> stop -> archive -> restore -> score;
+
+  {
+    rank=same;
+    start; load; wrap;
+  }
+
+  {
+    rank=same;
+    exec; door; room; gate; openp; closedp;
+  }
+
+  {
+    rank=same;
+    raw; proj; shape; rope; note; inner;
+  }
+
+  {
+    rank=same;
+    real; stop; archive; restore; score;
+  }
+}

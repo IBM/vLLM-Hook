@@ -6,6 +6,8 @@ import time
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+if os.environ.get("VLLM_HOOK_DEBUG", "") != "1":
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
 from vllm_hook_plugins import HookLLM
 
@@ -62,6 +64,12 @@ if __name__ == "__main__":
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
     model = 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' # 'mistralai/Mistral-7B-Instruct-v0.3' # 
     backend = os.environ.get("VLLM_HOOK_BACKEND")
+    debug = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
+    config_basename = f'{model.split("/")[-1]}.json'
+    if backend == "metal" and model == "ibm-granite/granite-3.1-8b-instruct":
+        # TODO: Delete this demo-level override once HookLLM selects the
+        # Metal-specific Granite attention-tracker config internally.
+        config_basename = "granite-3.1-8b-instruct-metal.json"
     
     dtype_map = {
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
@@ -74,7 +82,7 @@ if __name__ == "__main__":
         worker_name="probe_hook_qk",
         backend=backend,
         analyzer_name="attn_tracker",
-        config_file=f'model_configs/attention_tracker/{model.split("/")[-1]}.json',
+        config_file=f'model_configs/attention_tracker/{config_basename}',
         download_dir=cache_dir,
         gpu_memory_utilization=0.7,
         max_model_len=2048,
@@ -104,12 +112,14 @@ if __name__ == "__main__":
         print("=" * 50)
         instruction = case["instruction"]
         data = case["data"]
-        print(f"Instruction: '{instruction}'")
-        print(f"Data: '{data}'")
+        if debug:
+            print(f"Instruction: '{instruction}'")
+            print(f"Data: '{data}'")
         
         # Apply chat template and get ranges
         text, input_range = apply_chat_template_and_get_ranges(llm.tokenizer, model, instruction, data)
-        debug_token_layout(llm.tokenizer, text, input_range)
+        if debug:
+            debug_token_layout(llm.tokenizer, text, input_range)
 
         t0 = time.time()
         output = llm.generate(text, temperature=0.1, max_tokens=50)

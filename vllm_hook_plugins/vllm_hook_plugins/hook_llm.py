@@ -159,6 +159,11 @@ class HookLLM:
         if llm is None:
             return
         engine = getattr(llm, "llm_engine", None)
+        if engine is not None and hasattr(engine, "collective_rpc"):
+            try:
+                engine.collective_rpc("_uninstall_hooks")
+            except Exception:
+                pass
         if engine is not None and hasattr(engine, "shutdown"):
             engine.shutdown()
 
