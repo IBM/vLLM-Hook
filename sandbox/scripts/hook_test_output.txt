@@ -1,0 +1,54 @@
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 226040.34it/s]
+
+[hook] selecting model.layers.23.mlp
+[hook] parent path: model.layers.23
+[hook] target attr: mlp
+[hook] before: MLP
+[hook] after: SimpleHook
+[hook] effect: model.model.layers.23.mlp now dispatches through SimpleHook.__call__
+
+[hook] selecting model.layers.22.mlp
+[hook] parent path: model.layers.22
+[hook] target attr: mlp
+[hook] before: MLP
+[hook] after: SimpleHook
+[hook] effect: model.model.layers.22.mlp now dispatches through SimpleHook.__call__
+
+[hook] selecting model.layers.21.mlp
+[hook] parent path: model.layers.21
+[hook] target attr: mlp
+[hook] before: MLP
+[hook] after: SimpleHook
+[hook] effect: model.model.layers.21.mlp now dispatches through SimpleHook.__call__
+
+Registration complete: wrapped 24 modules
+Running inference...
+
+Results
+model.layers.0.mlp | Shape: (1, 4, 896)
+model.layers.1.mlp | Shape: (1, 4, 896)
+model.layers.2.mlp | Shape: (1, 4, 896)
+model.layers.3.mlp | Shape: (1, 4, 896)
+model.layers.4.mlp | Shape: (1, 4, 896)
+model.layers.5.mlp | Shape: (1, 4, 896)
+model.layers.6.mlp | Shape: (1, 4, 896)
+model.layers.7.mlp | Shape: (1, 4, 896)
+model.layers.8.mlp | Shape: (1, 4, 896)
+model.layers.9.mlp | Shape: (1, 4, 896)
+model.layers.10.mlp | Shape: (1, 4, 896)
+model.layers.11.mlp | Shape: (1, 4, 896)
+model.layers.12.mlp | Shape: (1, 4, 896)
+model.layers.13.mlp | Shape: (1, 4, 896)
+model.layers.14.mlp | Shape: (1, 4, 896)
+model.layers.15.mlp | Shape: (1, 4, 896)
+model.layers.16.mlp | Shape: (1, 4, 896)
+model.layers.17.mlp | Shape: (1, 4, 896)
+model.layers.18.mlp | Shape: (1, 4, 896)
+model.layers.19.mlp | Shape: (1, 4, 896)
+model.layers.20.mlp | Shape: (1, 4, 896)
+model.layers.21.mlp | Shape: (1, 4, 896)
+model.layers.22.mlp | Shape: (1, 4, 896)
+model.layers.23.mlp | Shape: (1, 4, 896)
+
+Sample data from model.layers.0.mlp (first five values):
+array([-0.270264, -0.176392, -0.103638, -0.168579, 0.00693512], dtype=float16)

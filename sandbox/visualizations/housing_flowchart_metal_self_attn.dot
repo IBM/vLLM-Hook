@@ -1,0 +1,105 @@
+digraph metal_self_attn_housing_flow {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad="0.22",
+    nodesep="0.34",
+    ranksep="0.52",
+    splines=ortho,
+    fontname="Helvetica"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#3b5870",
+    fillcolor="#eef4fa",
+    fontcolor="#1f2933",
+    margin="0.10,0.08"
+  ];
+
+  edge [
+    color="#657b8f",
+    penwidth=1.15,
+    arrowsize=0.7
+  ];
+
+  start [label="HookLLM opens the building\ncreates a new notebook\nand opens the recording room", fillcolor="#dfeaf6"];
+  load  [label="The worker enters the building,\nreads the posted hook instructions,\nand notes which floors matter", fillcolor="#dfeaf6"];
+  wrap  [label="The building directory finds each\ntracked self_attn house,\nchecks the house has the right occupants,\nand installs temporary outer houses", fillcolor="#e5f3e2", color="#466b3f"];
+
+  exec  [label="Visitors are allowed in\ncapture is active", fillcolor="#f7efe0", color="#8a6f35"];
+  door  [label="A visitor packet x arrives at\na self_attn front door", fillcolor="#f7efe0", color="#8a6f35"];
+  room  [label="The recording room checks\nwhich notebook this visit belongs to", fillcolor="#efe7f7", color="#71518d"];
+  gate  [shape=diamond, label="Is the recording room open?\nCapture must be active,\nthe hook flag must be posted,\nand a run notebook ID must exist", fillcolor="#fff4d8", color="#8a6f35"];
+
+  raw   [label="Write down the raw visitor\npacket x", fillcolor="#efe7f7", color="#71518d"];
+  proj  [label="Make three specialist copies:\nQ visitor, K visitor, V visitor", fillcolor="#efe7f7", color="#71518d"];
+  shape [label="Arrange the copied packets\ninto the same attention layout\nthe inner house will use", fillcolor="#efe7f7", color="#71518d"];
+  rope  [label="Send Q and K through the\nposition checkpoint\nuse cache offset if needed", fillcolor="#efe7f7", color="#71518d"];
+  note  [label="File x, q, k, and v into the notebook:\none floor tab per layer,\none section per packet kind,\none request packet per sample", fillcolor="#efe7f7", color="#71518d"];
+
+  inner [label="Send the real visitor into\nthe original inner house", fillcolor="#f7efe0", color="#8a6f35"];
+  real  [label="The inner house performs\nreal attention work", fillcolor="#f7efe0", color="#8a6f35"];
+  stop  [label="Capture closes for this run", fillcolor="#f7efe0", color="#8a6f35"];
+
+  archive [label="Archive the notebook to disk\nas qkv.pt in the run archive room", fillcolor="#f3e7f7", color="#7b4c8b"];
+  restore [label="When the temporary hooked engine\nis disposed, remove the temporary\nouter houses and restore the original houses", fillcolor="#f7f2e7", color="#8b6f35"];
+  score [label="The scoring desk reads the notes\nthrough the normalized qk view", fillcolor="#f3e7f7", color="#7b4c8b"];
+
+  start -> load -> wrap;
+  wrap -> exec -> door -> room -> gate;
+  gate -> inner [xlabel="no", fontcolor="#7b5d2d"];
+  gate -> raw [xlabel="yes", fontcolor="#7b5d2d"];
+  raw -> proj -> shape -> rope -> note -> inner;
+  inner -> real -> stop -> archive -> restore -> score;
+
+  {
+    rank=same;
+    start; load;
+  }
+
+  {
+    rank=same;
+    wrap; exec; door;
+  }
+
+  {
+    rank=same;
+    room; gate; raw;
+  }
+
+  {
+    rank=same;
+    proj; shape; rope;
+  }
+
+  {
+    rank=same;
+    note; inner; real;
+  }
+
+  {
+    rank=same;
+    stop; archive; restore;
+  }
+
+  {
+    rank=same;
+    score;
+  }
+
+  start -> load [style=invis, weight=10];
+  wrap -> exec [style=invis, weight=10];
+  exec -> door [style=invis, weight=10];
+  room -> gate [style=invis, weight=10];
+  gate -> raw [style=invis, weight=10];
+  proj -> shape [style=invis, weight=10];
+  shape -> rope [style=invis, weight=10];
+  note -> inner [style=invis, weight=10];
+  inner -> real [style=invis, weight=10];
+  stop -> archive [style=invis, weight=10];
+  archive -> restore [style=invis, weight=10];
+}
