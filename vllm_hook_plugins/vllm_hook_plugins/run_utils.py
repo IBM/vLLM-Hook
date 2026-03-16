@@ -33,6 +33,9 @@ def _artifact_glob(hook_dir: str, run_id: str) -> List[str]:
 
 
 def _normalize_qkv_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
+    # Metal workers archive richer `qkv.pt` notebooks, but the current
+    # analyzer still consumes the legacy `qk_cache` shape. Normalize the Metal
+    # artifact here so the rest of the analyzer path can stay unchanged.
     qkv_cache = cache.get("qkv_cache")
     if not qkv_cache:
         return cache
@@ -82,6 +85,8 @@ def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     shareds = []
     for p in shared_paths:
         cache = torch.load(p, map_location="cpu")
+        # Convert Metal-style `qkv_cache` artifacts into the legacy `qk_cache`
+        # view expected by the existing attention analyzer and merge path.
         cache = _normalize_qkv_cache(cache)
         meta = cache.get("meta", {})
         tp_rank = int(meta.get("tp_rank", 0))
