@@ -26,10 +26,9 @@ class MLXHookWrapper(nn.Module):
         self.hook_fn = hook_fn
 
     def __call__(self, *args, **kwargs):
-        # Let the original attention house do its real work, then hand the
-        # visit details to the recording room hook before returning.
+        self.hook_fn("pre", args, None, self.name)
         output = self.module(*args, **kwargs)
-        self.hook_fn(args, output, self.name)
+        self.hook_fn("post", args, output, self.name)
         return output
 
 
@@ -307,6 +306,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens")
+        self.capture_phase = os.environ.get("VLLM_HOOK_CAPTURE_PHASE", "pre")
 
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
             print("Missing hook environment variables")
@@ -411,6 +411,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             original_attn = module
 
             def attention_hook(
+                phase,
                 input_args,
                 _output,
                 _module_name,
@@ -424,6 +425,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 #   copies for this floor
                 run_id = self._current_run_id()
                 if run_id is None:
+                    return None
+                if phase != self.capture_phase:
                     return None
                 self._capture_from_self_attn(run_id, layer_num, attn, input_args)
                 return None
