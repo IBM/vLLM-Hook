@@ -47,14 +47,14 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: 
     instruction_len = len(tokenizer.encode(instruction))
     data_len = len(tokenizer.encode(data))
             
-    if "granite-3.1" in model_name:
+    if "granite" in model_name.lower():
         data_range = ((3, 3+instruction_len), (-5-data_len, -5))
-    elif "Mistral-7B" in model_name:
+    elif "mistral" in model_name.lower():
         data_range = ((3, 3+instruction_len), (-1-data_len, -1))
-    elif "Qwen2-1.5B" in model_name:
+    elif "qwen2" in model_name.lower():
         data_range = ((3, 3+instruction_len), (-5-data_len, -5))
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unsupported model template logic for {model_name}")
     
     return text, data_range
 
