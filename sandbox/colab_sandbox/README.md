@@ -28,8 +28,9 @@ captured on Colab against a Metal run captured locally.
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/<your-user>/<your-repo>.git
+git clone https://github.com/tburleyinfo/vLLM-Hook/
 cd vLLM-Hook
+git switch sandbox
 pip install -e .
 ```
 
