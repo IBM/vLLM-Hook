@@ -62,10 +62,17 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
 
 if __name__ == "__main__":
 
-    cache_dir = "/dccstor/pyrite/irene/"
-    model = 'mistralai/Mistral-7B-Instruct-v0.3' # 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' #
+    # cache_dir = "/dccstor/pyrite/irene/"
+    cache_dir = os.path.expanduser("~/.cache/vllm-hook")
+    model = 'ibm-granite/granite-4.0-micro'  # old default: 'mistralai/Mistral-7B-Instruct-v0.3'
+    # model = 'mistralai/Mistral-7B-Instruct-v0.3'
+    # model = 'ibm-granite/granite-3.1-8b-instruct'
+    # model = 'Qwen/Qwen2-1.5B-Instruct'
+    keep_only_case = 1  # Set to None to run all single-case examples.
+    run_batch_example = False
     
     dtype_map = {
+        'ibm-granite/granite-4.0-micro': torch.float16,
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
         'ibm-granite/granite-3.1-8b-instruct': torch.float16,
         'Qwen/Qwen2-1.5B-Instruct': torch.float
@@ -200,6 +207,9 @@ if __name__ == "__main__":
             ]
         }
     ]
+
+    if keep_only_case is not None:
+        test_cases = [test_cases[keep_only_case]]
         
     for case in test_cases:
         print("=" * 50)
@@ -223,28 +233,29 @@ if __name__ == "__main__":
 
 
     ### batch processing, beta mode, not fully tested
-    print("=" * 50)
-    print("Batch processing examples...")
-    text_querys = []
-    query_specs = []
-    text_nas = []
-    na_specs = []
-    for case in test_cases:
-        query = case["query"]
-        documents = case["documents"]
-        
-        # Apply chat template and get ranges
-        text_query, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
-        text_na, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
+    if run_batch_example:
+        print("=" * 50)
+        print("Batch processing examples...")
+        text_querys = []
+        query_specs = []
+        text_nas = []
+        na_specs = []
+        for case in test_cases:
+            query = case["query"]
+            documents = case["documents"]
+            
+            # Apply chat template and get ranges
+            text_query, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
+            text_na, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
 
-        text_querys.append(text_query)
-        query_specs.append(query_spec)        
-        text_nas.append(text_na)
-        na_specs.append(na_spec)
-    
-    llm.generate(text_querys, temperature=0.1, max_tokens=1)
-    llm.generate(text_nas, cleanup=False, temperature=0.1, max_tokens=1)
-    
-    stats = llm.analyze(analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
-    print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
-    llm.llm_engine.reset_prefix_cache()
+            text_querys.append(text_query)
+            query_specs.append(query_spec)        
+            text_nas.append(text_na)
+            na_specs.append(na_spec)
+        
+        llm.generate(text_querys, temperature=0.1, max_tokens=1)
+        llm.generate(text_nas, cleanup=False, temperature=0.1, max_tokens=1)
+        
+        stats = llm.analyze(analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
+        print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
+        llm.llm_engine.reset_prefix_cache()

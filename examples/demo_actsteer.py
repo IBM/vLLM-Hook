@@ -16,6 +16,7 @@ if __name__ == "__main__":
     
     dtype_map = {
         'microsoft/Phi-3-mini-4k-instruct': 'auto',
+        'ibm-granite/granite-4.0-micro': torch.float16,
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
         'ibm-granite/granite-3.1-8b-instruct': torch.float16,
         'Qwen/Qwen2-1.5B-Instruct': torch.float

@@ -74,7 +74,7 @@ For `attntracker`:
 ```bash
 python sandbox/colab_sandbox/export_nonmetal_bundle.py \
   --analyzer attntracker \
-  --model mistralai/Mistral-7B-Instruct-v0.3 \
+  --model ibm-granite/granite-4.0-micro \
   --input-json /content/attntracker_input.json \
   --output-dir /content/nonmetal_bundle_attn
 ```
@@ -84,7 +84,7 @@ For `corer`:
 ```bash
 python sandbox/colab_sandbox/export_nonmetal_bundle.py \
   --analyzer corer \
-  --model mistralai/Mistral-7B-Instruct-v0.3 \
+  --model ibm-granite/granite-4.0-micro \
   --input-json /content/corer_input.json \
   --output-dir /content/nonmetal_bundle_corer
 ```

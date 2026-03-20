@@ -62,12 +62,16 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: 
 if __name__ == "__main__":
 
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
-    model = 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' # 'mistralai/Mistral-7B-Instruct-v0.3' # 
+    model = 'ibm-granite/granite-4.0-micro'  # old default: 'ibm-granite/granite-3.1-8b-instruct'
+    # model = 'ibm-granite/granite-3.1-8b-instruct'
+    # model = 'Qwen/Qwen2-1.5B-Instruct'
+    # model = 'mistralai/Mistral-7B-Instruct-v0.3'
     backend = os.environ.get("VLLM_HOOK_BACKEND")
     debug = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
     config_basename = f'{model.split("/")[-1]}.json'
     
     dtype_map = {
+        'ibm-granite/granite-4.0-micro': torch.float16,
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
         'ibm-granite/granite-3.1-8b-instruct': torch.float16,
         'Qwen/Qwen2-1.5B-Instruct': torch.float
