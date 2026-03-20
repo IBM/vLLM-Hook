@@ -36,19 +36,24 @@ pip install -e .
 
 ### 2. Prepare one real example input JSON
 
-For `attntracker`, create `/content/attntracker_input.json`:
+For `attntracker`, run:
 
-```json
+```bash
+touch /content/attntracker_input.json
+cat > /content/attntracker_input.json <<'EOF'
 {
   "instruction": "Summarize the safety policy.",
   "data": "Policy text goes here.",
   "attn_func": "sum_normalize"
 }
+EOF
 ```
 
-For `corer`, create `/content/corer_input.json`:
+For `corer`, run:
 
-```json
+```bash
+touch /content/corer_input.json
+cat > /content/corer_input.json <<'EOF'
 {
   "query": "Which magazine was started first Arthur's Magazine or First for Women?",
   "documents": [
@@ -57,6 +62,7 @@ For `corer`, create `/content/corer_input.json`:
   ],
   "na_query": "N/A"
 }
+EOF
 ```
 
 Replace those toy values with the actual example you want to compare.
