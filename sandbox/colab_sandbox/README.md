@@ -31,7 +31,7 @@ captured on Colab against a Metal run captured locally.
 git clone https://github.com/tburleyinfo/vLLM-Hook/
 cd vLLM-Hook
 git switch sandbox
-pip install -e .
+pip install -e vllm_hook_plugins/
 ```
 
 ### 2. Prepare one real example input JSON
