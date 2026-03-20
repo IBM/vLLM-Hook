@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 vllm_hook_plugins/vllm_hook_plugins.egg-info/
+
+# Ignore sandbox by default; keep only the Colab workflow tracked.
+/sandbox/*
+!/sandbox/colab_sandbox/
+!/sandbox/colab_sandbox/**
