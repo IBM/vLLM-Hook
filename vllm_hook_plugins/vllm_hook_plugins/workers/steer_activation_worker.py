@@ -107,5 +107,14 @@ class SteerHookActWorker(V1Worker):
             "apply_at_all_positions": steering_config.get("apply_at_all_positions", True)
         }
 
+    def _uninstall_hooks(self):
+        for hook in getattr(self, "_hooks", []):
+            try:
+                hook.remove()
+            except Exception:
+                pass
+        if hasattr(self, "_hooks"):
+            self._hooks.clear()
+
     def execute_model(self, *args, **kwargs):
         return super().execute_model(*args, **kwargs)
