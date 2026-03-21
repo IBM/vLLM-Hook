@@ -3,6 +3,28 @@
 This note summarizes the current matched Metal vs non-Metal CoRe comparison
 using the repeatable `sandbox/colab_sandbox` workflow.
 
+## Prompt Used
+
+The matched CoRe comparison used the checked-in input payload from
+[corer_input.json](/Users/timothyburley/opensource/vLLM-Hook/sandbox/colab_sandbox/corer_input.json):
+
+Query:
+
+```text
+Which magazine was started first Arthur's Magazine or First for Women?
+```
+
+Documents:
+
+1. `Arthur's Magazine was an American literary periodical published in the 1840s.`
+2. `First for Women is a woman's magazine published in the USA and was started in 1989.`
+
+NA query:
+
+```text
+N/A
+```
+
 ## Command
 
 ```bash
@@ -39,6 +61,22 @@ corer_doc_sums:
   mode=ref_best_nonmetal doc_sums=[0.8056640625, 2.0703125] delta_vs_nonmetal=[0.02392578125, -0.017578125]
 ```
 
+Per-document token mass from the probe output:
+
+- `nonmetal` doc 1 mass is concentrated mostly in the last two positions:
+  - `0.6611`
+  - `0.1155`
+- `nonmetal` doc 2 mass is concentrated mostly in the last two positions:
+  - `1.1328`
+  - `0.8696`
+- `metal` preserves that overall pattern:
+  - doc 1 tail mass: `0.6846`, `0.1147`
+  - doc 2 tail mass: `1.1179`, `0.8601`
+
+That means the Metal residual is not coming from a completely different
+document-selection pattern. It is a small redistribution of mass around the
+same high-impact document tokens.
+
 ## Findings
 
 1. Metal vs non-Metal CoRe scores are close on this matched example.
@@ -61,6 +99,47 @@ corer_doc_sums:
    The current result does not show a large CoRe distortion caused by the Metal
    capture path.
 
+6. Layer-level tensor drift is small, consistent, and largest in deeper layers.
+   From the probe JSON:
+
+   - layer 12:
+     - Metal vs non-Metal `q` mean abs diff: `0.02329`
+     - Metal vs non-Metal `k` mean abs diff: `0.02835`
+   - layer 15:
+     - `q`: `0.02568`
+     - `k`: `0.03079`
+   - layer 16:
+     - `q`: `0.02509`
+     - `k`: `0.03176`
+   - layer 18:
+     - `q`: `0.03013`
+     - `k`: `0.04179`
+
+   Cosine similarity remains extremely high across all of these comparisons:
+   roughly `0.99996` to `0.99998`.
+
+7. `k` drift is consistently larger than `q` drift.
+   That suggests the residual CoRe score gap may be more sensitive to small key
+   differences than to query differences in this example.
+
+8. `ref_post` is slightly closer to the non-Metal tensors than raw Metal.
+   Example:
+
+   - layer 12:
+     - Metal `q`: `0.02329`
+     - Post-RoPE reference `q`: `0.02217`
+     - Metal `k`: `0.02835`
+     - Post-RoPE reference `k`: `0.02677`
+   - layer 18:
+     - Metal `q`: `0.03013`
+     - Post-RoPE reference `q`: `0.02920`
+     - Metal `k`: `0.04179`
+     - Post-RoPE reference `k`: `0.04029`
+
+   This reinforces that the remaining issue is not a gross semantic failure.
+   It looks like small numeric/path-specific drift after the correct
+   attention-ready reconstruction steps.
+
 ## Interpretation
 
 The current evidence supports:
@@ -68,6 +147,72 @@ The current evidence supports:
 - the stable capture boundary is acceptable
 - RoPE must be applied
 - the remaining Metal vs non-Metal gap is small on this example
+
+The current evidence also suggests:
+
+- the residual score gap is driven by small tensor drift across multiple layers
+  rather than one catastrophic failure
+- later layers, especially layer `18`, are the strongest current candidates for
+  explaining the remaining difference
+- the dominant residual may be in `k` rather than `q`
+
+## Larger-Document Hypothesis
+
+It is fair to treat document length as a plausible risk factor for larger CoRe
+drift.
+
+Reasoning:
+
+- CoRe aggregates all-token attention mass over document spans
+- the matched Granite 4 micro test already shows small Metal vs non-Metal
+  tensor drift across multiple layers
+- with longer documents, there are more document-token positions over which
+  that small drift can accumulate
+
+So the conservative statement is:
+
+- the current evidence is consistent with the idea that CoRe drift can worsen
+  as document length grows
+- but the current matched test does not prove that yet
+
+## Why This Hypothesis Is Reasonable
+
+The original larger-document CoRe run showed a much wider Metal vs non-Metal
+margin than the small 2-document control example summarized above.
+
+Original Metal result:
+
+```text
+Sorted document IDs and scores by CoRe-Reranking:
+[[6, 3, 1, 0, 4, 5, 2]]:
+[[5.625, 3.921875, 2.296875, 2.046875, 1.53125, 0.734375, 0.54296875]]
+```
+
+Original non-Metal result:
+
+```text
+Sorted document IDs and scores by CoRe-Reranking:
+[[6, 3, 1, 0, 4, 2, 5]]:
+[[4.04296875, 3.427734375, 2.419921875, 1.6767578125, 1.62890625, 1.01953125, 0.79736328125]]
+```
+
+What that suggests:
+
+- the ranking prefix remains mostly stable
+- the score margin is substantially larger than in the matched 2-document test
+- the lower-ranked documents can swap order under the accumulated drift
+
+That pattern is consistent with an accumulation story:
+
+- small per-layer tensor drift
+- distributed over many more document tokens
+- producing larger integrated CoRe score differences
+
+But there is still an important caveat:
+
+- this larger-document example is suggestive, not isolating
+- it is not yet a clean length-controlled sweep
+- so it supports the hypothesis without proving that length alone is the cause
 
 The current evidence does not support:
 
@@ -92,6 +237,17 @@ The current evidence does not support:
 4. Replace the temporary Granite 4 micro layer/head config with a real one.
    The current Granite 4 micro config was adapted from older models and should
    be re-derived properly.
+
+5. Compare token-level CoRe deltas directly.
+   The current summary already shows that the largest mass sits on the same
+   document-tail tokens for Metal and non-Metal. The next step is to compute
+   explicit token-by-token deltas and rank which positions explain the final
+   `doc_sums` difference.
+
+6. Run a document-length sweep.
+   Keep the same query and relevant evidence, then progressively increase the
+   document span length and measure whether the Metal vs non-Metal CoRe gap
+   grows monotonically or near-monotonically.
 
 ## Artifacts
 
