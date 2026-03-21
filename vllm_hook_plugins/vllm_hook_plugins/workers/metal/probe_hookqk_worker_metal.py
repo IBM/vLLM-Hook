@@ -2,6 +2,7 @@ import math
 import os
 from typing import Dict, List
 
+import mlx.core as mx
 import mlx.nn as nn
 import torch
 from vllm.utils.torch_utils import set_random_seed
@@ -181,14 +182,78 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             [tokens[i].clone() for i in range(tokens.shape[0])]
         )
 
+    def _append_proj_token_list(
+        self,
+        run_id: str,
+        layer_num: int,
+        proj_kind: str,
+        token_list: list[torch.Tensor],
+    ) -> None:
+        cache = self._ensure_run_cache(run_id)
+        module_name = f"model.layers.{layer_num}.self_attn.attn.{proj_kind}"
+        layer_cache = cache["qkv_cache"].setdefault(
+            module_name,
+            {
+                "layer_num": layer_num,
+                "proj_kind": proj_kind,
+                "tokens": [],
+            },
+        )
+        layer_cache["tokens"].extend([tokens.clone() for tokens in token_list])
+
+    def _mx_offsets_to_int_list(self, value, batch_size: int) -> list[int]:
+        if value is None:
+            return [0] * batch_size
+        if isinstance(value, int):
+            return [int(value)] * batch_size
+        if hasattr(value, "shape"):
+            value_torch = mlx_to_torch(value, device="cpu")
+            if value_torch.ndim == 0:
+                return [int(value_torch.item())] * batch_size
+            return [int(x) for x in value_torch.tolist()]
+        return [int(value)] * batch_size
+
+    def _flatten_attention_sample(self, sample) -> torch.Tensor:
+        # Convert one `[heads, seq, head_dim]` packet into the legacy
+        # `[seq, heads * head_dim]` notebook layout.
+        flat = sample.transpose(1, 0, 2).reshape(sample.shape[1], -1)
+        return mlx_to_torch(flat, device="cpu")
+
+    def _build_full_kv_without_mutation(self, cache, keys, values):
+        # Reconstruct the attention-ready full-history K/V packets that the
+        # live MLX attention path will use, without mutating the real cache.
+        batch_size = keys.shape[0]
+        if cache is None or not hasattr(cache, "keys") or cache.keys is None:
+            return [keys[i] for i in range(batch_size)], [values[i] for i in range(batch_size)]
+
+        lengths = self._mx_offsets_to_int_list(getattr(cache, "offset", None), batch_size)
+        left_padding = self._mx_offsets_to_int_list(
+            getattr(cache, "left_padding", None), batch_size
+        )
+
+        full_keys = []
+        full_values = []
+        for i in range(batch_size):
+            old_len = max(0, lengths[i])
+            pad = max(0, left_padding[i])
+            if old_len > 0:
+                old_k = cache.keys[i, :, pad : pad + old_len, :]
+                old_v = cache.values[i, :, pad : pad + old_len, :]
+                full_keys.append(mx.concatenate([old_k, keys[i]], axis=1))
+                full_values.append(mx.concatenate([old_v, values[i]], axis=1))
+            else:
+                full_keys.append(keys[i])
+                full_values.append(values[i])
+        return full_keys, full_values
+
     def _record_qkv(  # qkv_hook in non metal worker.
         self,
         run_id: str,
         layer_num: int,
         raw_x,
         queries,
-        keys,
-        values,
+        key_samples,
+        value_samples,
     ) -> None:
         # Housing analogy:
         # - `raw_x` is the visitor as it first enters the self-attention house
@@ -207,15 +272,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         q_flat = queries.transpose(0, 2, 1, 3).reshape(
             queries.shape[0], queries.shape[2], -1
         )
-        k_flat = keys.transpose(0, 2, 1, 3).reshape(keys.shape[0], keys.shape[2], -1)
-        v_flat = values.transpose(0, 2, 1, 3).reshape(
-            values.shape[0], values.shape[2], -1
-        )
         # Archive everything on CPU so the on-disk notebook does not depend on
         # the lifetime of MLX tensors or Metal device state.
         q_torch = mlx_to_torch(q_flat, device="cpu")
-        k_torch = mlx_to_torch(k_flat, device="cpu")
-        v_torch = mlx_to_torch(v_flat, device="cpu")
+        k_torch = [self._flatten_attention_sample(sample) for sample in key_samples]
+        v_torch = [self._flatten_attention_sample(sample) for sample in value_samples]
 
         self._append_proj_tokens(run_id, layer_num, "x", x_torch)
         # Q is the only packet kind whose storage width changes with
@@ -226,8 +287,8 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             self._append_proj_tokens(run_id, layer_num, "q", q_torch[:, -1:, :])
         else:
             raise NotImplementedError(self.hookq_mode)
-        self._append_proj_tokens(run_id, layer_num, "k", k_torch)
-        self._append_proj_tokens(run_id, layer_num, "v", v_torch)
+        self._append_proj_token_list(run_id, layer_num, "k", k_torch)
+        self._append_proj_token_list(run_id, layer_num, "v", v_torch)
 
         if self._debug_hook:
             print(
@@ -284,9 +345,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             queries = attn_module.rope(queries)
             keys = attn_module.rope(keys)
 
+        full_keys, full_values = self._build_full_kv_without_mutation(cache, keys, values)
+
         # At this point the packets match the real attention-ready values, so
         # the notebook can archive them without depending on a deeper hook.
-        self._record_qkv(run_id, layer_num, raw_x, queries, keys, values)
+        self._record_qkv(run_id, layer_num, raw_x, queries, full_keys, full_values)
 
     def _install_hooks(self):
         # `model_runner.model` is the live MLX model object that will actually

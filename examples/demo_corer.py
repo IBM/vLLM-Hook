@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 import multiprocessing as mp
 import torch
@@ -61,6 +63,11 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
     return llm_prompt, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # DEBUG/TEMP: lets local Metal runs consume the same JSON payload shape as
+    # sandbox/colab_sandbox/README.md. Remove once the comparison workflow is stable.
+    parser.add_argument("--debug-input-json", default=None)
+    args = parser.parse_args()
 
     # cache_dir = "/dccstor/pyrite/irene/"
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
@@ -207,6 +214,15 @@ if __name__ == "__main__":
             ]
         }
     ]
+    if args.debug_input_json:
+        payload = json.loads(open(args.debug_input_json).read())
+        test_cases = [
+            {
+                "query": payload["query"],
+                "documents": payload["documents"],
+            }
+        ]
+        keep_only_case = None
 
     if keep_only_case is not None:
         test_cases = [test_cases[keep_only_case]]

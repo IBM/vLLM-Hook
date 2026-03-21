@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+import torch
 
 
 def flatten_layer_heads(layer_to_heads: dict[str, list[int]] | dict[int, list[int]]) -> str:
@@ -12,9 +13,45 @@ def flatten_layer_heads(layer_to_heads: dict[str, list[int]] | dict[int, list[in
     return ";".join(parts)
 
 
+def resolve_default_metal_path(project_root: Path, analyzer: str) -> Path:
+    bundle_dir = project_root / "sandbox" / "colab_sandbox" / "output" / f"metal_bundle_{analyzer}"
+    qkv = bundle_dir / "qkv.pt"
+    if not qkv.exists():
+        raise FileNotFoundError(
+            f"No default metal bundle found at {qkv}. "
+            f"Run sandbox/colab_sandbox/export_metal_bundle.py first."
+        )
+    return qkv
+
+
+def available_metal_layers(metal_path: Path) -> set[int]:
+    cache = torch.load(metal_path, map_location="cpu")
+    qkv = cache.get("qkv_cache", {})
+    layers = set()
+    for proj_data in qkv.values():
+        layers.add(int(proj_data["layer_num"]))
+    return layers
+
+
+def filter_layer_heads_to_metal(
+    layer_to_heads: dict[str, list[int]] | dict[int, list[int]],
+    metal_layers: set[int],
+) -> dict[int, list[int]]:
+    filtered: dict[int, list[int]] = {}
+    for layer, heads in layer_to_heads.items():
+        layer_idx = int(layer)
+        if layer_idx in metal_layers:
+            filtered[layer_idx] = heads
+    if not filtered:
+        raise ValueError(
+            f"No configured layers overlap with available metal layers: {sorted(metal_layers)}"
+        )
+    return filtered
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metal", required=True, help="Path to Metal qkv.pt or containing run dir")
+    parser.add_argument("--metal", default=None, help="Path to Metal qkv.pt or containing run dir")
     parser.add_argument("--bundle-dir", required=True, help="Exported Colab bundle directory")
     parser.add_argument("--sample", type=int, default=0)
     parser.add_argument("--dtype", default=None)
@@ -25,21 +62,30 @@ def main() -> None:
     bundle_dir = Path(args.bundle_dir).expanduser().resolve()
     metadata = json.loads((bundle_dir / "metadata.json").read_text())
     analyzer = metadata["analyzer"]
+    project_root = Path(__file__).resolve().parents[2]
+    metal_path = (
+        Path(args.metal).expanduser().resolve()
+        if args.metal is not None
+        else resolve_default_metal_path(project_root, analyzer)
+    )
     qk_path = bundle_dir / "qk.pt"
     model = metadata["model"]
-    layer_heads = flatten_layer_heads(metadata["layer_to_heads"])
+    layer_heads = filter_layer_heads_to_metal(
+        metadata["layer_to_heads"],
+        available_metal_layers(metal_path),
+    )
 
     cmd = [
         sys.executable,
-        str(Path(__file__).resolve().parents[1] / "scripts" / "analyzer_score_probe.py"),
+        str(project_root / "sandbox" / "scripts" / "analyzer_score_probe.py"),
         "--metal",
-        args.metal,
+        str(metal_path),
         "--nonmetal",
         str(qk_path),
         "--model",
         model,
         "--layer-heads",
-        layer_heads,
+        flatten_layer_heads(layer_heads),
         "--sample",
         str(args.sample),
         "--max-rope-offset",

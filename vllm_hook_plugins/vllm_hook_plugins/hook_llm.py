@@ -235,6 +235,7 @@ class HookLLM:
             hook_llm = self._build_llm(use_hook_worker=True)
             prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
             hook_llm.generate(prompts, prefill_params)
+            self._assert_hook_artifacts_exist()
         finally:
             self._cleanup_hooks()
             self._dispose_llm(hook_llm)
@@ -257,6 +258,7 @@ class HookLLM:
             if sampling_params is None:
                 sampling_params = SamplingParams(**kwargs)
             output = hook_llm.generate(prompts, sampling_params)
+            self._assert_hook_artifacts_exist()
         finally:
             self._cleanup_hooks()
             self._dispose_llm(hook_llm)
@@ -307,4 +309,47 @@ class HookLLM:
             print("Hooks deactivated.")
         else:
             print("No hooks to be deactivated.")
+
+    def _assert_hook_artifacts_exist(self) -> None:
+        run_ids = []
+        if os.path.exists(self._run_id_file):
+            with open(self._run_id_file, "r") as f:
+                run_ids = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+        run_id = run_ids[-1] if run_ids else None
+        if not run_id:
+            raise RuntimeError("Hook run completed without a recorded run ID.")
+
+        qk_paths = glob.glob(
+            os.path.join(self._hook_dir, run_id, "**", "qk.pt"),
+            recursive=True,
+        )
+        qkv_paths = glob.glob(
+            os.path.join(self._hook_dir, run_id, "**", "qkv.pt"),
+            recursive=True,
+        )
+        if qk_paths or qkv_paths:
+            return
+
+        hook_seen_paths = glob.glob(
+            os.path.join(self._hook_dir, run_id, "**", "hook_seen.txt"),
+            recursive=True,
+        )
+        outer_seen_paths = glob.glob(
+            os.path.join(self._hook_dir, run_id, "**", "outer_seen.txt"),
+            recursive=True,
+        )
+        marker_note = (
+            f" Hook markers found: {hook_seen_paths}."
+            if hook_seen_paths
+            else " No hook markers were written."
+        )
+        outer_note = (
+            f" Outer self_attn markers found: {outer_seen_paths}."
+            if outer_seen_paths
+            else " No outer self_attn markers were written."
+        )
+        raise RuntimeError(
+            "Hooked generation completed but produced no qk/qkv artifact for "
+            f"run_id={run_id} under {self._hook_dir}." + marker_note + outer_note
+        )
     
