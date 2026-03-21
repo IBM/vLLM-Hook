@@ -32,6 +32,7 @@ def register_plugins():
 
     # Register analyzers
     PluginRegistry.register_analyzer("attn_tracker", AttntrackerAnalyzer)
+    PluginRegistry.register_analyzer("attention_tracker", AttntrackerAnalyzer)
     PluginRegistry.register_analyzer("core_reranker", CorerAnalyzer)
 
 __all__ = [
