@@ -136,6 +136,23 @@ def flatten_layer_heads(important_heads: list[list[int]]) -> dict[int, list[int]
     return dict(sorted(out.items()))
 
 
+def to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return value.item()
+        return value.detach().cpu().tolist()
+    if hasattr(value, "item") and callable(value.item):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--analyzer", required=True, choices=["attntracker", "corer"])
@@ -256,7 +273,7 @@ def main() -> None:
         (output_dir / filename).write_text(json.dumps(data, indent=2))
 
     analyzer_output_path = output_dir / "analyzer_outputs.json"
-    analyzer_output_path.write_text(json.dumps(analyzer_output, indent=2))
+    analyzer_output_path.write_text(json.dumps(to_jsonable(analyzer_output), indent=2))
 
     metadata = {
         "model": args.model,
