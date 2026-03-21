@@ -242,8 +242,8 @@ def main() -> None:
         )
         llm.generate(na_prompt, cleanup=False, temperature=args.temperature, max_tokens=args.max_tokens)
         analyzer_output = llm.analyze(analyzer_spec=analyzer_spec)
-        query_doc_span, query_start, after_instruct, query_end = analyzer_spec["query_spec"]
-        _, na_query_start, na_after_instruct, na_query_end = analyzer_spec["na_spec"]
+        query_doc_span, query_start, after_instruct, query_end = query_spec
+        _, na_query_start, na_after_instruct, na_query_end = na_spec
         spec_files = {
             "corer_spec.json": {
                 "doc_span": [query_doc_span],
