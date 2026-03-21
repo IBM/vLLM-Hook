@@ -76,6 +76,8 @@ python sandbox/colab_sandbox/export_nonmetal_bundle.py \
   --analyzer attntracker \
   --model ibm-granite/granite-4.0-micro \
   --input-json /content/attntracker_input.json \
+  --gpu-memory-utilization 0.2 \
+  --max-model-len 1024 \
   --output-dir /content/nonmetal_bundle_attn
 ```
 
@@ -86,6 +88,8 @@ python sandbox/colab_sandbox/export_nonmetal_bundle.py \
   --analyzer corer \
   --model ibm-granite/granite-4.0-micro \
   --input-json /content/corer_input.json \
+  --gpu-memory-utilization 0.2 \
+  --max-model-len 1024 \
   --output-dir /content/nonmetal_bundle_corer
 ```
 
@@ -102,6 +106,47 @@ Each bundle should contain:
 - `metadata.json`
 - `analyzer_outputs.json`
 - `attn_spec.json` or `corer_spec.json`
+
+### If Colab still refuses to start the engine
+
+The key line is:
+
+```text
+Free memory on device cuda:0 (...) is less than desired GPU memory utilization
+```
+
+That means the GPU already has too little free memory for the fraction you
+requested. On Colab this usually happens because an earlier vLLM engine is
+still alive in the notebook session.
+
+Use this recovery sequence:
+
+```bash
+pkill -f vllm || true
+pkill -f EngineCore || true
+python - <<'PY'
+import gc
+import torch
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    print(torch.cuda.mem_get_info())
+PY
+```
+
+Then rerun the exporter with a lower memory target if needed:
+
+```bash
+python sandbox/colab_sandbox/export_nonmetal_bundle.py \
+  --analyzer attntracker \
+  --model ibm-granite/granite-4.0-micro \
+  --input-json /content/attntracker_input.json \
+  --gpu-memory-utilization 0.15 \
+  --max-model-len 1024 \
+  --output-dir /content/nonmetal_bundle_attn
+```
+
+If that still fails, restart the Colab runtime before retrying.
 
 ## Local Steps
 

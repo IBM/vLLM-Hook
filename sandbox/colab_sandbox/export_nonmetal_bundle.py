@@ -146,8 +146,8 @@ def main() -> None:
     parser.add_argument("--config-file", default=None)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--max-tokens", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
-    parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.2)
+    parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     args = parser.parse_args()
 
