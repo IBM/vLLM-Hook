@@ -23,11 +23,19 @@ def register_plugins():
     PluginRegistry.register_worker("probe_hook_qk", ProbeHookQKWorker)
     if _can_register_metal_worker():
         try:
-            from vllm_hook_plugins.workers.metal import ProbeHookQKWorkerMetal
+            from vllm_hook_plugins.workers.metal import (
+                ProbeHookQKWorkerMetal,
+                SteerHookActWorkerMetal,
+            )
         except Exception:
             ProbeHookQKWorkerMetal = None
+            SteerHookActWorkerMetal = None
         if ProbeHookQKWorkerMetal is not None:
             PluginRegistry.register_worker("probe_hook_qk_metal", ProbeHookQKWorkerMetal)
+        if SteerHookActWorkerMetal is not None:
+            PluginRegistry.register_worker(
+                "steer_hook_act_metal", SteerHookActWorkerMetal
+            )
     PluginRegistry.register_worker("steer_hook_act", SteerHookActWorker)
 
     # Register analyzers

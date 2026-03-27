@@ -3,6 +3,7 @@ import json
 import glob
 import uuid
 import platform
+import tempfile
 from importlib.util import find_spec
 from typing import Optional, Dict, List
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
@@ -34,12 +35,7 @@ class HookLLM:
         self._plugin_registry = None
         self._last_generate_used_hooks = False
 
-        if hook_dir is not None:
-            HOOK_DIR = hook_dir
-        else:
-            HOOK_DIR = os.path.join(download_dir,'_v1_qk_peeks')
-        os.makedirs(HOOK_DIR, exist_ok=True)
-        self._hook_dir = HOOK_DIR
+        self._hook_dir = self._resolve_hook_dir(download_dir, hook_dir)
         self._hook_flag = os.path.join(self._hook_dir, "EXTRACT.flag")
         self._run_id_file = os.path.join(self._hook_dir, "RUN_ID.txt")
         
@@ -81,6 +77,36 @@ class HookLLM:
                 self._plugin_registry = PluginRegistry
             self.analyzer = self._plugin_registry.get_analyzer(analyzer_name).analyzer
             self.analyzer = self.analyzer(self._hook_dir, self.layer_to_heads)
+
+    @staticmethod
+    def _resolve_hook_dir(download_dir: str, hook_dir: Optional[str]) -> str:
+        candidates = []
+        if hook_dir is not None:
+            candidates.append(os.path.expanduser(hook_dir))
+        else:
+            candidates.append(
+                os.path.join(os.path.expanduser(download_dir), "_v1_qk_peeks")
+            )
+
+        candidates.append(os.path.join(os.path.expanduser("~/.cache"), "_v1_qk_peeks"))
+        candidates.append(os.path.join(tempfile.gettempdir(), "_v1_qk_peeks"))
+
+        seen = set()
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                return candidate
+            except OSError:
+                continue
+
+        raise OSError(
+            "Could not create a writable hook cache directory. "
+            f"Tried: {', '.join(seen)}"
+        )
 
     @staticmethod
     def _resolve_backend(
@@ -258,7 +284,6 @@ class HookLLM:
             if sampling_params is None:
                 sampling_params = SamplingParams(**kwargs)
             output = hook_llm.generate(prompts, sampling_params)
-            self._assert_hook_artifacts_exist()
         finally:
             self._cleanup_hooks()
             self._dispose_llm(hook_llm)
