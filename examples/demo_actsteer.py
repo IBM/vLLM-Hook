@@ -13,7 +13,7 @@ if __name__ == "__main__":
 
     # cache_dir = "/dccstor/pyrite/irene/"
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
-    model = 'microsoft/Phi-3-mini-4k-instruct'
+    model = 'ibm-granite/granite-4.0-micro'
     
     dtype_map = {
         'microsoft/Phi-3-mini-4k-instruct': 'auto',
@@ -37,6 +37,7 @@ if __name__ == "__main__":
         enable_hook=True, 
         tensor_parallel_size=1  # the number of gpus
     )
+
     
     test_cases = [
         "Write a dialogue between two people, one is dressed up in a ball gown and the other is dressed down in sweats. The two are going to a nightly event. Your answer must contain exactly 3 bullet points in the markdown format (use \"* \" to indicate each bullet) such as:\n* This is the first point.\n* This is the second point.",

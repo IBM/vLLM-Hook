@@ -1,5 +1,0 @@
-{
-  "instruction": "Summarize the safety policy.",
-  "data": "Policy text goes here.",
-  "attn_func": "sum_normalize"
-}

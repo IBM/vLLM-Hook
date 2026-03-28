@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from typing import Dict, List
 
 import mlx.core as mx
@@ -11,15 +12,24 @@ from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.worker import MetalWorker
 
+ATTN_PATTERNS = [
+    re.compile(r"^model\.layers\.(\d+)\.self_attn$"),
+]
+
+PROJ_MODULE_NAME_TEMPLATE = "model.layers.{layer_num}.self_attn.attn.{proj_kind}"
+
+
+def match_attn(name: str):
+    for pat in ATTN_PATTERNS:
+        m = pat.match(name)
+        if m:
+            return int(m.group(1))
+    return None
+
 
 class MLXHookWrapper(nn.Module):
-    # Housing analogy:
-    # - the wrapped address is a house listed in the building directory
-    # - once we replace that address, this wrapper becomes the new outer house
-    # - the original module still lives inside as the inner house at
-    #   `self.module`
-    # - visitors reach the outer house first, step into the recording room
-    #   via `hook_fn`, and then continue into the original inner house
+    """Wrap an MLX attention module and invoke hook callbacks around calls."""
+
     def __init__(self, module, name, hook_fn):
         super().__init__()
         self.module = module
@@ -35,8 +45,7 @@ class MLXHookWrapper(nn.Module):
 
 class ProbeHookQKWorkerMetal(MetalWorker):
     def _stage(self, message: str) -> None:
-        # Shared debug-print helper so all optional worker traces use the same
-        # prefix and can be silenced together.
+        """Emit a standardized debug trace when hook debugging is enabled."""
         if not getattr(self, "_debug_hook", False):
             return
         pid = os.getpid()
@@ -48,8 +57,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
     def __init__(self, *args, **kwargs):
-        # Track whether the current execution window should be recorded and
-        # whether we have already emitted the one-time execute_model trace.
+        """Initialize capture state and optional debug logging."""
         self._execute_logged = False
         self._capture_active = False
         self._debug_hook = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
@@ -57,8 +65,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._stage("worker __init__ complete")
 
     def init_device(self) -> None:
-        # Use the simplified Metal setup when running a single process, but
-        # preserve the normal distributed worker path for larger world sizes.
+        """Use a fast single-process path while preserving distributed init."""
         self._stage(
             "init_device start "
             f"distributed_init_method={self.distributed_init_method}"
@@ -66,6 +73,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         try:
             world_size = self.parallel_config.world_size
             if world_size == 1:
+                # This branch remains because the Metal worker can bypass the
+                # distributed setup used by the non-Metal worker when only one
+                # process is active.
                 self._stage("init_device using single-process fast path")
                 self._init_device_single_process()
             else:
@@ -76,8 +86,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._stage("init_device complete")
 
     def _init_device_single_process(self) -> None:
-        # Set up MLX, the torch-facing Metal device, and the model runner for
-        # the common single-process case.
+        """Initialize MLX and the Metal model runner for world size one."""
         if self.metal_config.use_mlx:
             import mlx.core as mx
 
@@ -103,8 +112,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
     def load_model(self, *args, **kwargs):
-        # Load the underlying model first, then install the temporary wrappers
-        # that let this worker observe self_attn traffic for one hooked engine.
+        """Load the model and install temporary self-attention wrappers."""
         self._stage("load_model start")
         try:
             result = super().load_model(*args, **kwargs)
@@ -125,13 +133,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return result
 
     def _current_run_id(self) -> str | None:
-        # Housing analogy:
-        # - the recording room only writes when the building manager has posted
-        #   an "open notebook" sign for the current visit
-        # - `_capture_active` means the worker is in the real tenant visit, not
-        #   warmup or teardown traffic
-        # - `hook_flag` and `run_id_file` together tell the room which notebook
-        #   to write into for this run
+        """Return the active run id when capture is armed for this execution."""
         if not self._capture_active or not os.path.exists(self.hook_flag):
             return None
         if not os.path.exists(self.run_id_file):
@@ -139,14 +141,13 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return open(self.run_id_file).read().strip().split("\n")[-1]
 
     def _ensure_run_cache(self, run_id: str):
-        # Housing analogy:
-        # - each run gets its own notebook
-        # - the notebook keeps both the recorded visitor packets and the
-        #   building facts the scoring desk needs later
+        """Create or return the per-run cache used for recorded tensors."""
         cache = self._run_cache.get(run_id)
         if cache is None:
             cache = {
                 "config": self._conf,
+                # This remains `qkv_cache` rather than the non-Metal `qk_cache`
+                # because the Metal path reconstructs and stores x/q/k/v data.
                 "qkv_cache": {},
                 "meta": {
                     "tp_rank": int(self.rank),
@@ -163,13 +164,12 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         proj_kind: str,
         tokens: torch.Tensor,
     ) -> None:
-        # Housing analogy:
-        # - each layer's attention house gets a notebook in the recording room
-        # - each projection kind (`x`, `q`, `k`, `v`) gets its own section
-        # - each sample in the batch is stored as a separate packet so the
-        #   analyzer can later inspect each tenant visit independently
+        """Append batched projection tensors to the per-layer cache."""
         cache = self._ensure_run_cache(run_id)
-        module_name = f"model.layers.{layer_num}.self_attn.attn.{proj_kind}"
+        module_name = PROJ_MODULE_NAME_TEMPLATE.format(
+            layer_num=layer_num,
+            proj_kind=proj_kind,
+        )
         layer_cache = cache["qkv_cache"].setdefault(
             module_name,
             {
@@ -190,7 +190,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         token_list: list[torch.Tensor],
     ) -> None:
         cache = self._ensure_run_cache(run_id)
-        module_name = f"model.layers.{layer_num}.self_attn.attn.{proj_kind}"
+        module_name = PROJ_MODULE_NAME_TEMPLATE.format(
+            layer_num=layer_num,
+            proj_kind=proj_kind,
+        )
         layer_cache = cache["qkv_cache"].setdefault(
             module_name,
             {
@@ -214,14 +217,12 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return [int(value)] * batch_size
 
     def _flatten_attention_sample(self, sample) -> torch.Tensor:
-        # Convert one `[heads, seq, head_dim]` packet into the legacy
-        # `[seq, heads * head_dim]` notebook layout.
+        """Convert `[heads, seq, head_dim]` data to `[seq, heads * head_dim]`."""
         flat = sample.transpose(1, 0, 2).reshape(sample.shape[1], -1)
         return mlx_to_torch(flat, device="cpu")
 
     def _build_full_kv_without_mutation(self, cache, keys, values):
-        # Reconstruct the attention-ready full-history K/V packets that the
-        # live MLX attention path will use, without mutating the real cache.
+        """Rebuild full-history K/V tensors without mutating the live cache."""
         batch_size = keys.shape[0]
         if cache is None or not hasattr(cache, "keys") or cache.keys is None:
             return [keys[i] for i in range(batch_size)], [values[i] for i in range(batch_size)]
@@ -246,7 +247,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 full_values.append(values[i])
         return full_keys, full_values
 
-    def _record_qkv(  # qkv_hook in non metal worker.
+    def _record_qkv(
         self,
         run_id: str,
         layer_num: int,
@@ -255,32 +256,16 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         key_samples,
         value_samples,
     ) -> None:
-        # Housing analogy:
-        # - `raw_x` is the visitor as it first enters the self-attention house
-        # - `queries`, `keys`, and `values` are the specialized copies of that
-        #   visitor after the house has routed it through q_proj/k_proj/v_proj
-        # - this method files both the original visitor packet and the
-        #   specialized packets into the notebook under the same floor tab
-        # `raw_x` already has the analyzer-friendly `[batch, seq, hidden]`
-        # layout, so it can be bridged to CPU as-is.
+        """Store raw inputs and projected Q/K/V tensors for one layer."""
         x_torch = mlx_to_torch(raw_x, device="cpu")
-        # Q/K/V arrive here in the attention-worker layout
-        # `[batch, heads, seq, head_dim]`.
-        # The notebook stores the flatter analyzer layout
-        # `[batch, seq, heads * head_dim]`, so we transpose seq back to the
-        # middle and then collapse the head dimensions.
         q_flat = queries.transpose(0, 2, 1, 3).reshape(
             queries.shape[0], queries.shape[2], -1
         )
-        # Archive everything on CPU so the on-disk notebook does not depend on
-        # the lifetime of MLX tensors or Metal device state.
         q_torch = mlx_to_torch(q_flat, device="cpu")
         k_torch = [self._flatten_attention_sample(sample) for sample in key_samples]
         v_torch = [self._flatten_attention_sample(sample) for sample in value_samples]
 
         self._append_proj_tokens(run_id, layer_num, "x", x_torch)
-        # Q is the only packet kind whose storage width changes with
-        # `hookq_mode`: either keep the whole packet or just the last page.
         if self.hookq_mode == "all_tokens":
             self._append_proj_tokens(run_id, layer_num, "q", q_torch)
         elif self.hookq_mode == "last_token":
@@ -301,23 +286,11 @@ class ProbeHookQKWorkerMetal(MetalWorker):
     def _capture_from_self_attn(
         self, run_id: str, layer_num: int, attn_module, input_args
     ) -> None:
-        # Housing analogy:
-        # - this is the recording room attached to the `self_attn` house door
-        # - visitors arrive as raw hidden states `x`
-        # - we let the recording room compute the same q/k/v routes the house
-        #   itself would compute internally
-        # - that keeps the notebook aligned with the real house behavior while
-        #   avoiding any need for a deeper inner door that does not exist in
-        #   the installed Metal runtime
-        # The wrapped `self_attn` call receives `(x, mask, cache)`. We only
-        # need the raw hidden-state visitor plus the cache offset information
-        # to rebuild the same attention-ready Q/K/V packets the house will use.
+        """Recompute and record the Q/K/V tensors used by a self-attention call."""
         raw_x = input_args[0]
         cache = input_args[2] if len(input_args) > 2 else None
         batch, seq_len, _ = raw_x.shape
 
-        # Run the same projection occupants the real house uses. Right after
-        # projection the tensors are still in `[batch, seq, heads, head_dim]`.
         queries = attn_module.q_proj(raw_x).reshape(
             batch, seq_len, attn_module.n_heads, -1
         )
@@ -328,16 +301,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             batch, seq_len, attn_module.n_kv_heads, -1
         )
 
-        # Switch into the attention-worker layout `[batch, heads, seq, head_dim]`
-        # before applying rope, because that is the layout the live house uses
-        # internally for attention.
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        # Q and K must pass through the same positional checkpoint as the live
-        # attention path. During prefill/decode, `cache.offset` keeps rope
-        # aligned with the already-seen prefix.
         if cache is not None:
             queries = attn_module.rope(queries, offset=cache.offset)
             keys = attn_module.rope(keys, offset=cache.offset)
@@ -347,39 +314,41 @@ class ProbeHookQKWorkerMetal(MetalWorker):
 
         full_keys, full_values = self._build_full_kv_without_mutation(cache, keys, values)
 
-        # At this point the packets match the real attention-ready values, so
-        # the notebook can archive them without depending on a deeper hook.
         self._record_qkv(run_id, layer_num, raw_x, queries, full_keys, full_values)
 
+    def _parse_layer_heads(self) -> Dict[int, List[int]]:
+        """Parse `layer:head,head;layer:head` into a layer-to-head mapping."""
+        layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
+        result = {}
+        for part in layer_heads.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            layer_str, heads_str = part.split(":")
+            layer_idx = int(layer_str)
+            head_indices = sorted(int(h) for h in heads_str.split(",") if h)
+            result[layer_idx] = head_indices
+        return result
+
     def _install_hooks(self):
-        # `model_runner.model` is the live MLX model object that will actually
-        # be executed. If it is missing, there is nothing concrete to wrap.
+        """Install wrappers on tracked self-attention modules."""
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
             return
 
-        # These env vars are the worker-side control plane for one hooked run:
-        # - `hook_flag` says whether capture is currently armed
-        # - `hook_dir` tells us where notebooks should be archived
-        # - `run_id_file` tells us which notebook belongs to the active visit
-        # - `hookq_mode` controls whether Q is stored for all tokens or only
-        #   the last token
         self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens")
+        # This remains configurable because the Metal wrapper can observe both
+        # pre- and post-call boundaries, unlike the non-Metal forward hook.
         self.capture_phase = os.environ.get("VLLM_HOOK_CAPTURE_PHASE", "pre")
 
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
             print("Missing hook environment variables")
             return
 
-        # Housing analogy:
-        # - `layer_to_heads` tells us which apartment floors matter
-        # - we only install wrapper houses on those self-attention addresses
-        # - later, the analyzer will only score the tracked heads on those
-        #   same floors
         self.layer_to_heads = self._parse_layer_heads()
         self.important_layers = set(self.layer_to_heads.keys())
         self._run_cache = {}
@@ -387,10 +356,6 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._matched_hook_modules = []
         self._capture_boundary = "self_attn"
 
-        # Gather the structural facts the analyzer will need later to interpret
-        # the recorded Q/K/V packets. We prefer `model_args`, but fall back to
-        # live model attributes when necessary because different runtime builds
-        # expose these values in different places.
         cfg = getattr(self.model_runner, "model_args", None) or {}
         layers_obj = getattr(getattr(model, "model", model), "layers", None)
         if layers_obj is None:
@@ -408,8 +373,6 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             return
         head_dim = hidden // num_h
 
-        # `_conf` is the notebook header: enough shape metadata for the
-        # analyzer to reconstruct attention from archived Q/K/V packets later.
         self._conf = dict(
             num_attention_heads=num_h,
             num_key_value_heads=num_kv,
@@ -422,35 +385,13 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             kv_proj_output_width=head_dim * num_kv,
         )
 
-        # Housing analogy:
-        # - `named_modules()` is the building directory
-        # - each entry maps an address to the house currently living there
-        # - we search that directory for `*.self_attn` houses and replace each
-        #   tracked address with a wrapper outer house
-        # - each wrapper keeps the original attention house inside so teardown
-        #   can later restore the exact original resident to that address
         named_modules = dict(model.named_modules())
         for name, module in named_modules.items():
-            # Only `*.self_attn` addresses are valid outer-house targets for
-            # this worker. Everything else in the building directory is ignored.
-            if not name.endswith(".self_attn"):
+            layer_idx = match_attn(name)
+            if layer_idx is None:
                 continue
-
-            parts = name.split(".")
-            # We only want modules that clearly belong to `layers.<idx>` so we
-            # can map them back to the configured tracked floors.
-            if "layers" not in parts:
-                continue
-            layers_pos = parts.index("layers")
-            if layers_pos + 1 >= len(parts) or not parts[layers_pos + 1].isdigit():
-                continue
-
-            layer_idx = int(parts[layers_pos + 1])
-            # Skip floors that are not in the configured layer/head shortlist.
             if layer_idx not in self.important_layers:
                 continue
-            # The runtime must expose the projection and rope occupants we need
-            # to rebuild attention-ready Q/K/V at the self_attn door.
             if not all(
                 hasattr(module, attr)
                 for attr in (
@@ -464,8 +405,6 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             ):
                 continue
 
-            # We replace the module at `parent.target_name`, so we need the
-            # parent house object as well as the current resident.
             parent_name, target_name = name.rsplit(".", 1)
             parent = named_modules.get(parent_name)
             if parent is None:
@@ -481,11 +420,6 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 layer_num=layer_idx,
                 attn=original_attn,
             ):
-                # Housing analogy:
-                # - the wrapper's recording room checks whether there is an open
-                #   notebook for this visit
-                # - if so, it records the raw visitor and the projected Q/K/V
-                #   copies for this floor
                 run_id = self._current_run_id()
                 if run_id is None:
                     return None
@@ -494,8 +428,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 self._capture_from_self_attn(run_id, layer_num, attn, input_args)
                 return None
 
-            # Install the wrapper at the public address and remember enough
-            # information to restore the original house during teardown.
+            # This remains a wrapper replacement instead of `register_forward_hook`
+            # because the Metal MLX modules do not expose the same hook API as
+            # the non-Metal PyTorch modules.
             wrapped_attn = MLXHookWrapper(
                 module=original_attn,
                 name=name,
@@ -511,14 +446,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             )
             self._matched_hook_modules.append(name)
 
-        # If nothing matched, the worker cannot observe any self_attn traffic,
-        # so later analysis would have no notebook to read.
         if not self._matched_hook_modules:
             print("Could not locate self_attn modules for Metal attention hook")
             return
 
-        # Report the exact wrapped addresses so it is obvious which floors were
-        # actually instrumented for this temporary engine.
         print(
             f"Installed {len(self._matched_hook_modules)} hooks on layers: "
             f"{self._matched_hook_modules}",
@@ -533,30 +464,28 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             )
             print("Installed Granite attention hook", flush=True)
 
+    def _uninstall_hooks(self):
+        """Restore the original attention modules after temporary wrapping."""
+        for entry in reversed(self._hooks):
+            setattr(entry["parent"], entry["target_name"], entry["original_module"])
+        self._hooks.clear()
+
     def _flush_run_cache(self) -> None:
-        # Housing analogy:
-        # - when the visit ends, the worker carries each in-memory notebook to
-        #   the archive room on disk and files it as `qkv.pt`
-        # - the archive is grouped first by run, then by tensor-parallel rank,
-        #   so multiple workers can file notebooks for the same visit without
-        #   overwriting each other
+        """Persist any captured run cache entries to disk."""
         if not self._run_cache:
             return
 
         tp_rank = int(self.rank)
         for run_id, cache in self._run_cache.items():
-            # Each run gets its own directory, and each worker writes inside
-            # `tp_rank_<n>` so later merge logic can collect the right notebook
-            # fragments for that run.
             run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
             os.makedirs(run_dir, exist_ok=True)
             cache_path = os.path.join(run_dir, "qkv.pt")
-            # `torch.save` is the archive step: the entire notebook header plus
-            # all filed packet sections are serialized in one artifact.
+            # This stays as a post-execution flush instead of per-hook `torch.save`
+            # because the Metal worker reconstructs and batches multiple tensors
+            # per layer, making immediate writes much more expensive than in the
+            # non-Metal forward-hook path.
             torch.save(cache, cache_path)
             if self._debug_hook:
-                # Debug mode summarizes how many request packets were filed in
-                # each notebook section so batch behavior is easy to inspect.
                 sample_counts = {
                     module_name: len(module_cache.get("tokens", []))
                     for module_name, module_cache in cache["qkv_cache"].items()
@@ -568,57 +497,19 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                     flush=True,
                 )
 
-    def _uninstall_hooks(self):
-        # Housing analogy:
-        # - teardown removes the temporary outer houses from each tracked
-        #   address
-        # - the original inner houses are moved back to the public address so
-        #   the next temporary engine starts from a clean building directory
-        for entry in reversed(self._hooks):
-            setattr(entry["parent"], entry["target_name"], entry["original_module"])
-        self._hooks.clear()
-
-    def _parse_layer_heads(self) -> Dict[int, List[int]]:
-        # Parse the `layer:head,head;layer:head` env-var format into the layer
-        # lookup the worker uses to decide which floors to wrap and score.
-        layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
-        result = {}
-        for part in layer_heads.split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            layer_str, heads_str = part.split(":")
-            layer_idx = int(layer_str)
-            head_indices = sorted(int(h) for h in heads_str.split(",") if h)
-            result[layer_idx] = head_indices
-        return result
-
     def execute_model(self, *args, **kwargs):
-        # Housing analogy:
-        # - `execute_model` is when the building opens for a real tenant visit
-        # - capture is only active during this window
-        # - once the visit ends, any filled notebooks are sent to the archive
-        #   room before returning control
-        # The one-time `_execute_logged` banner keeps debug logs readable
-        # without repeating the same startup line on every execution call.
+        """Run the model with capture enabled only for the active execution."""
         if not self._execute_logged:
             self._stage("execute_model first entry")
             self._execute_logged = True
-        # Wrappers consult `_capture_active` through `_current_run_id()`, so
-        # this flag is the top-level switch that distinguishes real execution
-        # traffic from warmup/setup/teardown traffic.
+        # This extra gate remains because the Metal runtime may invoke wrapped
+        # modules during setup paths where capture should stay disabled.
         self._capture_active = True
         try:
-            # The underlying Metal worker performs the real forward/generation
-            # work while wrapper houses opportunistically record visits.
             result = super().execute_model(*args, **kwargs)
         finally:
-            # Always drop the capture flag, even if model execution raises, so
-            # later calls do not accidentally keep writing into the notebook.
             self._capture_active = False
         try:
-            # Archive any notebooks filled during this execution window before
-            # returning the model result to the caller.
             self._flush_run_cache()
         except Exception as exc:
             self._stage(f"flush_run_cache failed: {type(exc).__name__}: {exc}")
