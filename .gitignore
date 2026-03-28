@@ -10,6 +10,6 @@ vllm_hook_plugins/vllm_hook_plugins.egg-info/
 !/sandbox/colab_sandbox/**
 
 # Notebook-local caches and macOS metadata.
-/notebooks/.cache/_v1_qk_peeks
-/notebooks/.DS_Store
+.DS_Store
+/notebooks/~/.cache/_v1_qk_peeks/
 /notebooks/external_cache/
