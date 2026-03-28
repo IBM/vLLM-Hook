@@ -8,6 +8,16 @@ from vllm.v1.worker.gpu_worker import Worker as V1Worker
 class SteerHookActWorker(V1Worker):
     
     def load_model(self, *args, **kwargs):
+        """
+        Load the model and install the steering hook.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``load_model`` call.
+        """
         r = super().load_model(*args, **kwargs)
         
         try:
@@ -19,6 +29,15 @@ class SteerHookActWorker(V1Worker):
         return r
     
     def _install_hooks(self):
+        """
+        Register the steering hook on the configured transformer layer.
+
+        Args:
+            None.
+
+        Returns:
+            None: Steering hooks are installed in-place on the model.
+        """
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
@@ -41,6 +60,17 @@ class SteerHookActWorker(V1Worker):
             self.unit_vector = self.dir # / torch.norm(self.dir)
         
         def steering_hook(input, output):
+            """
+            Apply steering to the hooked residual stream output.
+
+            Args:
+                input: Forward-hook input tuple for the target layer.
+                output: Forward-hook output produced by the target layer.
+
+            Returns:
+                torch.Tensor | tuple: Steered residual output in the same shape
+                convention as the original module output.
+            """
             
             if not os.path.exists(self.hook_flag):
                 return output
@@ -93,6 +123,15 @@ class SteerHookActWorker(V1Worker):
         print(f"Installed {len(self._hooks)} hooks on layers: {name}")
     
     def _parse_steering_config(self) -> Dict:
+        """
+        Load steering settings from `VLLM_ACTSTEER_CONFIG`.
+
+        Args:
+            None.
+
+        Returns:
+            Dict: Parsed steering configuration with normalized field types.
+        """
         config_path = os.environ.get("VLLM_ACTSTEER_CONFIG")
         
         with open(config_path, 'r') as f:
@@ -108,6 +147,15 @@ class SteerHookActWorker(V1Worker):
         }
 
     def _uninstall_hooks(self):
+        """
+        Remove any registered steering hooks from the model.
+
+        Args:
+            None.
+
+        Returns:
+            None: Stored hook handles are removed and cleared.
+        """
         for hook in getattr(self, "_hooks", []):
             try:
                 hook.remove()
@@ -117,4 +165,14 @@ class SteerHookActWorker(V1Worker):
             self._hooks.clear()
 
     def execute_model(self, *args, **kwargs):
+        """
+        Delegate model execution to the base vLLM worker.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``execute_model`` call.
+        """
         return super().execute_model(*args, **kwargs)

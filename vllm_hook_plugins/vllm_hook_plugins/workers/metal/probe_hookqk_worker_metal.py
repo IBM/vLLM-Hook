@@ -20,6 +20,16 @@ PROJ_MODULE_NAME_TEMPLATE = "model.layers.{layer_num}.self_attn.attn.{proj_kind}
 
 
 def match_attn(name: str):
+    """
+    Return the layer index for a Metal self-attention module name.
+
+    Args:
+        name (str): Fully qualified module name to inspect.
+
+    Returns:
+        int | None: Parsed layer index if the module matches a Metal attention
+        pattern, otherwise ``None``.
+    """
     for pat in ATTN_PATTERNS:
         m = pat.match(name)
         if m:
@@ -28,15 +38,44 @@ def match_attn(name: str):
 
 
 class MLXHookWrapper(nn.Module):
-    """Wrap an MLX attention module and invoke hook callbacks around calls."""
+    """
+    Wrap an MLX attention module and invoke hook callbacks around calls.
+
+    Args:
+        None.
+
+    Returns:
+        None: Instances proxy calls to the wrapped MLX module.
+    """
 
     def __init__(self, module, name, hook_fn):
+        """
+        Store the wrapped module metadata and hook callback.
+
+        Args:
+            module: MLX module being wrapped.
+            name (str): Fully qualified module name.
+            hook_fn: Callback invoked around wrapped module execution.
+
+        Returns:
+            None: Initializes wrapper state.
+        """
         super().__init__()
         self.module = module
         self.name = name
         self.hook_fn = hook_fn
 
     def __call__(self, *args, **kwargs):
+        """
+        Invoke the hook before and after delegating to the wrapped module.
+
+        Args:
+            *args: Positional arguments forwarded to the wrapped module.
+            **kwargs: Keyword arguments forwarded to the wrapped module.
+
+        Returns:
+            Any: Output produced by the wrapped module.
+        """
         self.hook_fn("pre", args, None, self.name)
         output = self.module(*args, **kwargs)
         self.hook_fn("post", args, output, self.name)
@@ -45,7 +84,15 @@ class MLXHookWrapper(nn.Module):
 
 class ProbeHookQKWorkerMetal(MetalWorker):
     def _stage(self, message: str) -> None:
-        """Emit a standardized debug trace when hook debugging is enabled."""
+        """
+        Emit a standardized debug trace when hook debugging is enabled.
+
+        Args:
+            message (str): Debug message to print.
+
+        Returns:
+            None: The message is printed only when debug mode is enabled.
+        """
         if not getattr(self, "_debug_hook", False):
             return
         pid = os.getpid()
@@ -57,7 +104,16 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
     def __init__(self, *args, **kwargs):
-        """Initialize capture state and optional debug logging."""
+        """
+        Initialize capture state and optional debug logging.
+
+        Args:
+            *args: Positional arguments forwarded to the base Metal worker.
+            **kwargs: Keyword arguments forwarded to the base Metal worker.
+
+        Returns:
+            None: Worker state is initialized in-place.
+        """
         self._execute_logged = False
         self._capture_active = False
         self._debug_hook = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
@@ -65,7 +121,15 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._stage("worker __init__ complete")
 
     def init_device(self) -> None:
-        """Use a fast single-process path while preserving distributed init."""
+        """
+        Use a fast single-process path while preserving distributed init.
+
+        Args:
+            None.
+
+        Returns:
+            None: Device state is initialized in-place.
+        """
         self._stage(
             "init_device start "
             f"distributed_init_method={self.distributed_init_method}"
@@ -86,7 +150,15 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._stage("init_device complete")
 
     def _init_device_single_process(self) -> None:
-        """Initialize MLX and the Metal model runner for world size one."""
+        """
+        Initialize MLX and the Metal model runner for world size one.
+
+        Args:
+            None.
+
+        Returns:
+            None: MLX and model-runner state are initialized in-place.
+        """
         if self.metal_config.use_mlx:
             import mlx.core as mx
 
@@ -112,7 +184,16 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
     def load_model(self, *args, **kwargs):
-        """Load the model and install temporary self-attention wrappers."""
+        """
+        Load the model and install temporary self-attention wrappers.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``load_model`` call.
+        """
         self._stage("load_model start")
         try:
             result = super().load_model(*args, **kwargs)
@@ -133,7 +214,16 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return result
 
     def _current_run_id(self) -> str | None:
-        """Return the active run id when capture is armed for this execution."""
+        """
+        Return the active run id when capture is armed for this execution.
+
+        Args:
+            None.
+
+        Returns:
+            str | None: Active run identifier, or ``None`` when capture is
+            disabled for the current execution.
+        """
         if not self._capture_active or not os.path.exists(self.hook_flag):
             return None
         if not os.path.exists(self.run_id_file):
@@ -141,7 +231,15 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return open(self.run_id_file).read().strip().split("\n")[-1]
 
     def _ensure_run_cache(self, run_id: str):
-        """Create or return the per-run cache used for recorded tensors."""
+        """
+        Create or return the per-run cache used for recorded tensors.
+
+        Args:
+            run_id (str): Active run identifier.
+
+        Returns:
+            dict: Mutable cache entry for the requested run id.
+        """
         cache = self._run_cache.get(run_id)
         if cache is None:
             cache = {
@@ -164,7 +262,18 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         proj_kind: str,
         tokens: torch.Tensor,
     ) -> None:
-        """Append batched projection tensors to the per-layer cache."""
+        """
+        Append batched projection tensors to the per-layer cache.
+
+        Args:
+            run_id (str): Active run identifier.
+            layer_num (int): Transformer layer index being recorded.
+            proj_kind (str): Projection kind, such as ``x`` or ``q``.
+            tokens (torch.Tensor): Batched projection tensor to append.
+
+        Returns:
+            None: Tokens are appended to the run cache in-place.
+        """
         cache = self._ensure_run_cache(run_id)
         module_name = PROJ_MODULE_NAME_TEMPLATE.format(
             layer_num=layer_num,
@@ -189,6 +298,18 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         proj_kind: str,
         token_list: list[torch.Tensor],
     ) -> None:
+        """
+        Append a pre-split list of projection tensors to the per-layer cache.
+
+        Args:
+            run_id (str): Active run identifier.
+            layer_num (int): Transformer layer index being recorded.
+            proj_kind (str): Projection kind, such as ``k`` or ``v``.
+            token_list (list[torch.Tensor]): Per-sample tensors to append.
+
+        Returns:
+            None: Tensors are appended to the run cache in-place.
+        """
         cache = self._ensure_run_cache(run_id)
         module_name = PROJ_MODULE_NAME_TEMPLATE.format(
             layer_num=layer_num,
@@ -205,6 +326,16 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         layer_cache["tokens"].extend([tokens.clone() for tokens in token_list])
 
     def _mx_offsets_to_int_list(self, value, batch_size: int) -> list[int]:
+        """
+        Normalize MLX or scalar offset metadata to a Python integer list.
+
+        Args:
+            value: Offset metadata value from the MLX cache.
+            batch_size (int): Number of samples in the batch.
+
+        Returns:
+            list[int]: Integer offsets for each sample in the batch.
+        """
         if value is None:
             return [0] * batch_size
         if isinstance(value, int):
@@ -217,12 +348,30 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return [int(value)] * batch_size
 
     def _flatten_attention_sample(self, sample) -> torch.Tensor:
-        """Convert `[heads, seq, head_dim]` data to `[seq, heads * head_dim]`."""
+        """
+        Convert `[heads, seq, head_dim]` data to `[seq, heads * head_dim]`.
+
+        Args:
+            sample: Single attention sample in MLX head-major layout.
+
+        Returns:
+            torch.Tensor: Flattened tensor on CPU for analyzer consumption.
+        """
         flat = sample.transpose(1, 0, 2).reshape(sample.shape[1], -1)
         return mlx_to_torch(flat, device="cpu")
 
     def _build_full_kv_without_mutation(self, cache, keys, values):
-        """Rebuild full-history K/V tensors without mutating the live cache."""
+        """
+        Rebuild full-history K/V tensors without mutating the live cache.
+
+        Args:
+            cache: Active MLX cache object, if present.
+            keys: Current-step key tensor batch.
+            values: Current-step value tensor batch.
+
+        Returns:
+            tuple[list, list]: Full key and value tensors for each sample.
+        """
         batch_size = keys.shape[0]
         if cache is None or not hasattr(cache, "keys") or cache.keys is None:
             return [keys[i] for i in range(batch_size)], [values[i] for i in range(batch_size)]
@@ -256,7 +405,20 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         key_samples,
         value_samples,
     ) -> None:
-        """Store raw inputs and projected Q/K/V tensors for one layer."""
+        """
+        Store raw inputs and projected Q/K/V tensors for one layer.
+
+        Args:
+            run_id (str): Active run identifier.
+            layer_num (int): Transformer layer index being recorded.
+            raw_x: Original hidden-state tensor entering self-attention.
+            queries: Query tensor after projection and rotary embedding.
+            key_samples: Per-sample full-history key tensors.
+            value_samples: Per-sample full-history value tensors.
+
+        Returns:
+            None: Recorded tensors are appended to the run cache.
+        """
         x_torch = mlx_to_torch(raw_x, device="cpu")
         q_flat = queries.transpose(0, 2, 1, 3).reshape(
             queries.shape[0], queries.shape[2], -1
@@ -286,7 +448,18 @@ class ProbeHookQKWorkerMetal(MetalWorker):
     def _capture_from_self_attn(
         self, run_id: str, layer_num: int, attn_module, input_args
     ) -> None:
-        """Recompute and record the Q/K/V tensors used by a self-attention call."""
+        """
+        Recompute and record the Q/K/V tensors used by a self-attention call.
+
+        Args:
+            run_id (str): Active run identifier.
+            layer_num (int): Transformer layer index being recorded.
+            attn_module: Wrapped MLX self-attention module.
+            input_args: Positional arguments passed to the wrapped module.
+
+        Returns:
+            None: Recomputed tensors are recorded into the run cache.
+        """
         raw_x = input_args[0]
         cache = input_args[2] if len(input_args) > 2 else None
         batch, seq_len, _ = raw_x.shape
@@ -317,7 +490,15 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._record_qkv(run_id, layer_num, raw_x, queries, full_keys, full_values)
 
     def _parse_layer_heads(self) -> Dict[int, List[int]]:
-        """Parse `layer:head,head;layer:head` into a layer-to-head mapping."""
+        """
+        Parse `layer:head,head;layer:head` into a layer-to-head mapping.
+
+        Args:
+            None.
+
+        Returns:
+            Dict[int, List[int]]: Mapping from layer index to sorted head indices.
+        """
         layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
         result = {}
         for part in layer_heads.split(";"):
@@ -331,7 +512,15 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         return result
 
     def _install_hooks(self):
-        """Install wrappers on tracked self-attention modules."""
+        """
+        Install wrappers on tracked self-attention modules.
+
+        Args:
+            None.
+
+        Returns:
+            None: Wrappers are installed in-place on the loaded model.
+        """
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
@@ -420,6 +609,20 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 layer_num=layer_idx,
                 attn=original_attn,
             ):
+                """
+                Capture one self-attention call when the active run is armed.
+
+                Args:
+                    phase: Wrapper callback phase, such as ``pre`` or ``post``.
+                    input_args: Positional arguments passed to self-attention.
+                    _output: Output produced by the wrapped module.
+                    _module_name: Hook-reported module name.
+                    layer_num (int): Bound transformer layer index.
+                    attn: Bound original attention module.
+
+                Returns:
+                    None: Capture side effects are written into the run cache.
+                """
                 run_id = self._current_run_id()
                 if run_id is None:
                     return None
@@ -465,13 +668,29 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             print("Installed Granite attention hook", flush=True)
 
     def _uninstall_hooks(self):
-        """Restore the original attention modules after temporary wrapping."""
+        """
+        Restore the original attention modules after temporary wrapping.
+
+        Args:
+            None.
+
+        Returns:
+            None: Wrapped modules are restored in-place.
+        """
         for entry in reversed(self._hooks):
             setattr(entry["parent"], entry["target_name"], entry["original_module"])
         self._hooks.clear()
 
     def _flush_run_cache(self) -> None:
-        """Persist any captured run cache entries to disk."""
+        """
+        Persist any captured run cache entries to disk.
+
+        Args:
+            None.
+
+        Returns:
+            None: Run cache artifacts are serialized under the hook directory.
+        """
         if not self._run_cache:
             return
 
@@ -498,7 +717,16 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 )
 
     def execute_model(self, *args, **kwargs):
-        """Run the model with capture enabled only for the active execution."""
+        """
+        Run the model with capture enabled only for the active execution.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``execute_model`` call.
+        """
         if not self._execute_logged:
             self._stage("execute_model first entry")
             self._execute_logged = True

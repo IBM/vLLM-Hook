@@ -19,6 +19,16 @@ ATTN_PATTERNS = [
 ]
 
 def match_attn(name: str):
+    """
+    Return the layer index for a supported attention module name.
+
+    Args:
+        name (str): Fully qualified module name to inspect.
+
+    Returns:
+        int | None: Parsed layer index if the module matches an attention
+        pattern, otherwise ``None``.
+    """
     for pat in ATTN_PATTERNS:
         m = pat.match(name)
         if m:
@@ -27,6 +37,18 @@ def match_attn(name: str):
 
 
 def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.device):
+    """
+    Extract flattened request boundaries from vLLM attention metadata.
+
+    Args:
+        metadata: Attention metadata object provided by the forward context.
+        module_name (str): Name of the hooked attention module.
+        device (torch.device): Device used for any temporary tensors.
+
+    Returns:
+        torch.Tensor | None: Boundary tensor of shape ``[batch + 1]`` when
+        bounds can be recovered, otherwise ``None``.
+    """
     if metadata is None:
         return None
 
@@ -79,6 +101,16 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
 class ProbeHookQKWorker(V1Worker):
 
     def load_model(self, *args, **kwargs):
+        """
+        Load the model and install forward hooks for tracked layers.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``load_model`` call.
+        """
         r = super().load_model(*args, **kwargs)
         
         try:
@@ -90,6 +122,15 @@ class ProbeHookQKWorker(V1Worker):
         return r
 
     def _install_hooks(self):
+        """
+        Register forward hooks on configured attention modules.
+
+        Args:
+            None.
+
+        Returns:
+            None: Hooks are installed in-place on the loaded model.
+        """
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
@@ -125,6 +166,16 @@ class ProbeHookQKWorker(V1Worker):
         )
 
         def qkv_hook(input, module_name):
+            """
+            Capture Q/K tensors for one attention module invocation.
+
+            Args:
+                input: Forward-hook input tuple for the attention module.
+                module_name (str): Fully qualified hooked module name.
+
+            Returns:
+                None: Captured tensors are written into the worker cache.
+            """
 
             if not os.path.exists(self.hook_flag): # hooks deactivated
                 return None
@@ -211,6 +262,15 @@ class ProbeHookQKWorker(V1Worker):
         print(f"Installed {len(self._hooks)} hooks on layers: {matched}")
 
     def _parse_layer_heads(self) -> Dict[int, List[int]]:
+        """
+        Parse `VLLM_HOOK_LAYER_HEADS` into a layer-to-head mapping.
+
+        Args:
+            None.
+
+        Returns:
+            Dict[int, List[int]]: Mapping from layer index to sorted head indices.
+        """
         ## Parse 'VLLM_HOOK_LAYER_HEADS' env var from string to dict: '0:0,3,6;15:2' → {0:[0,3,6], 15:[2]}
         layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
         result = {}
@@ -228,6 +288,15 @@ class ProbeHookQKWorker(V1Worker):
         return result
 
     def _uninstall_hooks(self):
+        """
+        Remove any registered forward hooks from the model.
+
+        Args:
+            None.
+
+        Returns:
+            None: Stored hooks are removed and the hook list is cleared.
+        """
         for hook in getattr(self, "_hooks", []):
             try:
                 hook.remove()
@@ -237,4 +306,14 @@ class ProbeHookQKWorker(V1Worker):
             self._hooks.clear()
 
     def execute_model(self, *args, **kwargs):
+        """
+        Delegate model execution to the base vLLM worker.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``execute_model`` call.
+        """
         return super().execute_model(*args, **kwargs)

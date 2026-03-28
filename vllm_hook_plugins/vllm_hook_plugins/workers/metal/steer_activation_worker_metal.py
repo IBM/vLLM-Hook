@@ -15,25 +15,73 @@ TARGET_LAYER_TEMPLATE = "model.layers.{layer_num}"
 
 
 class MLXSteeringWrapper(nn.Module):
-    """Wrap an MLX layer and apply steering to its output."""
+    """
+    Wrap an MLX layer and apply steering to its output.
+
+    Args:
+        None.
+
+    Returns:
+        None: Instances proxy calls to the wrapped MLX module.
+    """
 
     def __init__(self, module, name, hook_fn):
+        """
+        Store the wrapped module metadata and steering callback.
+
+        Args:
+            module: MLX module being wrapped.
+            name (str): Fully qualified module name.
+            hook_fn: Callback invoked after wrapped module execution.
+
+        Returns:
+            None: Initializes wrapper state.
+        """
         super().__init__()
         self.module = module
         self.name = name
         self.hook_fn = hook_fn
 
     def __call__(self, *args, **kwargs):
+        """
+        Run the wrapped module and post-process its output.
+
+        Args:
+            *args: Positional arguments forwarded to the wrapped module.
+            **kwargs: Keyword arguments forwarded to the wrapped module.
+
+        Returns:
+            Any: Output produced by the wrapped module after steering.
+        """
         output = self.module(*args, **kwargs)
         return self.hook_fn(output, self.name)
 
 
 class SteerHookActWorkerMetal(MetalWorker):
     def __init__(self, *args, **kwargs):
+        """
+        Initialize steering state before Metal worker setup.
+
+        Args:
+            *args: Positional arguments forwarded to the base Metal worker.
+            **kwargs: Keyword arguments forwarded to the base Metal worker.
+
+        Returns:
+            None: Worker state is initialized in-place.
+        """
         self._capture_active = False
         super().__init__(*args, **kwargs)
 
     def init_device(self) -> None:
+        """
+        Initialize the Metal device, with a single-process fast path.
+
+        Args:
+            None.
+
+        Returns:
+            None: Device state is initialized in-place.
+        """
         try:
             world_size = self.parallel_config.world_size
             if world_size == 1:
@@ -47,6 +95,15 @@ class SteerHookActWorkerMetal(MetalWorker):
             raise
 
     def _init_device_single_process(self) -> None:
+        """
+        Initialize MLX and the Metal model runner for world size one.
+
+        Args:
+            None.
+
+        Returns:
+            None: MLX and model-runner state are initialized in-place.
+        """
         if self.metal_config.use_mlx:
             device_type = (
                 mx.DeviceType.gpu
@@ -67,6 +124,16 @@ class SteerHookActWorkerMetal(MetalWorker):
         )
 
     def load_model(self, *args, **kwargs):
+        """
+        Load the model and install the steering wrapper.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``load_model`` call.
+        """
         result = super().load_model(*args, **kwargs)
 
         try:
@@ -78,6 +145,15 @@ class SteerHookActWorkerMetal(MetalWorker):
         return result
 
     def _install_hooks(self):
+        """
+        Install the steering wrapper on the configured transformer layer.
+
+        Args:
+            None.
+
+        Returns:
+            None: Wrappers are installed in-place on the loaded model.
+        """
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
@@ -146,6 +222,15 @@ class SteerHookActWorkerMetal(MetalWorker):
         )
 
     def _parse_steering_config(self) -> Dict:
+        """
+        Load steering settings from `VLLM_ACTSTEER_CONFIG`.
+
+        Args:
+            None.
+
+        Returns:
+            Dict: Parsed steering configuration with normalized field types.
+        """
         config_path = os.environ.get("VLLM_ACTSTEER_CONFIG")
 
         with open(config_path, "r") as f:
@@ -163,6 +248,15 @@ class SteerHookActWorkerMetal(MetalWorker):
         }
 
     def _steering_enabled(self) -> bool:
+        """
+        Return whether steering is active for the current execution.
+
+        Args:
+            None.
+
+        Returns:
+            bool: ``True`` when the current execution should apply steering.
+        """
         return bool(
             self._capture_active
             and self.hook_flag
@@ -170,11 +264,30 @@ class SteerHookActWorkerMetal(MetalWorker):
         )
 
     def _mlx_cast_like(self, value: mx.array, reference: mx.array) -> mx.array:
+        """
+        Cast an MLX array to the dtype used by a reference tensor.
+
+        Args:
+            value (mx.array): MLX array to cast.
+            reference (mx.array): Reference array providing the target dtype.
+
+        Returns:
+            mx.array: Array converted to the reference dtype when needed.
+        """
         if value.dtype != reference.dtype:
             return value.astype(reference.dtype)
         return value
 
     def _apply_torch_steering(self, residuals: torch.Tensor) -> torch.Tensor:
+        """
+        Apply steering to a PyTorch residual tensor.
+
+        Args:
+            residuals (torch.Tensor): Residual stream tensor to modify.
+
+        Returns:
+            torch.Tensor: Residual tensor after steering is applied.
+        """
         steering_vec = self.dir.to(residuals.device, dtype=residuals.dtype)
 
         if self.steering_method == "add_vector":
@@ -194,6 +307,15 @@ class SteerHookActWorkerMetal(MetalWorker):
         raise ValueError(f"Unknown steering method: {self.steering_method}")
 
     def _apply_mlx_steering(self, residuals: mx.array) -> mx.array:
+        """
+        Apply steering to an MLX residual tensor.
+
+        Args:
+            residuals (mx.array): Residual stream array to modify.
+
+        Returns:
+            mx.array: Residual array after steering is applied.
+        """
         # This separate MLX path remains because Metal layers may surface MLX
         # arrays instead of PyTorch tensors, while the non-Metal worker only
         # needs the torch implementation.
@@ -218,6 +340,16 @@ class SteerHookActWorkerMetal(MetalWorker):
         raise ValueError(f"Unknown steering method: {self.steering_method}")
 
     def _steering_hook(self, output, _module_name: str):
+        """
+        Transform the hooked module output when steering is enabled.
+
+        Args:
+            output: Output produced by the wrapped transformer layer.
+            _module_name (str): Hook-reported module name.
+
+        Returns:
+            Any: Original or steered output in the same structure as input.
+        """
         if not self._steering_enabled():
             return output
 
@@ -238,12 +370,31 @@ class SteerHookActWorkerMetal(MetalWorker):
         return residuals
 
     def _uninstall_hooks(self):
+        """
+        Restore the original module after temporary wrapping.
+
+        Args:
+            None.
+
+        Returns:
+            None: Wrapped modules are restored in-place.
+        """
         for entry in reversed(getattr(self, "_hooks", [])):
             setattr(entry["parent"], entry["target_name"], entry["original_module"])
         if hasattr(self, "_hooks"):
             self._hooks.clear()
 
     def execute_model(self, *args, **kwargs):
+        """
+        Run the model with steering enabled only during active execution.
+
+        Args:
+            *args: Positional arguments forwarded to the base worker.
+            **kwargs: Keyword arguments forwarded to the base worker.
+
+        Returns:
+            Any: Result returned by the base worker ``execute_model`` call.
+        """
         # This extra gate remains because the Metal runtime may invoke wrapped
         # modules during setup paths where steering should stay disabled.
         self._capture_active = True
