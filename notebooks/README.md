@@ -59,10 +59,10 @@ curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/instal
 ## Register a Kernel
 
 ```bash
-python -m ipykernel install --user --name vllm_hook_metal_env --display-name "vllm_hook_vllm_metal"
+python -m ipykernel install --user --name vllm_hook_env --display-name "vllm_hook_env"
 ```
 
-Then select `vllm_hook_vllm_metal` inside Jupyter.
+Then select `vllm_hook_env` inside Jupyter.
 
 ## Launch Jupyter
 

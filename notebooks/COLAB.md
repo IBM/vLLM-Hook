@@ -62,5 +62,11 @@ Do not skip directly to later cells in a fresh runtime.
 - Import errors after changing branches or cells
   - Restart the runtime and run the notebook from the top.
 
+- `ValueError` about free memory being lower than `gpu_memory_utilization`
+  - Free public Colab T4 runtimes can start with limited available GPU memory. The Colab notebooks use lower defaults (`gpu_memory_utilization=0.5` and `max_model_len=2048`) to reduce this, but repeated reruns can still leave less memory available.
+
+- `demo_actsteer_colab.ipynb` can still fail on free Colab T4 with a startup-memory error during generation
+  - This is a known limitation. The steering path builds a hooked vLLM engine after using the base engine, so constrained T4 sessions may temporarily need memory for both engine lifecycles in the same notebook run. This has been flagged for follow-up and is not yet changed in `HookLLM`.
+
 - Slow or inconsistent behavior after repeated experimentation
   - Use `Runtime -> Restart session` and re-run all cells in order.
