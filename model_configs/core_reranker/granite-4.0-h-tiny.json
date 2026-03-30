@@ -1,0 +1,16 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "granite4-h-tiny-corer",
+        "model_id": "ibm-granite/granite-4.0-h-tiny",
+        "note": "Temporary Granite 4 h-tiny core-reranker config. Important heads are copied from the existing Granite 4 micro placeholder and need to be re-derived."
+    },
+    "params": {
+        "temperature": 0.1,
+        "max_output_tokens": 32,
+        "important_heads": [[15, 21], [15, 1], [16, 12], [15, 7], [9, 26], [12, 11], [12, 7], [18, 0]]
+    },
+    "hookq": {
+        "hookq_mode": "all_tokens"
+    }
+}
