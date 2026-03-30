@@ -15,6 +15,7 @@ ATTN_PATTERNS = [
     re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn.attn$"),
 
     # Qwen/LLaMA: model.layers.<i>.self_attn
+    re.compile(r"^model\.layers\.(\d+)\.self_attn$"),
     re.compile(r"^model\.layers\.(\d+)\.self_attn.attn$"),
 ]
 
