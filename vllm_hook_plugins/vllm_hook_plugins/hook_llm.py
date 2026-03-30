@@ -2,9 +2,7 @@ import os
 import json
 import glob
 import uuid
-import platform
 import tempfile
-from importlib.util import find_spec
 from typing import Optional, Dict, List
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
@@ -63,6 +61,11 @@ class HookLLM:
                 PluginRegistry, worker_name, self.backend
             )
         self._resolved_download_dir = download_dir
+        print(
+            f"HookLLM backend={self.backend} worker={self.worker_name or 'none'} "
+            f"hooks_enabled={self.enable_hook}",
+            flush=True,
+        )
         self.llm = self._build_llm(use_hook_worker=False)
             
         self.tokenizer = self.llm.get_tokenizer()
@@ -109,26 +112,33 @@ class HookLLM:
         )
 
     @staticmethod
+    def _normalize_backend_name(name: Optional[str]) -> Optional[str]:
+        if not isinstance(name, str):
+            return None
+        normalized = name.strip().lower()
+        if not normalized:
+            return None
+        if normalized in {"mps", "metal"}:
+            return "metal"
+        return normalized
+
+    @staticmethod
     def _resolve_backend(
         backend: Optional[str], vllm_kwargs: Dict
     ) -> str:
-        if backend:
-            return backend.lower()
+        normalized_backend = HookLLM._normalize_backend_name(backend)
+        if normalized_backend:
+            return normalized_backend
 
         device = vllm_kwargs.get("device")
-        if isinstance(device, str) and device:
-            return device.lower()
+        normalized_device = HookLLM._normalize_backend_name(device)
+        if normalized_device:
+            return normalized_device
 
         env_backend = os.environ.get("VLLM_HOOK_BACKEND")
-        if env_backend:
-            return env_backend.lower()
-
-        if (
-            platform.system() == "Darwin"
-            and platform.machine() == "arm64"
-            and find_spec("vllm_metal") is not None
-        ):
-            return "metal"
+        normalized_env_backend = HookLLM._normalize_backend_name(env_backend)
+        if normalized_env_backend:
+            return normalized_env_backend
 
         return "default"
 
