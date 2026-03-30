@@ -54,8 +54,12 @@ class HookLLM:
 
         if worker_name:
             import vllm.plugins
-            from vllm_hook_plugins import PluginRegistry
+            from vllm_hook_plugins import (
+                PluginRegistry,
+                ensure_backend_workers_registered,
+            )
             vllm.plugins.load_general_plugins()
+            ensure_backend_workers_registered(self.backend)
             self._plugin_registry = PluginRegistry
             self.worker_name = self._resolve_worker_name(
                 PluginRegistry, worker_name, self.backend
@@ -75,8 +79,12 @@ class HookLLM:
         if analyzer_name:
             if self._plugin_registry is None:
                 import vllm.plugins
-                from vllm_hook_plugins import PluginRegistry
+                from vllm_hook_plugins import (
+                    PluginRegistry,
+                    ensure_backend_workers_registered,
+                )
                 vllm.plugins.load_general_plugins()
+                ensure_backend_workers_registered(self.backend)
                 self._plugin_registry = PluginRegistry
             self.analyzer = self._plugin_registry.get_analyzer(analyzer_name).analyzer
             self.analyzer = self.analyzer(self._hook_dir, self.layer_to_heads)

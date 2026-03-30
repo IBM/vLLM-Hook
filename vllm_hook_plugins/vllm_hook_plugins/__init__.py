@@ -18,24 +18,27 @@ def _can_register_metal_worker() -> bool:
     )
 
 
+def ensure_backend_workers_registered(backend: str) -> None:
+    if backend != "metal":
+        return
+    if not _can_register_metal_worker():
+        return
+    if PluginRegistry.get_worker("probe_hook_qk_metal") is not None:
+        return
+    try:
+        from vllm_hook_plugins.workers.metal import (
+            ProbeHookQKWorkerMetal,
+            SteerHookActWorkerMetal,
+        )
+    except Exception:
+        return
+    PluginRegistry.register_worker("probe_hook_qk_metal", ProbeHookQKWorkerMetal)
+    PluginRegistry.register_worker("steer_hook_act_metal", SteerHookActWorkerMetal)
+
+
 def register_plugins():
     # Register workers
     PluginRegistry.register_worker("probe_hook_qk", ProbeHookQKWorker)
-    if _can_register_metal_worker():
-        try:
-            from vllm_hook_plugins.workers.metal import (
-                ProbeHookQKWorkerMetal,
-                SteerHookActWorkerMetal,
-            )
-        except Exception:
-            ProbeHookQKWorkerMetal = None
-            SteerHookActWorkerMetal = None
-        if ProbeHookQKWorkerMetal is not None:
-            PluginRegistry.register_worker("probe_hook_qk_metal", ProbeHookQKWorkerMetal)
-        if SteerHookActWorkerMetal is not None:
-            PluginRegistry.register_worker(
-                "steer_hook_act_metal", SteerHookActWorkerMetal
-            )
     PluginRegistry.register_worker("steer_hook_act", SteerHookActWorker)
 
     # Register analyzers
@@ -50,5 +53,6 @@ __all__ = [
     "SteerHookActWorker",
     "AttntrackerAnalyzer",
     "CorerAnalyzer",
-    "register_plugins"
+    "register_plugins",
+    "ensure_backend_workers_registered",
 ]

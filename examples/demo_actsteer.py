@@ -1,5 +1,6 @@
 import os
 import multiprocessing as mp
+import platform
 import torch
 
 mp.set_start_method("spawn", force=True)
@@ -13,7 +14,10 @@ if __name__ == "__main__":
 
     # cache_dir = "/dccstor/pyrite/irene/"
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
-    model = 'ibm-granite/granite-4.0-micro'
+    model = 'ibm-granite/granite-3.1-8b-instruct'
+    backend = os.environ.get("VLLM_HOOK_BACKEND")
+    if backend is None and platform.system() == "Darwin" and platform.machine() == "arm64":
+        backend = "metal"
     
     dtype_map = {
         'microsoft/Phi-3-mini-4k-instruct': 'auto',
@@ -26,6 +30,7 @@ if __name__ == "__main__":
     llm = HookLLM(
         model=model,
         worker_name="steer_hook_act",
+        backend=backend,
         config_file=f'model_configs/activation_steer/{model.split("/")[-1]}.json',
         download_dir=cache_dir,
         gpu_memory_utilization=0.7,

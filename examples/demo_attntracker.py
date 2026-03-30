@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import multiprocessing as mp
+import platform
 import torch
 import time
 
@@ -69,11 +70,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
-    model = 'ibm-granite/granite-4.0-micro'  # old default: 'ibm-granite/granite-3.1-8b-instruct'
-    # model = 'ibm-granite/granite-3.1-8b-instruct'
+    model = 'ibm-granite/granite-3.1-8b-instruct'
+    # model = 'ibm-granite/granite-4.0-micro'
     # model = 'Qwen/Qwen2-1.5B-Instruct'
     # model = 'mistralai/Mistral-7B-Instruct-v0.3'
     backend = os.environ.get("VLLM_HOOK_BACKEND")
+    if backend is None and platform.system() == "Darwin" and platform.machine() == "arm64":
+        backend = "metal"
     debug = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
     config_basename = f'{model.split("/")[-1]}.json'
     

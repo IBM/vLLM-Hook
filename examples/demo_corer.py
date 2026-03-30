@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import multiprocessing as mp
+import platform
 import torch
 import time
 from typing import List
@@ -71,12 +72,15 @@ if __name__ == "__main__":
 
     # cache_dir = "/dccstor/pyrite/irene/"
     cache_dir = os.path.expanduser("~/.cache/vllm-hook")
-    model = 'ibm-granite/granite-4.0-micro'  # old default: 'mistralai/Mistral-7B-Instruct-v0.3'
+    model = 'ibm-granite/granite-3.1-8b-instruct'
     # model = 'mistralai/Mistral-7B-Instruct-v0.3'
-    # model = 'ibm-granite/granite-3.1-8b-instruct'
+    # model = 'ibm-granite/granite-4.0-micro'
     # model = 'Qwen/Qwen2-1.5B-Instruct'
     keep_only_case = 1  # Set to None to run all single-case examples.
     run_batch_example = False
+    backend = os.environ.get("VLLM_HOOK_BACKEND")
+    if backend is None and platform.system() == "Darwin" and platform.machine() == "arm64":
+        backend = "metal"
     
     dtype_map = {
         'ibm-granite/granite-4.0-micro': torch.float16,
@@ -88,6 +92,7 @@ if __name__ == "__main__":
     llm = HookLLM(
         model=model,
         worker_name="probe_hook_qk",
+        backend=backend,
         analyzer_name="core_reranker",
         config_file=f'model_configs/core_reranker/{model.split("/")[-1]}.json',
         download_dir=cache_dir,

@@ -96,7 +96,7 @@ REQ_FILE = REPO_ROOT / "requirement.txt"
 
 ## Notes
 
-- The notebooks currently default to `ibm-granite/granite-4.0-micro`.
+- The local notebooks currently default to `ibm-granite/granite-3.1-8b-instruct`.
 - If you change the model, keep the notebook config file aligned with that model.
 - When you edit helper cells in a notebook, re-run that cell or restart the kernel before re-running later cells.
 - Metal-specific worker behavior lives under:

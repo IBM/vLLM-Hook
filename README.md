@@ -100,7 +100,7 @@ You can customize model configurations in the `model_configs/` folder, e.g.:
 ```
 model_configs/<example_name>/<model_name>.json
 ```
-For example `model_configs/attention_tracker/granite-4.0-micro.json`.
+For example `model_configs/attention_tracker/granite-3.1-8b-instruct.json`.
 
 ---
 
