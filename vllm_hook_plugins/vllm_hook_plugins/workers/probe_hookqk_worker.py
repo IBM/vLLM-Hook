@@ -217,6 +217,12 @@ class ProbeHookQKWorker(V1Worker):
             # Warmup or non-attention passes: nothing to do
             if metadata is None:
                 return
+
+            # Some Granite/vLLM attention wrappers do not expose q/k tensors in
+            # the forward-hook input tuple. In those cases, let the q_proj/k_proj
+            # fallback hooks capture tensors instead of crashing here.
+            if len(input) < 2 or not hasattr(input[0], "device"):
+                return
         
             bounds = _segment_bounds_from_metadata(
                 metadata,
