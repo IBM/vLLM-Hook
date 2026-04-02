@@ -4,6 +4,7 @@ from vllm_hook_plugins.hook_client import HookClient
 from vllm_hook_plugins.workers.probe_hookqk_worker import ProbeHookQKWorker
 from vllm_hook_plugins.workers.steer_activation_worker import SteerHookActWorker
 from vllm_hook_plugins.workers.probe_hidden_states_worker import ProbeHiddenStatesWorker
+from vllm_hook_plugins.workers.spotlight_worker import SpotlightWorker
 from vllm_hook_plugins.analyzers.attention_tracker_analyzer import AttntrackerAnalyzer
 from vllm_hook_plugins.analyzers.core_reranker_analyzer import CorerAnalyzer
 from vllm_hook_plugins.analyzers.hidden_states_analyzer import HiddenStatesAnalyzer
@@ -16,6 +17,7 @@ def register_plugins():
     PluginRegistry.register_worker("probe_hook_qk",       ProbeHookQKWorker)
     PluginRegistry.register_worker("steer_hook_act",      SteerHookActWorker)
     PluginRegistry.register_worker("probe_hidden_states", ProbeHiddenStatesWorker)
+    PluginRegistry.register_worker("probe_spotlight",     SpotlightWorker)
 
     # Register analyzers
     PluginRegistry.register_analyzer("attn_tracker",          AttntrackerAnalyzer)
@@ -30,6 +32,7 @@ __all__ = [
     "ProbeHookQKWorker",
     "SteerHookActWorker",
     "ProbeHiddenStatesWorker",
+    "SpotlightWorker",
     "AttntrackerAnalyzer",
     "CorerAnalyzer",
     "HiddenStatesAnalyzer",
