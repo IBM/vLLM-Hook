@@ -2,7 +2,11 @@ import os
 import math
 import torch
 from typing import Dict, List
-from vllm.v1.worker.gpu_worker import Worker as V1Worker
+import torch
+if torch.cuda.is_available():
+    from vllm.v1.worker.gpu_worker import Worker as V1Worker
+else:
+    from vllm.v1.worker.cpu_worker import CPUWorker as V1Worker
 from vllm.forward_context import get_forward_context
 import re
 from vllm.distributed import parallel_state as ps
