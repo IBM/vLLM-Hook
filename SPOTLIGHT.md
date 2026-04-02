@@ -1,6 +1,6 @@
 # Spotlight: Attention Steering for Instruction Following
 
-**Paper**: [Venkateswaran and Contractor, EACL 2026]([https://arxiv.org/abs/2505.12025](https://aclanthology.org/2026.eacl-long.174/])  
+**Paper**: [Venkateswaran and Contractor, EACL 2026]([https://aclanthology.org/2026.eacl-long.174/])  
 **Reference implementation**: [agent-lifecycle-toolkit SpotLightComponent](https://github.com/AgentToolkit/agent-lifecycle-toolkit/blob/main/altk/pre_llm/spotlight/spotlight.py)
 
 Spotlight is an inference-time attention steering mechanism. It biases how a model attends to emphasized text spans (e.g. "Answer in JSON format") to improve instruction following, without any fine-tuning.
