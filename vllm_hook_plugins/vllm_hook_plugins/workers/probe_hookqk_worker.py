@@ -68,6 +68,23 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
         except Exception:
             pass
 
+    expanded_candidates = []
+    seen_ids = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        obj_id = id(candidate)
+        if obj_id in seen_ids:
+            continue
+        seen_ids.add(obj_id)
+        expanded_candidates.append(candidate)
+        for attr in ("prefill", "decode", "_cached_prefill_metadata", "_cached_decode_metadata"):
+            nested = getattr(candidate, attr, None)
+            if nested is not None and id(nested) not in seen_ids:
+                seen_ids.add(id(nested))
+                expanded_candidates.append(nested)
+    candidates = expanded_candidates
+
     for candidate in candidates:
         if candidate is None:
             continue
@@ -80,6 +97,17 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
                 query_start_loc = query_start_loc.to(device)
             if query_start_loc.numel() >= 2:
                 return query_start_loc.to(dtype=torch.long)
+
+        for attr in ("qo_indptr", "cu_seqlens", "cu_seqlens_q", "seq_start_loc"):
+            offsets = getattr(candidate, attr, None)
+            if offsets is None:
+                continue
+            if not torch.is_tensor(offsets):
+                offsets = torch.tensor(offsets, device=device)
+            else:
+                offsets = offsets.to(device)
+            if offsets.numel() >= 2:
+                return offsets.to(dtype=torch.long)
 
         for attr in ("seq_lens_tensor", "seq_lens"):
             seq_lens = getattr(candidate, attr, None)
@@ -119,6 +147,10 @@ def _format_debug_value(value):
 def _metadata_debug_summary(metadata, module_name: str) -> str:
     field_names = (
         "query_start_loc",
+        "qo_indptr",
+        "cu_seqlens",
+        "cu_seqlens_q",
+        "seq_start_loc",
         "seq_lens_tensor",
         "seq_lens",
         "slot_mapping",
@@ -142,6 +174,23 @@ def _metadata_debug_summary(metadata, module_name: str) -> str:
                 candidates.append((f"metadata[{module_name!r}]", metadata[module_name]))
         except Exception:
             pass
+
+    expanded_candidates = []
+    seen_ids = set()
+    for label, candidate in candidates:
+        if candidate is None:
+            continue
+        obj_id = id(candidate)
+        if obj_id in seen_ids:
+            continue
+        seen_ids.add(obj_id)
+        expanded_candidates.append((label, candidate))
+        for attr in ("prefill", "decode", "_cached_prefill_metadata", "_cached_decode_metadata"):
+            nested = getattr(candidate, attr, None)
+            if nested is not None and id(nested) not in seen_ids:
+                seen_ids.add(id(nested))
+                expanded_candidates.append((f"{label}.{attr}", nested))
+    candidates = expanded_candidates
 
     lines = []
     for label, candidate in candidates:
