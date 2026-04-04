@@ -101,6 +101,70 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
 
     return None
 
+
+def _format_debug_value(value):
+    if value is None:
+        return "None"
+    if torch.is_tensor(value):
+        return (
+            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+            f"device={value.device})"
+        )
+    if isinstance(value, (list, tuple)):
+        preview = list(value[:4]) if len(value) > 4 else list(value)
+        return f"{type(value).__name__}(len={len(value)}, preview={preview})"
+    return repr(value)
+
+
+def _metadata_debug_summary(metadata, module_name: str) -> str:
+    field_names = (
+        "query_start_loc",
+        "seq_lens_tensor",
+        "seq_lens",
+        "slot_mapping",
+        "num_prefill_tokens",
+        "num_decode_tokens",
+        "num_input_tokens",
+        "max_query_len",
+        "max_prefill_seq_len",
+        "context_lens_tensor",
+        "block_tables",
+    )
+    candidates = [("metadata", metadata)]
+    for attr in ("prefill", "decode", "_cached_prefill_metadata", "_cached_decode_metadata"):
+        nested = getattr(metadata, attr, None)
+        if nested is not None:
+            candidates.append((attr, nested))
+
+    if hasattr(metadata, "__contains__"):
+        try:
+            if module_name in metadata:
+                candidates.append((f"metadata[{module_name!r}]", metadata[module_name]))
+        except Exception:
+            pass
+
+    lines = []
+    for label, candidate in candidates:
+        try:
+            candidate_type = type(candidate).__name__
+            visible_attrs = [
+                attr for attr in dir(candidate)
+                if not attr.startswith("_") and not callable(getattr(candidate, attr, None))
+            ]
+            visible_attrs = visible_attrs[:20]
+            lines.append(
+                f"{label}: type={candidate_type}, attrs={visible_attrs}"
+            )
+            for field_name in field_names:
+                if hasattr(candidate, field_name):
+                    value = getattr(candidate, field_name, None)
+                    lines.append(
+                        f"{label}.{field_name}={_format_debug_value(value)}"
+                    )
+        except Exception as exc:
+            lines.append(f"{label}: debug_summary_failed={exc!r}")
+    return " | ".join(lines)
+
 class ProbeHookQKWorker(V1Worker):
 
     def load_model(self, *args, **kwargs):
@@ -259,6 +323,11 @@ class ProbeHookQKWorker(V1Worker):
             )
             if bounds is None or bounds.numel() < 2:
                 _debug_once("skip_no_segment_bounds", module_name)
+                _debug_once(
+                    "attn_metadata_summary",
+                    module_name,
+                    extra=_metadata_debug_summary(metadata, module_name),
+                )
                 return
 
             bs = bounds.numel() - 1
@@ -317,6 +386,11 @@ class ProbeHookQKWorker(V1Worker):
             )
             if bounds is None or bounds.numel() < 2:
                 _debug_once(f"skip_no_segment_bounds_{proj_kind}", module_name)
+                _debug_once(
+                    f"attn_metadata_summary_{proj_kind}",
+                    module_name,
+                    extra=_metadata_debug_summary(metadata, module_name),
+                )
                 return None
 
             bs = bounds.numel() - 1
