@@ -68,23 +68,6 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
         except Exception:
             pass
 
-    expanded_candidates = []
-    seen_ids = set()
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        obj_id = id(candidate)
-        if obj_id in seen_ids:
-            continue
-        seen_ids.add(obj_id)
-        expanded_candidates.append(candidate)
-        for attr in ("prefill", "decode", "_cached_prefill_metadata", "_cached_decode_metadata"):
-            nested = getattr(candidate, attr, None)
-            if nested is not None and id(nested) not in seen_ids:
-                seen_ids.add(id(nested))
-                expanded_candidates.append(nested)
-    candidates = expanded_candidates
-
     for candidate in candidates:
         if candidate is None:
             continue
@@ -97,17 +80,6 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
                 query_start_loc = query_start_loc.to(device)
             if query_start_loc.numel() >= 2:
                 return query_start_loc.to(dtype=torch.long)
-
-        for attr in ("qo_indptr", "cu_seqlens", "cu_seqlens_q", "seq_start_loc"):
-            offsets = getattr(candidate, attr, None)
-            if offsets is None:
-                continue
-            if not torch.is_tensor(offsets):
-                offsets = torch.tensor(offsets, device=device)
-            else:
-                offsets = offsets.to(device)
-            if offsets.numel() >= 2:
-                return offsets.to(dtype=torch.long)
 
         for attr in ("seq_lens_tensor", "seq_lens"):
             seq_lens = getattr(candidate, attr, None)
@@ -128,91 +100,6 @@ def _segment_bounds_from_metadata(metadata, module_name: str, device: torch.devi
             )
 
     return None
-
-
-def _format_debug_value(value):
-    if value is None:
-        return "None"
-    if torch.is_tensor(value):
-        return (
-            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
-            f"device={value.device})"
-        )
-    if isinstance(value, (list, tuple)):
-        preview = list(value[:4]) if len(value) > 4 else list(value)
-        return f"{type(value).__name__}(len={len(value)}, preview={preview})"
-    return repr(value)
-
-
-def _metadata_debug_summary(metadata, module_name: str) -> str:
-    field_names = (
-        "query_start_loc",
-        "qo_indptr",
-        "cu_seqlens",
-        "cu_seqlens_q",
-        "seq_start_loc",
-        "seq_lens_tensor",
-        "seq_lens",
-        "slot_mapping",
-        "num_prefill_tokens",
-        "num_decode_tokens",
-        "num_input_tokens",
-        "max_query_len",
-        "max_prefill_seq_len",
-        "context_lens_tensor",
-        "block_tables",
-    )
-    candidates = [("metadata", metadata)]
-    for attr in ("prefill", "decode", "_cached_prefill_metadata", "_cached_decode_metadata"):
-        nested = getattr(metadata, attr, None)
-        if nested is not None:
-            candidates.append((attr, nested))
-
-    if hasattr(metadata, "__contains__"):
-        try:
-            if module_name in metadata:
-                candidates.append((f"metadata[{module_name!r}]", metadata[module_name]))
-        except Exception:
-            pass
-
-    expanded_candidates = []
-    seen_ids = set()
-    for label, candidate in candidates:
-        if candidate is None:
-            continue
-        obj_id = id(candidate)
-        if obj_id in seen_ids:
-            continue
-        seen_ids.add(obj_id)
-        expanded_candidates.append((label, candidate))
-        for attr in ("prefill", "decode", "_cached_prefill_metadata", "_cached_decode_metadata"):
-            nested = getattr(candidate, attr, None)
-            if nested is not None and id(nested) not in seen_ids:
-                seen_ids.add(id(nested))
-                expanded_candidates.append((f"{label}.{attr}", nested))
-    candidates = expanded_candidates
-
-    lines = []
-    for label, candidate in candidates:
-        try:
-            candidate_type = type(candidate).__name__
-            visible_attrs = [
-                attr for attr in dir(candidate)
-                if not attr.startswith("_") and not callable(getattr(candidate, attr, None))
-            ]
-            visible_attrs = visible_attrs[:20]
-            lines.append(
-                f"{label}: type={candidate_type}, attrs={visible_attrs}"
-            )
-            for field_name in field_names:
-                if hasattr(candidate, field_name):
-                    value = getattr(candidate, field_name, None)
-                    lines.append(
-                        f"{label}.{field_name}={_format_debug_value(value)}"
-                    )
-        except Exception as exc:
-            lines.append(f"{label}: debug_summary_failed={exc!r}")
-    return " | ".join(lines)
 
 class ProbeHookQKWorker(V1Worker):
 
@@ -256,8 +143,6 @@ class ProbeHookQKWorker(V1Worker):
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens") # ["last_token", "all_tokens"]
-        self._debug_hook = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
-        self._debug_seen = set()
         tp_rank = int(ps.get_tensor_model_parallel_rank())
         
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
@@ -302,25 +187,6 @@ class ProbeHookQKWorker(V1Worker):
             os.makedirs(run_dir, exist_ok=True)
             cache_path = os.path.join(run_dir, "qk.pt")
             torch.save(cache, cache_path)
-            if self._debug_hook:
-                print(
-                    f"[hook-debug] saved qk cache run_id={run_id} path={cache_path} "
-                    f"modules={list(cache['qk_cache'].keys())}",
-                    flush=True,
-                )
-
-        def _debug_once(reason, module_name, extra=""):
-            if not self._debug_hook:
-                return
-            key = (reason, module_name)
-            if key in self._debug_seen:
-                return
-            self._debug_seen.add(key)
-            suffix = f" {extra}" if extra else ""
-            print(
-                f"[hook-debug] {reason} module={module_name}{suffix}",
-                flush=True,
-            )
 
         def _ensure_layer_cache(cache, module_name, layer_num):
             layer_cache = cache["qk_cache"].get(module_name)
@@ -343,7 +209,6 @@ class ProbeHookQKWorker(V1Worker):
 
             run_id = _active_run_id()
             if run_id is None:
-                _debug_once("skip_no_active_run", module_name)
                 return None
 
             ctx = get_forward_context()
@@ -351,18 +216,12 @@ class ProbeHookQKWorker(V1Worker):
 
             # Warmup or non-attention passes: nothing to do
             if metadata is None:
-                _debug_once("skip_no_attn_metadata", module_name)
                 return
 
             # Some Granite/vLLM attention wrappers do not expose q/k tensors in
             # the forward-hook input tuple. In those cases, let the q_proj/k_proj
             # fallback hooks capture tensors instead of crashing here.
             if len(input) < 2 or not hasattr(input[0], "device"):
-                _debug_once(
-                    "skip_unusable_hook_input",
-                    module_name,
-                    extra=f"input_len={len(input)}",
-                )
                 return
         
             bounds = _segment_bounds_from_metadata(
@@ -371,12 +230,6 @@ class ProbeHookQKWorker(V1Worker):
                 input[0].device,
             )
             if bounds is None or bounds.numel() < 2:
-                _debug_once("skip_no_segment_bounds", module_name)
-                _debug_once(
-                    "attn_metadata_summary",
-                    module_name,
-                    extra=_metadata_debug_summary(metadata, module_name),
-                )
                 return
 
             bs = bounds.numel() - 1
@@ -414,18 +267,15 @@ class ProbeHookQKWorker(V1Worker):
 
             run_id = _active_run_id()
             if run_id is None:
-                _debug_once(f"skip_no_active_run_{proj_kind}", module_name)
                 return None
 
             ctx = get_forward_context()
             metadata = getattr(ctx, "attn_metadata", None)
             if metadata is None:
-                _debug_once(f"skip_no_attn_metadata_{proj_kind}", module_name)
                 return None
 
             device = getattr(output, "device", None)
             if device is None:
-                _debug_once(f"skip_no_output_device_{proj_kind}", module_name)
                 return None
 
             bounds = _segment_bounds_from_metadata(
@@ -434,12 +284,6 @@ class ProbeHookQKWorker(V1Worker):
                 device,
             )
             if bounds is None or bounds.numel() < 2:
-                _debug_once(f"skip_no_segment_bounds_{proj_kind}", module_name)
-                _debug_once(
-                    f"attn_metadata_summary_{proj_kind}",
-                    module_name,
-                    extra=_metadata_debug_summary(metadata, module_name),
-                )
                 return None
 
             bs = bounds.numel() - 1
@@ -485,18 +329,9 @@ class ProbeHookQKWorker(V1Worker):
             # Fallback for Granite-style modules whose self_attn wrapper computes
             # q/k internally instead of exposing them as the hook input tuple.
             if name.endswith(".self_attn") and hasattr(module, "q_proj") and hasattr(module, "k_proj"):
-                if self._debug_hook:
-                    print(
-                        f"[hook-debug] using proj fallback for module={name}",
-                        flush=True,
-                    )
                 for proj_kind in ("q", "k"):
                     proj_module = getattr(module, f"{proj_kind}_proj", None)
                     if proj_module is None:
-                        _debug_once(
-                            f"missing_proj_module_{proj_kind}",
-                            name,
-                        )
                         continue
                     hook = proj_module.register_forward_hook(
                         lambda m, i, o, n=name, l=layer_num, p=proj_kind: proj_hook(i, o, n, l, p)
