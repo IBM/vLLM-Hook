@@ -143,6 +143,8 @@ class ProbeHookQKWorker(V1Worker):
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens") # ["last_token", "all_tokens"]
+        self._debug_hook = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
+        self._debug_seen = set()
         tp_rank = int(ps.get_tensor_model_parallel_rank())
         
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
@@ -187,6 +189,25 @@ class ProbeHookQKWorker(V1Worker):
             os.makedirs(run_dir, exist_ok=True)
             cache_path = os.path.join(run_dir, "qk.pt")
             torch.save(cache, cache_path)
+            if self._debug_hook:
+                print(
+                    f"[hook-debug] saved qk cache run_id={run_id} path={cache_path} "
+                    f"modules={list(cache['qk_cache'].keys())}",
+                    flush=True,
+                )
+
+        def _debug_once(reason, module_name, extra=""):
+            if not self._debug_hook:
+                return
+            key = (reason, module_name)
+            if key in self._debug_seen:
+                return
+            self._debug_seen.add(key)
+            suffix = f" {extra}" if extra else ""
+            print(
+                f"[hook-debug] {reason} module={module_name}{suffix}",
+                flush=True,
+            )
 
         def _ensure_layer_cache(cache, module_name, layer_num):
             layer_cache = cache["qk_cache"].get(module_name)
@@ -209,6 +230,7 @@ class ProbeHookQKWorker(V1Worker):
 
             run_id = _active_run_id()
             if run_id is None:
+                _debug_once("skip_no_active_run", module_name)
                 return None
 
             ctx = get_forward_context()
@@ -216,12 +238,18 @@ class ProbeHookQKWorker(V1Worker):
 
             # Warmup or non-attention passes: nothing to do
             if metadata is None:
+                _debug_once("skip_no_attn_metadata", module_name)
                 return
 
             # Some Granite/vLLM attention wrappers do not expose q/k tensors in
             # the forward-hook input tuple. In those cases, let the q_proj/k_proj
             # fallback hooks capture tensors instead of crashing here.
             if len(input) < 2 or not hasattr(input[0], "device"):
+                _debug_once(
+                    "skip_unusable_hook_input",
+                    module_name,
+                    extra=f"input_len={len(input)}",
+                )
                 return
         
             bounds = _segment_bounds_from_metadata(
@@ -230,6 +258,7 @@ class ProbeHookQKWorker(V1Worker):
                 input[0].device,
             )
             if bounds is None or bounds.numel() < 2:
+                _debug_once("skip_no_segment_bounds", module_name)
                 return
 
             bs = bounds.numel() - 1
@@ -267,15 +296,18 @@ class ProbeHookQKWorker(V1Worker):
 
             run_id = _active_run_id()
             if run_id is None:
+                _debug_once(f"skip_no_active_run_{proj_kind}", module_name)
                 return None
 
             ctx = get_forward_context()
             metadata = getattr(ctx, "attn_metadata", None)
             if metadata is None:
+                _debug_once(f"skip_no_attn_metadata_{proj_kind}", module_name)
                 return None
 
             device = getattr(output, "device", None)
             if device is None:
+                _debug_once(f"skip_no_output_device_{proj_kind}", module_name)
                 return None
 
             bounds = _segment_bounds_from_metadata(
@@ -284,6 +316,7 @@ class ProbeHookQKWorker(V1Worker):
                 device,
             )
             if bounds is None or bounds.numel() < 2:
+                _debug_once(f"skip_no_segment_bounds_{proj_kind}", module_name)
                 return None
 
             bs = bounds.numel() - 1
@@ -329,9 +362,18 @@ class ProbeHookQKWorker(V1Worker):
             # Fallback for Granite-style modules whose self_attn wrapper computes
             # q/k internally instead of exposing them as the hook input tuple.
             if name.endswith(".self_attn") and hasattr(module, "q_proj") and hasattr(module, "k_proj"):
+                if self._debug_hook:
+                    print(
+                        f"[hook-debug] using proj fallback for module={name}",
+                        flush=True,
+                    )
                 for proj_kind in ("q", "k"):
                     proj_module = getattr(module, f"{proj_kind}_proj", None)
                     if proj_module is None:
+                        _debug_once(
+                            f"missing_proj_module_{proj_kind}",
+                            name,
+                        )
                         continue
                     hook = proj_module.register_forward_hook(
                         lambda m, i, o, n=name, l=layer_num, p=proj_kind: proj_hook(i, o, n, l, p)
