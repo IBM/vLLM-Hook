@@ -1,6 +1,7 @@
 # 🪝 vLLM.hook
 *A modular plugin library for vLLM.*
-> 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](./vLLM_Hook_v0.pdf)
+
+📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
 vLLM.hook is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
 
@@ -145,6 +146,17 @@ We welcome contributions from the community!
 - Include examples and documentation for new features  
 - The registry will be updated by the admin
 
+---
+
+## 🌟 Feeling Inspired
+```
+@article{ko2026vllm,
+  title={vLLM Hook v0: A Plug-in for Programming Model Internals on vLLM},
+  author={Ko, Ching-Yun and Chen, Pin-Yu},
+  journal={arXiv preprint arXiv:2603.06588},
+  year={2026}
+}
+```
 ---
 
 
