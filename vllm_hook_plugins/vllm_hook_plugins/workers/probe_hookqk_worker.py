@@ -7,8 +7,6 @@ from vllm.forward_context import get_forward_context
 import re
 from vllm.distributed import parallel_state as ps
 
-PROJ_MODULE_NAME_TEMPLATE = "{attn_name}.{proj_kind}"
-
 ATTN_PATTERNS = [
     # GPT-2: transformer.h.<i>.attn
     re.compile(r"^transformer\.h\.(\d+)\.attn.attn$"),
@@ -218,9 +216,8 @@ class ProbeHookQKWorker(V1Worker):
             if metadata is None:
                 return
 
-            # Some Granite/vLLM attention wrappers do not expose q/k tensors in
-            # the forward-hook input tuple. In those cases, let the q_proj/k_proj
-            # fallback hooks capture tensors instead of crashing here.
+            # Require the attention module itself to expose both q and k in the
+            # forward-hook input tuple. Projection-hook fallback is disabled.
             if len(input) < 2 or not hasattr(input[0], "device"):
                 return
         
@@ -259,63 +256,6 @@ class ProbeHookQKWorker(V1Worker):
             )
             _save_cache(run_id, cache)
 
-        def proj_hook(input, output, module_name, layer_num, proj_kind):
-            """
-            Capture projected Q or K tensors for attention modules whose wrapper
-            no longer passes both tensors in the forward-hook input tuple.
-            """
-
-            run_id = _active_run_id()
-            if run_id is None:
-                return None
-
-            ctx = get_forward_context()
-            metadata = getattr(ctx, "attn_metadata", None)
-            if metadata is None:
-                return None
-
-            device = getattr(output, "device", None)
-            if device is None:
-                return None
-
-            bounds = _segment_bounds_from_metadata(
-                metadata,
-                module_name,
-                device,
-            )
-            if bounds is None or bounds.numel() < 2:
-                return None
-
-            bs = bounds.numel() - 1
-            cache = _get_or_create_cache(run_id)
-            layer_cache = _ensure_layer_cache(cache, module_name, layer_num)
-
-            if proj_kind == "q":
-                if self.hookq_mode == "all_tokens":
-                    layer_cache["q"].extend(
-                        [
-                            output[bounds[i]:bounds[i + 1], :].detach().cpu()
-                            for i in range(bs)
-                        ]
-                    )
-                elif self.hookq_mode == "last_token":
-                    layer_cache["q"].extend(
-                        list(output[bounds[1:] - 1, :].detach().cpu())
-                    )
-                else:
-                    raise NotImplementedError
-            elif proj_kind == "k":
-                layer_cache["k_all"].extend(
-                    [
-                        output[bounds[i]:bounds[i + 1], :].detach().cpu()
-                        for i in range(bs)
-                    ]
-                )
-            else:
-                raise NotImplementedError
-
-            _save_cache(run_id, cache)
-
         # register hooks on attention modules 
         self._hooks = []
         matched = []
@@ -324,20 +264,6 @@ class ProbeHookQKWorker(V1Worker):
             if layer_num is None: # not an attention module 
                 continue
             if layer_num not in self.important_layers:
-                continue
-
-            # Fallback for Granite-style modules whose self_attn wrapper computes
-            # q/k internally instead of exposing them as the hook input tuple.
-            if name.endswith(".self_attn") and hasattr(module, "q_proj") and hasattr(module, "k_proj"):
-                for proj_kind in ("q", "k"):
-                    proj_module = getattr(module, f"{proj_kind}_proj", None)
-                    if proj_module is None:
-                        continue
-                    hook = proj_module.register_forward_hook(
-                        lambda m, i, o, n=name, l=layer_num, p=proj_kind: proj_hook(i, o, n, l, p)
-                    )
-                    self._hooks.append(hook)
-                    matched.append(PROJ_MODULE_NAME_TEMPLATE.format(attn_name=name, proj_kind=f"{proj_kind}_proj"))
                 continue
 
             hook = module.register_forward_hook(
