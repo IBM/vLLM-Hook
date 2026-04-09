@@ -61,7 +61,7 @@ Legend:
 | `tests/use_cases/test_corer.py` | M | DEMO | Test target model changed to Granite |
 | `vllm_hook_plugins/vllm_hook_plugins/__init__.py` | M | RUNTIME | Backend-specific worker registration |
 | `vllm_hook_plugins/vllm_hook_plugins/analyzers/attention_tracker_analyzer.py` | M | RUNTIME | Attention tracker contract and token semantics changed |
-| `vllm_hook_plugins/vllm_hook_plugins/hook_llm.py` | M | RUNTIME | Backend resolution, hook-engine lifecycle, artifact assertions |
+| `vllm_hook_plugins/vllm_hook_plugins/hook_llm.py` | M | RUNTIME | Apple Silicon backend auto-detect, backend-routed worker resolution, hook-engine lifecycle, artifact assertions |
 | `vllm_hook_plugins/vllm_hook_plugins/run_utils.py` | M | RUNTIME | Load/normalize `qkv.pt` in addition to `qk.pt` |
 | `vllm_hook_plugins/vllm_hook_plugins/workers/metal/__init__.py` | A | RUNTIME, NEW | Exposes Metal workers |
 | `vllm_hook_plugins/vllm_hook_plugins/workers/metal/probe_hookqk_worker_metal.py` | A | RUNTIME, NEW | New Metal probe worker |
@@ -265,6 +265,8 @@ Sandbox behavior:
   - `steer_hook_act_metal`
 - Adds analyzer alias:
   - `attention_tracker`
+- This file is now part of `HookLLM` worker resolution, not just plugin declaration:
+  - `HookLLM` calls `ensure_backend_workers_registered(self.backend)` before resolving suffixed worker names
 
 Overwrite risk:
 
@@ -292,6 +294,11 @@ Sandbox behavior:
   - `~/.cache/_v1_qk_peeks`
   - temp dir
 - Metal-specific env defaults are set in `__init__`.
+- If backend is not explicitly provided, `_resolve_backend(...)` now defaults to `metal` on Apple Silicon macOS only:
+  - `platform.system() == "Darwin"`
+  - `platform.machine() == "arm64"`
+- `__init__` now imports `PluginRegistry` and `ensure_backend_workers_registered` through package-relative imports.
+- `__init__` calls `ensure_backend_workers_registered(self.backend)` before resolving worker names.
 - `_resolve_worker_name(...)` prefers backend-specific worker names like `probe_hook_qk_metal`.
 - `_should_use_hook_worker(...)` disables Metal hook workers when `VLLM_DISABLE_METAL_HOOKS=1`.
 - `_build_llm(...)` can build a hooked worker-backed engine or a plain engine.
@@ -317,8 +324,9 @@ Sandbox behavior:
 
 Directly observed semantic differences by function:
 
-- `_resolve_backend(...)`: new
-- `_resolve_worker_name(...)`: new backend-specific worker resolution
+- `_resolve_backend(...)`: new; now normalizes explicit values, consults `device`/`VLLM_HOOK_BACKEND`, and defaults to `metal` only on Darwin/arm64
+- `__init__(...)`: now registers backend-specific workers before resolving hook worker names
+- `_resolve_worker_name(...)`: new backend-specific worker resolution with suffixed-name preference and generic fallback
 - `_should_use_hook_worker(...)`: new Metal-specific disable switch
 - `_build_llm(...)`: new hook-worker-aware engine construction
 - `_dispose_llm(...)`: new lifecycle cleanup
@@ -350,24 +358,22 @@ Sandbox behavior:
   - `_cached_prefill_metadata`
   - `_cached_decode_metadata`
   - per-module metadata mapping
-- `_install_hooks(...)` now has two capture paths:
-  - direct attention hook path via `qkv_hook(...)`
-  - projection fallback via `proj_hook(...)` on `q_proj` and `k_proj`
-- Fallback path exists specifically for wrapper modules whose forward-hook tuple no longer exposes both tensors.
+- `_install_hooks(...)` now keeps the direct attention hook path via `qkv_hook(...)`, but uses `_segment_bounds_from_metadata(...)` plus cache helpers (`_active_run_id`, `_get_or_create_cache`, `_save_cache`, `_ensure_layer_cache`) instead of the older inline sequence-length logic.
+- The current `sandbox` version explicitly requires the attention module itself to expose both `q` and `k` in the forward-hook input tuple.
 - `_uninstall_hooks(...)` is new.
 
 Directly observed semantic differences by function:
 
 - `match_attn(...)`: broader module-name matching
 - `_segment_bounds_from_metadata(...)`: new metadata decoding path
-- `_install_hooks(...)`: handles Granite-style `self_attn` and projection-hook fallback
+- `_install_hooks(...)`: broader module-name matching, nested-metadata boundary handling, cache-helper refactor, and direct-hook-only capture requirement
 - `_uninstall_hooks(...)`: new cleanup path
 
 Overwrite risk:
 
 - High.
-- If `sandbox` overwrites upstream with this file, upstream will inherit support for newer Granite-style attention layouts and nested metadata paths.
-- The real risk is behavioral expansion: upstream GPU capture semantics will change for newer attention-module layouts and wrapper structures.
+- If `sandbox` overwrites upstream with this file, upstream will inherit support for newer `.self_attn` module-name matching and nested metadata-path handling.
+- The real risk is mixed: behavior expands for newer metadata/module naming, while capture still depends on the hooked attention module exposing direct `q`/`k` inputs.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/workers/steer_activation_worker.py`
 
@@ -565,7 +571,7 @@ Most likely breakpoints if `sandbox` overwrites upstream without carrying the fu
 - analyzer expecting `qk.pt` only while Metal writes `qkv.pt`
 - Attention Tracker output schema changing back to score-only
 - Attention Tracker reverting from last-query-token semantics
-- GPU probe worker losing Granite/self-attn/projection fallback behavior
+- GPU probe worker losing broader `.self_attn` matching or nested metadata handling
 
 ## Minimal Truths That Are Safe To Assert
 

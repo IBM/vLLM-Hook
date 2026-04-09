@@ -1,6 +1,7 @@
 import os
 import json
 import glob
+import platform
 import uuid
 import tempfile
 from typing import Optional, Dict, List
@@ -54,10 +55,8 @@ class HookLLM:
 
         if worker_name:
             import vllm.plugins
-            from vllm_hook_plugins import (
-                PluginRegistry,
-                ensure_backend_workers_registered,
-            )
+            from . import ensure_backend_workers_registered
+            from .registry import PluginRegistry
             vllm.plugins.load_general_plugins()
             ensure_backend_workers_registered(self.backend)
             self._plugin_registry = PluginRegistry
@@ -79,10 +78,8 @@ class HookLLM:
         if analyzer_name:
             if self._plugin_registry is None:
                 import vllm.plugins
-                from vllm_hook_plugins import (
-                    PluginRegistry,
-                    ensure_backend_workers_registered,
-                )
+                from . import ensure_backend_workers_registered
+                from .registry import PluginRegistry
                 vllm.plugins.load_general_plugins()
                 ensure_backend_workers_registered(self.backend)
                 self._plugin_registry = PluginRegistry
@@ -147,6 +144,9 @@ class HookLLM:
         normalized_env_backend = HookLLM._normalize_backend_name(env_backend)
         if normalized_env_backend:
             return normalized_env_backend
+
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            return "metal"
 
         return "default"
 
@@ -395,4 +395,3 @@ class HookLLM:
             "Hooked generation completed but produced no qk/qkv artifact for "
             f"run_id={run_id} under {self._hook_dir}." + marker_note + outer_note
         )
-    
