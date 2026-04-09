@@ -17,17 +17,21 @@ class AttntrackerAnalyzer:
         self,
         analyzer_spec: Optional[Dict] = None
     ) -> Optional[Dict]:
-        
+        analyzer_spec = analyzer_spec or {}
         run_id_file = os.environ.get("VLLM_RUN_ID")
 
         attention_weights = self.compute_attention_from_qk(run_id_file)
-        score = self.attn2score(attention_weights, analyzer_spec['input_range'], analyzer_spec['attn_func'])
+        score, per_head_scores = self.attn2score(
+            attention_weights,
+            analyzer_spec['input_range'],
+            analyzer_spec['attn_func'],
+        )
 
         return {
-            "score": score
+            "score": score,
+            "per_head_scores": per_head_scores,
         }
-        
-            
+
     def compute_attention_from_qk(self, run_id_file: str) -> Dict[str, Dict]:
 
         run_id = latest_run_id(run_id_file)
@@ -43,7 +47,9 @@ class AttntrackerAnalyzer:
             important_head_indices = self.layer_to_heads[layer_num]
             
             for i in range(bs):
-                q_last = qk_data['q'][i]  # [4096]
+                q_last = qk_data['q'][i]
+                if q_last.ndim == 2:
+                    q_last = q_last[-1]
                 k_all = qk_data['k_all'][i]    # [seq_len, 1024]
                 
                 seq_len = k_all.shape[0]
@@ -63,7 +69,6 @@ class AttntrackerAnalyzer:
                 
                 full_attention = F.softmax(scores, dim=-1).squeeze(2).squeeze(0)  # [32, seq_len]
                 
-                # filter to only important heads
                 filtered_attention = full_attention[important_head_indices, :]  # [num_important_heads, seq_len]
                 
                 batch_attention_weights[i][layer_name] = {
@@ -80,20 +85,20 @@ class AttntrackerAnalyzer:
             batch_input_range = [batch_input_range]
 
         batch_scores = []
+        batch_per_head_scores = []
         for attention, input_range in zip(batch_attention, batch_input_range):
             scores = []
-            for _, layer_data in attention.items():
+            sample_per_head_scores = []
+            for layer_name, layer_data in attention.items():
                 head_indices = layer_data['head_indices']
                 attention_tensor = layer_data['attention']  # [num_heads, seq_len]
                 
                 for i, _ in enumerate(head_indices):
-                    head_attention = attention_tensor[i, :].numpy()  # [seq_len]
+                    head_attention = attention_tensor[i, :].float().numpy()  # [seq_len]
                     
-                    # Get instruction and data attention
                     inst_attn = head_attention[input_range[0][0]:input_range[0][1]]
                     data_attn = head_attention[input_range[1][0]:input_range[1][1]]
                     
-                    # Calculate score based on function
                     if "sum" in attn_func:
                         score = np.sum(inst_attn)
                     elif "max" in attn_func:
@@ -105,6 +110,15 @@ class AttntrackerAnalyzer:
                         score = score / total
                     
                     scores.append(score)
+                    sample_per_head_scores.append(
+                        {
+                            "layer_name": layer_name,
+                            "layer_index": layer_data["layer_index"],
+                            "head_index": head_indices[i],
+                            "score": float(score),
+                        }
+                    )
             batch_scores.append(np.mean(scores))
-        return batch_scores
+            batch_per_head_scores.append(sample_per_head_scores)
+        return batch_scores, batch_per_head_scores
     

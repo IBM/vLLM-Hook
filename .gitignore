@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+vllm_hook_plugins/vllm_hook_plugins.egg-info/
+
+# Ignore sandbox by default; keep only the Colab workflow tracked.
+/sandbox/*
+!/sandbox/colab_sandbox/
+!/sandbox/colab_sandbox/**
+
+# Notebook-local caches and macOS metadata.
+.DS_Store
+/notebooks/~/.cache/_v1_qk_peeks/
+/notebooks/external_cache/

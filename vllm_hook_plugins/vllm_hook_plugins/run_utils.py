@@ -22,9 +22,51 @@ def latest_run_id(run_id_file: str) -> str:
 
 def _artifact_glob(hook_dir: str, run_id: str) -> List[str]:
     """Return a list of shared artifact files for a run."""
-    patt_new = os.path.join(hook_dir, run_id, "**", "qk.pt")
-    paths = glob.glob(patt_new, recursive=True)
+    patterns = [
+        os.path.join(hook_dir, run_id, "**", "qk.pt"),
+        os.path.join(hook_dir, run_id, "**", "qkv.pt"),
+    ]
+    paths = []
+    for pattern in patterns:
+        paths.extend(glob.glob(pattern, recursive=True))
     return paths
+
+
+def _normalize_qkv_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
+    # Metal workers archive richer `qkv.pt` notebooks, but the current
+    # analyzer still consumes the legacy `qk_cache` shape. Normalize the Metal
+    # artifact here so the rest of the analyzer path can stay unchanged.
+    qkv_cache = cache.get("qkv_cache")
+    if not qkv_cache:
+        return cache
+
+    normalized: Dict[str, Any] = {
+        "config": cache["config"],
+        "qk_cache": {},
+        "meta": cache.get("meta", {}),
+    }
+
+    grouped: Dict[int, Dict[str, Any]] = {}
+    for module_name, proj_data in qkv_cache.items():
+        layer_num = proj_data["layer_num"]
+        proj_kind = proj_data["proj_kind"]
+        layer_entry = grouped.setdefault(layer_num, {"layer_num": layer_num})
+        layer_entry[proj_kind] = proj_data["tokens"]
+        layer_entry.setdefault(
+            "module_name",
+            module_name.rsplit(".", 1)[0],
+        )
+
+    for layer_data in grouped.values():
+        if "q" not in layer_data or "k" not in layer_data:
+            continue
+        normalized["qk_cache"][layer_data["module_name"]] = {
+            "q": layer_data["q"],
+            "k_all": layer_data["k"],
+            "layer_num": layer_data["layer_num"],
+        }
+
+    return normalized
 
 
 def load_and_merge_qk_cache(hook_dir: str, run_id: str):
@@ -43,6 +85,9 @@ def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     shareds = []
     for p in shared_paths:
         cache = torch.load(p, map_location="cpu")
+        # Convert Metal-style `qkv_cache` artifacts into the legacy `qk_cache`
+        # view expected by the existing attention analyzer and merge path.
+        cache = _normalize_qkv_cache(cache)
         meta = cache.get("meta", {})
         tp_rank = int(meta.get("tp_rank", 0))
         shareds.append((tp_rank, cache))

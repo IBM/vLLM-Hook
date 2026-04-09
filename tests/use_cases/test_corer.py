@@ -9,7 +9,8 @@ from tests.conftest import ensure_config_for_model
 
 TEST_MODELS = [
     "microsoft/Phi-3-mini-4k-instruct",
-    "mistralai/Mistral-7B-Instruct-v0.3",
+    "ibm-granite/granite-4.0-micro",
+    # old coverage target: "mistralai/Mistral-7B-Instruct-v0.3",
 ]
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, documents: List[str]):

@@ -1,5 +1,6 @@
 import os
 import multiprocessing as mp
+import platform
 import torch
 
 mp.set_start_method("spawn", force=True)
@@ -11,11 +12,16 @@ from vllm import SamplingParams
 
 if __name__ == "__main__":
 
-    cache_dir = "/dccstor/pyrite/irene/"
-    model = 'microsoft/Phi-3-mini-4k-instruct'
+    # cache_dir = "/dccstor/pyrite/irene/"
+    cache_dir = os.path.expanduser("~/.cache/vllm-hook")
+    model = 'ibm-granite/granite-3.1-8b-instruct'
+    backend = os.environ.get("VLLM_HOOK_BACKEND")
+    if backend is None and platform.system() == "Darwin" and platform.machine() == "arm64":
+        backend = "metal"
     
     dtype_map = {
         'microsoft/Phi-3-mini-4k-instruct': 'auto',
+        'ibm-granite/granite-4.0-micro': torch.float16,
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
         'ibm-granite/granite-3.1-8b-instruct': torch.float16,
         'Qwen/Qwen2-1.5B-Instruct': torch.float
@@ -24,6 +30,7 @@ if __name__ == "__main__":
     llm = HookLLM(
         model=model,
         worker_name="steer_hook_act",
+        backend=backend,
         config_file=f'model_configs/activation_steer/{model.split("/")[-1]}.json',
         download_dir=cache_dir,
         gpu_memory_utilization=0.7,
@@ -35,6 +42,7 @@ if __name__ == "__main__":
         enable_hook=True, 
         tensor_parallel_size=1  # the number of gpus
     )
+
     
     test_cases = [
         "Write a dialogue between two people, one is dressed up in a ball gown and the other is dressed down in sweats. The two are going to a nightly event. Your answer must contain exactly 3 bullet points in the markdown format (use \"* \" to indicate each bullet) such as:\n* This is the first point.\n* This is the second point.",
