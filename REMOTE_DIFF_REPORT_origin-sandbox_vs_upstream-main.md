@@ -60,7 +60,7 @@ Legend:
 | `tests/test_token_mode_sensitivity.py` | A | DEMO, NEW | New semantic tests for analyzer behavior |
 | `tests/use_cases/test_corer.py` | M | DEMO | Test target model changed to Granite |
 | `vllm_hook_plugins/vllm_hook_plugins/__init__.py` | M | RUNTIME | Backend-specific worker registration |
-| `vllm_hook_plugins/vllm_hook_plugins/analyzers/attention_tracker_analyzer.py` | M | RUNTIME | Attention tracker contract and token semantics changed |
+| `vllm_hook_plugins/vllm_hook_plugins/analyzers/attention_tracker_analyzer.py` | M | RUNTIME | Attention tracker analyzer handling changed |
 | `vllm_hook_plugins/vllm_hook_plugins/hook_llm.py` | M | RUNTIME | Apple Silicon backend auto-detect, backend-routed worker resolution, hook-engine lifecycle, artifact assertions |
 | `vllm_hook_plugins/vllm_hook_plugins/run_utils.py` | M | RUNTIME | Load/normalize `qkv.pt` in addition to `qk.pt` |
 | `vllm_hook_plugins/vllm_hook_plugins/workers/metal/__init__.py` | A | RUNTIME, NEW | Exposes Metal workers |
@@ -425,26 +425,19 @@ Upstream behavior:
 Sandbox behavior:
 
 - `analyze(...)` now defaults `analyzer_spec = analyzer_spec or {}`
-- `analyze(...)` returns:
-  - `score`
-  - `per_head_scores`
-- `compute_attention_from_qk(...)` checks `q_last.ndim == 2` and, if so, uses the last query token.
-- `attn2score(...)` accumulates both mean score and per-head score entries.
+- `attn2score(...)` converts attention slices to float before NumPy conversion.
+- The analyzer is now described as coupled to artifact normalization in `run_utils.py`, while preserving the score-only contract expected by callers.
 
 Directly observed semantic differences by function:
 
-- `compute_attention_from_qk(...)`: multi-token query tensors are reduced to last-token semantics
-- `attn2score(...)`: contract changed to return `(batch_scores, batch_per_head_scores)`
-- `analyze(...)`: output schema changed
+- `analyze(...)`: now tolerates `analyzer_spec=None`
+- `attn2score(...)`: now uses explicit float conversion before NumPy scoring
 
 Overwrite risk:
 
 - High.
-- If `sandbox` overwrites upstream with this file, upstream will inherit:
-  - a changed analyzer output schema
-  - last-query-token normalization for multi-token `q`
-  - per-head score reporting
-- This is a true contract change, so downstream callers on upstream may break if they expect the old score-only result shape.
+- If `sandbox` overwrites upstream with this file, upstream will inherit analyzer-side assumptions that are now aligned with the newer artifact-loading path.
+- The coupling risk is with `run_utils.py` and the worker artifact shape, not with an intentionally different public analyzer result schema.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/workers/metal/probe_hookqk_worker_metal.py`
 
@@ -579,5 +572,5 @@ Most likely breakpoints if `sandbox` overwrites upstream without carrying the fu
 - `origin/sandbox` contains the substantive runtime changes.
 - `hook_llm.py`, `__init__.py`, `probe_hookqk_worker.py`, `run_utils.py`, and `attention_tracker_analyzer.py` all have direct functional differences from `upstream/main`.
 - Metal worker support exists only in `origin/sandbox`.
-- `attention_tracker_analyzer.py` in `origin/sandbox` changes both analyzer output schema and query-token handling.
+- `attention_tracker_analyzer.py` in `origin/sandbox` differs from upstream, but the intended contract remains score-oriented and coupled to the newer artifact-loading path.
 - `run_utils.py` in `origin/sandbox` adds explicit support for `qkv.pt`-style artifacts.

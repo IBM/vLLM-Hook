@@ -21,7 +21,9 @@ class AttntrackerAnalyzer:
         run_id_file = os.environ.get("VLLM_RUN_ID")
 
         attention_weights = self.compute_attention_from_qk(run_id_file)
-        score, per_head_scores = self.attn2score(
+        # Keep upstream-style analyzer contract while `run_utils` continues to
+        # normalize newer artifacts into the legacy `qk_cache` shape.
+        score = self.attn2score(
             attention_weights,
             analyzer_spec['input_range'],
             analyzer_spec['attn_func'],
@@ -29,7 +31,6 @@ class AttntrackerAnalyzer:
 
         return {
             "score": score,
-            "per_head_scores": per_head_scores,
         }
 
     def compute_attention_from_qk(self, run_id_file: str) -> Dict[str, Dict]:
@@ -47,9 +48,9 @@ class AttntrackerAnalyzer:
             important_head_indices = self.layer_to_heads[layer_num]
             
             for i in range(bs):
+                # Preserve the upstream assumption that each cached `q` entry is
+                # already a single vector for the sample.
                 q_last = qk_data['q'][i]
-                if q_last.ndim == 2:
-                    q_last = q_last[-1]
                 k_all = qk_data['k_all'][i]    # [seq_len, 1024]
                 
                 seq_len = k_all.shape[0]
@@ -85,11 +86,9 @@ class AttntrackerAnalyzer:
             batch_input_range = [batch_input_range]
 
         batch_scores = []
-        batch_per_head_scores = []
         for attention, input_range in zip(batch_attention, batch_input_range):
             scores = []
-            sample_per_head_scores = []
-            for layer_name, layer_data in attention.items():
+            for _, layer_data in attention.items():
                 head_indices = layer_data['head_indices']
                 attention_tensor = layer_data['attention']  # [num_heads, seq_len]
                 
@@ -110,15 +109,6 @@ class AttntrackerAnalyzer:
                         score = score / total
                     
                     scores.append(score)
-                    sample_per_head_scores.append(
-                        {
-                            "layer_name": layer_name,
-                            "layer_index": layer_data["layer_index"],
-                            "head_index": head_indices[i],
-                            "score": float(score),
-                        }
-                    )
             batch_scores.append(np.mean(scores))
-            batch_per_head_scores.append(sample_per_head_scores)
-        return batch_scores, batch_per_head_scores
+        return batch_scores
     
