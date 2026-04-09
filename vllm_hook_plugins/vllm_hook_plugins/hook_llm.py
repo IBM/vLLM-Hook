@@ -6,6 +6,7 @@ from typing import Optional, Dict, List
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 from vllm import LLM, SamplingParams
+from vllm_hook_plugins.registry import PluginRegistry
 
 class HookLLM:
     def __init__(
@@ -48,7 +49,6 @@ class HookLLM:
         worker = None
         if worker_name:
             import vllm.plugins
-            from vllm_hook_plugins import PluginRegistry
             vllm.plugins.load_general_plugins()
             
             worker = PluginRegistry.get_worker(worker_name).path
@@ -109,50 +109,59 @@ class HookLLM:
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        if hook:
-            if "probe" in self.worker_name:
-                return self.generate_with_encode_hook(prompts, sampling_params, cleanup, **kwargs)
-            elif "steer" in self.worker_name:
-                return self.generate_with_decode_hook(prompts, sampling_params, cleanup, **kwargs)
-
-        else:
+        if not hook or not self.worker_name:
             if sampling_params is None:
                 sampling_params = SamplingParams(**kwargs)
             return self.llm.generate(prompts, sampling_params)
-    
+        
+        worker_entry = PluginRegistry.get_worker(self.worker_name)
+        hooks_on_prefill, hooks_on_generate = worker_entry.hooks_on if worker_entry else (False, False)
+
+        return self._generate_with_hooks(
+            prompts, sampling_params, cleanup,
+            hooks_on_prefill=hooks_on_prefill,
+            hooks_on_generate=hooks_on_generate,
+            **kwargs
+        )
+
+    def _generate_with_hooks(self, prompts, sampling_params, cleanup,
+                              hooks_on_prefill: bool, hooks_on_generate: bool, **kwargs):
+        if sampling_params is None:
+            sampling_params = SamplingParams(**kwargs)
+
+        if hooks_on_prefill and hooks_on_generate:
+            # Single-pass: hooks active throughout
+            self._setup_hooks(cleanup)
+            try:
+                return self.llm.generate(prompts, sampling_params)
+            finally:
+                self._cleanup_hooks()
+        else:
+            # Two-pass: prefill (max_tokens=1) then full generation
+            prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
+
+            if hooks_on_prefill:
+                self._setup_hooks(cleanup)
+            self.llm.generate(prompts, prefill_params)
+            if hooks_on_prefill:
+                self._cleanup_hooks()
+
+            if hooks_on_generate:
+                self._setup_hooks(cleanup)
+            output = self.llm.generate(prompts, sampling_params)
+            if hooks_on_generate:
+                self._cleanup_hooks()
+
+            return output
+
+    ####### depreciated ####### 
     def generate_with_encode_hook(self, prompts, sampling_params, cleanup, **kwargs):
-
-        self._setup_hooks(cleanup)
-        
-        # prefill with hooks
-        prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
-        self.llm.generate(prompts, prefill_params)
-        
-        self._cleanup_hooks()
-        output = None
-        # generation without hooks
-        if sampling_params is None:
-            sampling_params = SamplingParams(**kwargs)
-        output = self.llm.generate(prompts, sampling_params)
-        
-        return output
-    
+        return self._generate_with_hooks(prompts, sampling_params, cleanup,
+                                          hooks_on_prefill=True, hooks_on_generate=False, **kwargs)
+    ####### depreciated ####### 
     def generate_with_decode_hook(self, prompts, sampling_params, cleanup, **kwargs):
-        
-        # prefill without hooks
-        prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
-        self.llm.generate(prompts, prefill_params)
-        
-        self._setup_hooks(cleanup)
-        
-        # generation with hooks
-        if sampling_params is None:
-            sampling_params = SamplingParams(**kwargs)
-        output = self.llm.generate(prompts, sampling_params)
-    
-        self._cleanup_hooks()
-
-        return output
+        return self._generate_with_hooks(prompts, sampling_params, cleanup,
+                                          hooks_on_prefill=False, hooks_on_generate=True, **kwargs)
     
     def analyze(
         self,
