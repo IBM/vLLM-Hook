@@ -269,7 +269,7 @@ Sandbox behavior:
 Overwrite risk:
 
 - Medium.
-- Overwriting this file without also carrying Metal worker files and `HookLLM` backend routing will break backend-specific worker lookup.
+- If `sandbox` overwrites upstream with this file, upstream must also take the Metal worker files and `HookLLM` backend-routing changes or backend-specific worker lookup will break.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/hook_llm.py`
 
@@ -330,8 +330,8 @@ Directly observed semantic differences by function:
 Overwrite risk:
 
 - High.
-- This file now coordinates backend selection, worker selection, hook lifecycle, analysis validity, and Metal behavior.
-- Overwriting it with upstream will remove backend-specific worker selection and the temporary hooked-engine lifecycle.
+- If `sandbox` overwrites upstream with this file, upstream will inherit backend selection, worker selection, hook lifecycle, analysis-validity checks, and Metal-specific behavior.
+- The real merge risk is not loss inside `sandbox`; it is that upstream must also accept the coupled worker and analyzer changes for this file to remain correct.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/workers/probe_hookqk_worker.py`
 
@@ -366,7 +366,8 @@ Directly observed semantic differences by function:
 Overwrite risk:
 
 - High.
-- If you overwrite this file with upstream, GPU capture for newer Granite-style attention layouts and nested metadata paths will be lost.
+- If `sandbox` overwrites upstream with this file, upstream will inherit support for newer Granite-style attention layouts and nested metadata paths.
+- The real risk is behavioral expansion: upstream GPU capture semantics will change for newer attention-module layouts and wrapper structures.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/workers/steer_activation_worker.py`
 
@@ -384,7 +385,8 @@ Sandbox behavior:
 Overwrite risk:
 
 - Low to medium.
-- The main functional loss from overwriting would be hook cleanup symmetry.
+- If `sandbox` overwrites upstream with this file, the main effect is hook-cleanup symmetry plus docstring/structure churn.
+- This is a comparatively low-risk overwrite relative to the probe worker and `HookLLM`.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/run_utils.py`
 
@@ -402,7 +404,8 @@ Sandbox behavior:
 Overwrite risk:
 
 - High if you keep Metal workers.
-- Overwriting this file with upstream will likely make analyzer loading incompatible with Metal `qkv.pt` artifacts.
+- If `sandbox` overwrites upstream with this file, upstream will inherit compatibility with Metal `qkv.pt` artifacts.
+- The real risk is coupling: upstream should not take this file without also taking the Metal worker path that produces those artifacts.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/analyzers/attention_tracker_analyzer.py`
 
@@ -431,7 +434,11 @@ Directly observed semantic differences by function:
 Overwrite risk:
 
 - High.
-- Overwriting with upstream changes analyzer output shape and removes the last-token normalization behavior used by the new tests.
+- If `sandbox` overwrites upstream with this file, upstream will inherit:
+  - a changed analyzer output schema
+  - last-query-token normalization for multi-token `q`
+  - per-head score reporting
+- This is a true contract change, so downstream callers on upstream may break if they expect the old score-only result shape.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/workers/metal/probe_hookqk_worker_metal.py`
 
@@ -450,6 +457,8 @@ Sandbox behavior:
 Overwrite risk:
 
 - High if you need Apple Silicon / `vllm_metal` support.
+- If `sandbox` overwrites upstream with this file, upstream will gain a new Apple Silicon / `vllm_metal` probe-worker path.
+- The real risk is maintenance and coupling with `HookLLM`, worker registration, and artifact loading.
 
 ### `vllm_hook_plugins/vllm_hook_plugins/workers/metal/steer_activation_worker_metal.py`
 
@@ -465,6 +474,8 @@ Sandbox behavior:
 Overwrite risk:
 
 - High if you need Apple Silicon / `vllm_metal` steering support.
+- If `sandbox` overwrites upstream with this file, upstream will gain a new Apple Silicon / `vllm_metal` steering-worker path.
+- The real risk is maintenance and coupling with backend registration and Metal runtime assumptions.
 
 ## Demo/Test/Config Report
 
@@ -537,7 +548,7 @@ Observed changes:
 
 ## Overwrite Guidance
 
-If you plan to substantially overwrite local code with upstream content, treat these files as coupled and review them together:
+If `sandbox` is going to substantially overwrite upstream code, treat these files as coupled and review them together:
 
 - `vllm_hook_plugins/vllm_hook_plugins/hook_llm.py`
 - `vllm_hook_plugins/vllm_hook_plugins/__init__.py`
@@ -547,7 +558,7 @@ If you plan to substantially overwrite local code with upstream content, treat t
 - `vllm_hook_plugins/vllm_hook_plugins/workers/metal/probe_hookqk_worker_metal.py`
 - `vllm_hook_plugins/vllm_hook_plugins/workers/metal/steer_activation_worker_metal.py`
 
-Most likely breakpoints if overwritten incorrectly:
+Most likely breakpoints if `sandbox` overwrites upstream without carrying the full coupled set:
 
 - backend-specific worker lookup
 - Metal support disappearing silently
@@ -564,4 +575,3 @@ Most likely breakpoints if overwritten incorrectly:
 - Metal worker support exists only in `origin/sandbox`.
 - `attention_tracker_analyzer.py` in `origin/sandbox` changes both analyzer output schema and query-token handling.
 - `run_utils.py` in `origin/sandbox` adds explicit support for `qkv.pt`-style artifacts.
-
