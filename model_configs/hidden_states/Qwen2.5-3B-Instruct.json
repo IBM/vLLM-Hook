@@ -1,0 +1,9 @@
+{
+  "model_info": {
+    "name": "Qwen/Qwen2.5-3B-Instruct"
+  },
+  "hidden_states": {
+    "layers": [1, 2, 3, 4],
+    "mode": "last_token"
+  }
+}

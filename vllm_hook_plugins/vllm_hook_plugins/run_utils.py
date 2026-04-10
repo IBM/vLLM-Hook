@@ -27,6 +27,72 @@ def _artifact_glob(hook_dir: str, run_id: str) -> List[str]:
     return paths
 
 
+def _hs_artifact_glob(hook_dir: str, run_id: str) -> List[str]:
+    """Return a list of hidden-state artifact files for a run."""
+    patt = os.path.join(hook_dir, run_id, "**", "hidden_states.pt")
+    return glob.glob(patt, recursive=True)
+
+
+def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
+    """
+    Load all hidden-state artifacts for run_id and merge across TP ranks.
+    Returns a dict with keys: config, hs_cache.
+    TP shards are concatenated along the hidden_size (last) dimension.
+    """
+    import torch
+
+    paths = _hs_artifact_glob(hook_dir, run_id)
+    if not paths:
+        raise FileNotFoundError(
+            f"No hidden-state artifacts found for run_id={run_id} under {hook_dir}"
+        )
+
+    shards = []
+    for p in paths:
+        cache = torch.load(p, map_location="cpu")
+        meta = cache.get("meta", {})
+        tp_rank = int(meta.get("tp_rank", 0))
+        shards.append((tp_rank, cache))
+    shards.sort(key=lambda x: x[0])
+
+    if len(shards) == 1:
+        return shards[0][1]
+
+    base_cfg = shards[0][1]["config"]
+    merged: Dict[str, Any] = {
+        "config": base_cfg,
+        "hs_cache": {},
+    }
+
+    module_names: set = set()
+    for _, shard in shards:
+        module_names.update(shard.get("hs_cache", {}).keys())
+
+    for module_name in module_names:
+        layer_num = None
+        per_shard_hs: List[List[Any]] = []
+        for _, shard in shards:
+            entry = shard.get("hs_cache", {}).get(module_name)
+            if entry is None:
+                continue
+            if layer_num is None:
+                layer_num = entry.get("layer_num")
+            per_shard_hs.append(entry["hidden_states"])
+
+        bs = len(per_shard_hs[0])
+        merged_hs: List[Any] = []
+        for i in range(bs):
+            parts = [hs[i] for hs in per_shard_hs]
+            merged_hs.append(torch.cat(parts, dim=-1))
+
+        merged["hs_cache"][module_name] = {
+            "hidden_states": merged_hs,
+            "layer_num": layer_num,
+        }
+
+    return merged
+
+
 def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     """
     Load all shareds for run_id and merge into a single cache.
