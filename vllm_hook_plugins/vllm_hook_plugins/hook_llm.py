@@ -96,6 +96,13 @@ class HookLLM:
         if "steering" in config_data:
             os.environ["VLLM_ACTSTEER_CONFIG"] = os.path.abspath(config_file)
 
+        if "hidden_states" in config_data:
+            hs_cfg = config_data["hidden_states"]
+            layers = hs_cfg.get("layers", [])
+            os.environ["VLLM_HOOK_LAYERS"] = ";".join(map(str, layers))
+            mode = hs_cfg.get("mode", "last_token")
+            os.environ["VLLM_HOOK_HS_MODE"] = mode
+
     def generate(
         self,
         prompts: List[str],
