@@ -43,6 +43,7 @@ ConfigKind = Literal[
     "attention_tracker",
     "activation_steer",
     "core_reranker",
+    "hidden_states",
 ]
 
 
@@ -70,12 +71,21 @@ def ensure_config_for_model(project_root: Path, kind: ConfigKind, model_id: str)
         data["random_generated"] = True
 
     # make important_heads the first few layers to avoid out of range lists
-    data = {
-        "params": {
-            "important_heads": [[1, 2],[3, 4]],
-            "random_generated": True,
-        },
-    }
+    if kind == "hidden_states":
+        data = {
+            "hidden_states": {
+                "layers": [1, 2],
+                "mode": "last_token",
+                "random_generated": True,
+            },
+        }
+    else:
+        data = {
+            "params": {
+                "important_heads": [[1, 2],[3, 4]],
+                "random_generated": True,
+            },
+        }
     with open(target2, "w") as f:
         json.dump(data, f, indent=2)
 
