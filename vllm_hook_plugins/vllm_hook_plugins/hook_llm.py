@@ -184,25 +184,18 @@ class HookLLM:
     
     def _setup_hooks(self, cleanup):
         if cleanup:
-            for p in glob.glob(os.path.join(self._hook_dir, "**", "qk.pt"), recursive=True):
+            for p in glob.glob(os.path.join(self._hook_dir, "**", "*.pt"), recursive=True):
                 os.remove(p)
-                print("Cleaned up previous qk cache.")
             if os.path.exists(self._run_id_file):
                 os.remove(self._run_id_file)
 
         run_id = str(uuid.uuid4())
         with open(self._run_id_file, "a") as f:
             f.write(run_id+ "\n")
-            print("Logged run ID.")
 
         open(self._hook_flag, "a").close()
-        print("Created hook flag.")
-        
 
     def _cleanup_hooks(self):
         if os.path.exists(self._hook_flag):
             os.remove(self._hook_flag)
-            print("Hooks deactivated.")
-        else:
-            print("No hooks to be deactivated.")
     
