@@ -56,19 +56,22 @@ class ProbeHiddenStatesWorker(V1Worker):
 
         self._run_cache = {}
 
+        # Per-pass state written by execute_model(), read by the hook.
+        # Avoids all filesystem I/O inside the hook closure.
+        self._hook_active = False
+        self._current_run_id = None
+
         cfg = model.config
         hidden_size = int(getattr(cfg, "hidden_size"))
         num_layers = int(getattr(cfg, "num_hidden_layers", 0))
         self._conf = {"hidden_size": hidden_size, "num_layers": num_layers}
 
         def hs_hook(output, module_name, layer_num):
-            if not os.path.exists(self.hook_flag):
+            # Fast-path: checked once per execute_model() call, not per hook.
+            if not self._hook_active:
                 return None
 
-            if os.path.exists(self.run_id_file):
-                run_id = open(self.run_id_file).read().strip().split("\n")[-1]
-            else:
-                raise Exception("run_id not found.")
+            run_id = self._current_run_id
 
             ctx = get_forward_context()
             metadata = getattr(ctx, "attn_metadata", None)
@@ -116,17 +119,20 @@ class ProbeHiddenStatesWorker(V1Worker):
             else:
                 batch_hs = cache["hs_cache"][module_name]["hidden_states"]
 
+            # Accumulate GPU tensors — clone() copies the data immediately so
+            # we own the buffer and don't need a synchronize() before post-pass.
+            # No .cpu() here; transfer happens once in execute_model().
             if self.hs_mode == "last_token":
                 batch_hs.extend(
                     [
-                        hidden[last_indices[i + 1] - 1].detach().cpu()
+                        hidden[last_indices[i + 1] - 1].detach().clone()
                         for i in range(bs)
                     ]
                 )
             elif self.hs_mode == "all_tokens":
                 batch_hs.extend(
                     [
-                        hidden[last_indices[i] : last_indices[i + 1]].detach().cpu()
+                        hidden[last_indices[i] : last_indices[i + 1]].detach().clone()
                         for i in range(bs)
                     ]
                 )
@@ -137,10 +143,6 @@ class ProbeHiddenStatesWorker(V1Worker):
                 "hidden_states": batch_hs,
                 "layer_num": layer_num,
             }
-
-            run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
-            os.makedirs(run_dir, exist_ok=True)
-            torch.save(cache, os.path.join(run_dir, "hidden_states.pt"))
 
         self._hooks = []
         matched = []
@@ -168,4 +170,61 @@ class ProbeHiddenStatesWorker(V1Worker):
         return result
 
     def execute_model(self, *args, **kwargs):
-        return super().execute_model(*args, **kwargs)
+        # --- Refresh per-pass state (filesystem I/O done once here, not in hook) ---
+        hooks_configured = all([
+            getattr(self, "hook_dir", None),
+            getattr(self, "hook_flag", None),
+            getattr(self, "run_id_file", None),
+        ])
+
+        if hooks_configured and os.path.exists(self.hook_flag):
+            if os.path.exists(self.run_id_file):
+                run_id = open(self.run_id_file).read().strip().split("\n")[-1]
+            else:
+                run_id = None
+            self._hook_active = run_id is not None
+            self._current_run_id = run_id
+        else:
+            self._hook_active = False
+            self._current_run_id = None
+
+        if self._hook_active:
+            peak_gpu_mb = torch.cuda.max_memory_allocated() / 1024**2
+            torch.cuda.reset_peak_memory_stats()
+
+        result = super().execute_model(*args, **kwargs)
+
+        # --- Post-pass: GPU→CPU transfer and save (once per pass, not per layer) ---
+        run_id = self._current_run_id
+        if self._hook_active and run_id is not None:
+            cache = self._run_cache.get(run_id)
+            if cache is not None:
+                tp_rank = int(ps.get_tensor_model_parallel_rank())
+                run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
+                os.makedirs(run_dir, exist_ok=True)
+
+                # Move all accumulated GPU tensors to CPU in one pass
+                cpu_cache = {
+                    "config": cache["config"],
+                    "hs_cache": {
+                        mod: {
+                            "hidden_states": [t.cpu() for t in entry["hidden_states"]],
+                            "layer_num": entry["layer_num"],
+                        }
+                        for mod, entry in cache["hs_cache"].items()
+                    },
+                    "peak_gpu_mb": peak_gpu_mb,
+                }
+                out_path = os.path.join(run_dir, "hidden_states.pt")
+                tmp_path = out_path + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    torch.save(cpu_cache, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.rename(tmp_path, out_path)
+
+                # Evict stale run entries to prevent unbounded memory growth
+                for stale_id in [k for k in self._run_cache if k != run_id]:
+                    del self._run_cache[stale_id]
+
+        return result
