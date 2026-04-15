@@ -76,6 +76,8 @@ class ProbeHiddenStatesWorker(V1Worker):
             # Warmup or non-attention passes: nothing to do
             if metadata is None:
                 return
+            if torch.cuda.is_current_stream_capturing():
+                return None
 
             # The HS worker hooks on "model.layers.<i>",
             # so we look up the corresponding attention key.
