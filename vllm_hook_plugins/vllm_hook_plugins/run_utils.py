@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import os
+import time
 from typing import Dict, List, Any
 
 
@@ -27,10 +28,103 @@ def _artifact_glob(hook_dir: str, run_id: str) -> List[str]:
     return paths
 
 
-def _hs_artifact_glob(hook_dir: str, run_id: str) -> List[str]:
-    """Return a list of hidden-state artifact files for a run."""
-    patt = os.path.join(hook_dir, run_id, "**", "hidden_states.pt")
-    return glob.glob(patt, recursive=True)
+def _hs_glob(hook_dir: str, run_id: str, filename: str, timeout: float = 0.0) -> List[str]:
+    """Return artifact under run_id, optionally polling.
+
+    When VLLM_HOOK_ASYNC_SAVE=1 the worker hands the save off to a background
+    thread before execute_model() returns, so the file may not exist yet when
+    analyze() is called. Pass timeout > 0 (e.g. 5.0) to poll until the file
+    appears or the deadline is reached.
+    """
+    patt = os.path.join(hook_dir, run_id, "**", filename)
+    paths = glob.glob(patt, recursive=True)
+    if paths or timeout <= 0:
+        return paths
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.005)
+        paths = glob.glob(patt, recursive=True)
+        if paths:
+            return paths
+    return []
+
+
+def _load_and_merge_hs_safetensors(
+    hook_dir: str, run_id: str, st_paths: List[str]
+) -> Dict[str, Any]:
+    """Load safetensors artifacts and merge across TP shards (same logic as .pt path)."""
+    import json
+    import torch
+    from safetensors import safe_open
+
+    shards = []
+    for p in st_paths:
+        meta_path = p.replace("hidden_states.safetensors", "hidden_states.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        tp_rank = meta.get("tp_rank", 0)
+        batch_size = meta["batch_size"]
+
+        seq_lens = meta.get("seq_lens")  # present for all_tokens mode, None otherwise
+
+        hs_cache: Dict[str, Any] = {}
+        with safe_open(p, framework="pt", device="cpu") as sf:
+            for item in meta["layer_order"]:
+                t = sf.get_tensor(item["key"])
+                if seq_lens is not None:
+                    # all_tokens: t is (bs, max_seq_len, hidden_size) — unpad
+                    hidden_states = [t[i, :seq_lens[i], :] for i in range(batch_size)]
+                else:
+                    # last_token: t is (bs, hidden_size)
+                    hidden_states = [t[i] for i in range(batch_size)]
+                hs_cache[item["module_name"]] = {
+                    "hidden_states": hidden_states,
+                    "layer_num": item["layer_num"],
+                }
+
+        shards.append((tp_rank, {
+            "config": meta["config"],
+            "hs_cache": hs_cache,
+            "peak_gpu_mb": meta.get("peak_gpu_mb", 0.0),
+        }))
+    shards.sort(key=lambda x: x[0])
+
+    if len(shards) == 1:
+        return shards[0][1]
+
+    base_cfg = shards[0][1]["config"]
+    merged: Dict[str, Any] = {
+        "config": base_cfg,
+        "hs_cache": {},
+    }
+
+    module_names: set = set()
+    for _, shard in shards:
+        module_names.update(shard.get("hs_cache", {}).keys())
+
+    for module_name in module_names:
+        layer_num = None
+        per_shard_hs: List[List[Any]] = []
+        for _, shard in shards:
+            entry = shard.get("hs_cache", {}).get(module_name)
+            if entry is None:
+                continue
+            if layer_num is None:
+                layer_num = entry.get("layer_num")
+            per_shard_hs.append(entry["hidden_states"])
+
+        bs = len(per_shard_hs[0])
+        merged_hs: List[Any] = []
+        for i in range(bs):
+            parts = [hs[i] for hs in per_shard_hs]
+            merged_hs.append(torch.cat(parts, dim=-1))
+
+        merged["hs_cache"][module_name] = {
+            "hidden_states": merged_hs,
+            "layer_num": layer_num,
+        }
+
+    return merged
 
 
 def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
@@ -38,10 +132,22 @@ def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
     Load all hidden-state artifacts for run_id and merge across TP ranks.
     Returns a dict with keys: config, hs_cache.
     TP shards are concatenated along the hidden_size (last) dimension.
+    Auto-detects safetensors format when VLLM_HOOK_USE_SAFETENSORS=1.
     """
     import torch
 
-    paths = _hs_artifact_glob(hook_dir, run_id)
+    async_save = os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1"
+    poll_timeout = 5.0 if async_save else 0.0
+
+    if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+        st_paths = _hs_glob(hook_dir, run_id, "hidden_states.safetensors", timeout=poll_timeout)
+        if not st_paths:
+            raise FileNotFoundError(
+                f"No safetensors artifacts found for run_id={run_id} under {hook_dir}"
+            )
+        return _load_and_merge_hs_safetensors(hook_dir, run_id, st_paths)
+
+    paths = _hs_glob(hook_dir, run_id, "hidden_states.pt", timeout=poll_timeout)
     if not paths:
         raise FileNotFoundError(
             f"No hidden-state artifacts found for run_id={run_id} under {hook_dir}"
