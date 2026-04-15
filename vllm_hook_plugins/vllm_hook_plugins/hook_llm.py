@@ -184,8 +184,11 @@ class HookLLM:
     
     def _setup_hooks(self, cleanup):
         if cleanup:
-            for p in glob.glob(os.path.join(self._hook_dir, "**", "*.pt"), recursive=True):
-                os.remove(p)
+            for ext in ("*.pt", "*.safetensors", "*.json"):
+                for p in glob.glob(
+                    os.path.join(self._hook_dir, "**", ext), recursive=True
+                ):
+                    os.remove(p)
             if os.path.exists(self._run_id_file):
                 os.remove(self._run_id_file)
 
