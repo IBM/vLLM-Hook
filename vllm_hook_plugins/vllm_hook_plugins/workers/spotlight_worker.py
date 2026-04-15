@@ -14,7 +14,8 @@ from vllm.forward_context import get_forward_context
 import re
 from vllm.distributed import parallel_state as ps
 
-from vllm_hook_plugins.workers.spotlight_utils import (
+
+from vllm_hook_plugins.utils.spotlight.utils import (
     compute_spotlight_bias,
     compute_attention_scores,
     apply_attention_weights,
