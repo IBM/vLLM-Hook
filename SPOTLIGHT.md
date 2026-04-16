@@ -14,7 +14,7 @@ Spotlight was implemented as a worker + utility function following the existing 
 | File | Role |
 |---|---|
 | `workers/spotlight_worker.py` | Worker that registers PyTorch forward hooks on every `.attn` module |
-| `utils/spotlight_utils.py` | Tensor operations, span tokenization, attention bias computation, and `generate_with_spotlight()` convenience function |
+| `utils/spotlight/utils.py` | Tensor operations, span tokenization, attention bias computation, and `generate_with_spotlight()` convenience function |
 
 ### How it works
 
