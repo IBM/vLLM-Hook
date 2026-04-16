@@ -44,7 +44,12 @@ class HookLLM:
         self.layer_to_heads = {}
         if config_file:
             self.load_config(config_file)
-        
+
+        # (Optional) pre-allocate shared memory before worker subprocess is spawned.
+        self._hook_shm = None
+        if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
+            from vllm_hook_plugins.shm_utils import setup_shm
+            self._hook_shm = setup_shm(config_file, worker_name)
 
         worker = None
         if worker_name:
@@ -181,7 +186,10 @@ class HookLLM:
         
         return self.analyzer.analyze(analyzer_spec)
     
-    
+    def __del__(self):
+        from vllm_hook_plugins.shm_utils import teardown_shm
+        teardown_shm(getattr(self, "_hook_shm", None))
+
     def _setup_hooks(self, cleanup):
         if cleanup:
             for ext in ("*.pt", "*.safetensors", "*.json"):

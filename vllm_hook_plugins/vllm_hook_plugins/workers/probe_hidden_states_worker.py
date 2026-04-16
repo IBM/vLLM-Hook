@@ -58,16 +58,36 @@ class ProbeHiddenStatesWorker(V1Worker):
 
         self._run_cache = {}
 
-        # Background I/O thread (VLLM_HOOK_ASYNC_SAVE=1).
-        if not getattr(self, '_io_thread_started', False):
-            self._save_queue: queue.Queue = queue.Queue(maxsize=4)
-            self._io_thread = threading.Thread(
-                target=self._background_save_loop,
-                daemon=True,
-                name="vllm-hook-io",
-            )
-            self._io_thread.start()
-            self._io_thread_started = True
+        # attach to pre-allocated SharedMemory block if enabled.
+        self._shm = None
+        if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
+            try:
+                from multiprocessing.shared_memory import SharedMemory
+                shm_name = os.environ["VLLM_HOOK_SHM_NAME"]
+                self._shm = SharedMemory(create=False, name=shm_name)
+                self._shm_hidden_size = int(os.environ["VLLM_HOOK_SHM_HIDDEN_SIZE"])
+                self._shm_num_layers = int(os.environ["VLLM_HOOK_SHM_NUM_LAYERS"])
+                self._shm_max_batch = int(os.environ["VLLM_HOOK_SHM_MAX_BATCH"])
+                self._shm_ready_flag = os.environ["VLLM_HOOK_SHM_READY_FLAG"]
+                layer_order_str = os.environ.get("VLLM_HOOK_SHM_LAYER_ORDER", "")
+                self._shm_layer_order = [int(x) for x in layer_order_str.split(";") if x]
+                # print(f"SHM attached: {shm_name} "
+                #       f"({self._shm_num_layers} layers, hidden_size={self._shm_hidden_size})")
+            except Exception as e:
+                print(f"SHM attach failed: {e} — falling back to disk path")
+                self._shm = None
+
+        # Background I/O thread (only when VLLM_HOOK_ASYNC_SAVE=1, and SHM is not used).
+        elif os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+            if not getattr(self, '_io_thread_started', False):
+                self._save_queue: queue.Queue = queue.Queue(maxsize=4)
+                self._io_thread = threading.Thread(
+                    target=self._background_save_loop,
+                    daemon=True,
+                    name="vllm-hook-io",
+                )
+                self._io_thread.start()
+                self._io_thread_started = True
 
         # Per-pass state written by execute_model(), read by the hook.
         # Avoids all filesystem I/O inside the hook closure.
@@ -320,7 +340,46 @@ class ProbeHiddenStatesWorker(V1Worker):
                 for stale_id in [k for k in self._run_cache if k != run_id]:
                     del self._run_cache[stale_id]
 
-                if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+                if self._shm is not None:
+                    # write tensors directly into shared memory — no disk I/O.
+                    # Layout: [0:4] uint32 num_layers, [4:8] uint32 batch_size,
+                    #          [8:] float16 data row-major (layer_slot, batch_item, hidden_dim).
+                    # Sync via a tiny flag file on /dev/shm (ms-range latency).
+                    # Only last_token mode is supported (all tensors are 1-D, same shape).
+                    layer_order = self._shm_layer_order
+                    hidden_size = self._shm_hidden_size
+                    lnum_to_mod = {
+                        entry["layer_num"]: mod
+                        for mod, entry in cpu_cache["hs_cache"].items()
+                    }
+                    actual_layers = sum(1 for ln in layer_order if ln in lnum_to_mod)
+                    first_entry = next(iter(cpu_cache["hs_cache"].values()))
+                    actual_bs = len(first_entry["hidden_states"])
+
+                    import struct as _struct
+                    self._shm.buf[0:8] = _struct.pack("II", actual_layers, actual_bs)
+
+                    data_offset = 8
+                    slot = 0
+                    for lnum in layer_order:
+                        mod = lnum_to_mod.get(lnum)
+                        if mod is None:
+                            continue
+                        tensors = cpu_cache["hs_cache"][mod]["hidden_states"]
+                        stacked = torch.stack(tensors).to(torch.float16)  # (bs, hidden_size)
+                        raw = stacked.numpy().tobytes()
+                        start = data_offset + slot * actual_bs * hidden_size * 2
+                        end = start + len(raw)
+                        self._shm.buf[start:end] = raw
+                        slot += 1
+
+                    # Signal readiness via flag file (main process polls for it).
+                    # Write peak_gpu_mb into the flag file so the analyzer can
+                    # include it in the persisted artifact.
+                    with open(self._shm_ready_flag, "w") as _f:
+                        _f.write(str(peak_gpu_mb))
+
+                elif os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
                     self._save_queue.put((run_id, cpu_cache, run_dir))
                 elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
                     self._save_safetensors(cpu_cache, run_dir)
