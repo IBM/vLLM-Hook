@@ -7,22 +7,21 @@ Spotlight is an inference-time attention steering mechanism. It biases how a mod
 
 ## Architecture Overview
 
-Spotlight was implemented as a new worker/LLM pair following the existing `ProbeHookQKWorker` + `HookLLM` pattern as the primary reference.
+Spotlight was implemented as a worker + utility function following the existing `ProbeHookQKWorker` + `HookLLM` pattern as the primary reference.
 
 ### Key files
 
 | File | Role |
 |---|---|
 | `workers/spotlight_worker.py` | Worker that registers PyTorch forward hooks on every `.attn` module |
-| `workers/spotlight_utils.py` | Tensor operations: span tokenization, attention bias computation |
-| `spotlight_llm.py` | `SpotlightLLM` — `HookLLM` subclass with `generate_with_spotlight()` |
+| `utils/spotlight/utils.py` | Tensor operations, span tokenization, attention bias computation, and `generate_with_spotlight()` convenience function |
 
 ### How it works
 
 ```
-User calls generate_with_spotlight(prompts, emph_strings, alpha)
+User calls generate_with_spotlight(llm, prompts, emph_strings, alpha)
 │
-├─ 1. SpotlightLLM tokenizes emph_strings → token span ranges
+├─ 1. generate_with_spotlight() tokenizes emph_strings → token span ranges
 ├─ 2. Writes {span_ranges, alpha} to spotlight_params.json (cross-process safe)
 ├─ 3. Creates EXTRACT.flag file to activate hooks
 ├─ 4. Calls llm.generate() — single pass with hooks active
@@ -69,7 +68,7 @@ The reference hooks on HuggingFace's `self_attn` module with `output_attentions=
 
 vLLM V1 spawns worker processes via `multiprocessing.spawn`. The main process and worker share no memory. Following the pattern established by `ProbeHookQKWorker` (which uses `EXTRACT.flag` and `RUN_ID.txt` files), Spotlight passes parameters via the filesystem:
 
-- **Main process** (`SpotlightLLM`): writes `spotlight_params.json` to `VLLM_HOOK_DIR`
+- **Main process** (`generate_with_spotlight()`): writes `spotlight_params.json` to `VLLM_HOOK_DIR`
 - **Worker process** (`SpotlightWorker`): reads the file when the hook fires
 - **Flag file** (`EXTRACT.flag`): controls whether hooks are active
 
@@ -85,10 +84,10 @@ The Spotlight worker was built using `ProbeHookQKWorker` as the architectural re
 ## Quick Start
 
 ```python
-from vllm_hook_plugins import SpotlightLLM, register_plugins
+from vllm_hook_plugins import HookLLM, generate_with_spotlight, register_plugins
 register_plugins()
 
-llm = SpotlightLLM(
+llm = HookLLM(
     model="Qwen/Qwen2-1.5B-Instruct",
     worker_name="probe_spotlight",
     enforce_eager=True,  # Required — disables fused attention
@@ -102,7 +101,8 @@ baseline = llm.generate(
 )
 
 # With Spotlight
-spotlight = llm.generate_with_spotlight(
+spotlight = generate_with_spotlight(
+    llm,
     prompts=["Answer in JSON. What is 2+2?"],
     emph_strings=["Answer in JSON"],
     alpha=0.95,
