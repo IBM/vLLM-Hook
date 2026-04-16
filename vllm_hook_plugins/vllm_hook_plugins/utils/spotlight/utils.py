@@ -2,7 +2,9 @@
 Spotlight attention steering utilities - backend-agnostic tensor operations.
 Extracted from agent-lifecycle-toolkit for reuse in vLLM Hook.
 
-Option B Implementation: Q/K capture with logit-direct bias application.
+**Paper**: [Venakteswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)
+
+Implementation: Q/K capture with logit-direct bias application.
 """
 import os
 import json

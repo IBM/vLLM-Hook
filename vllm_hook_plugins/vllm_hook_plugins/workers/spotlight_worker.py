@@ -2,7 +2,9 @@
 Spotlight Worker for vLLM Hook - implements attention steering via token span highlighting.
 Based on agent-lifecycle-toolkit's Spotlight component.
 
-Option B Implementation: Q/K capture at .attn submodule level with logit-direct bias.
+**Paper**: [Venakteswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)
+
+Implementation: Q/K capture at .attn submodule level with logit-direct bias.
 """
 import os
 import torch
