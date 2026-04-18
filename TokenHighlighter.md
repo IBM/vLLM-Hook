@@ -20,6 +20,7 @@ View the original paper [**Token Highlighter: Inspecting and Mitigating Jailbrea
 
 ### Worker (`HighlighterWorker`)
 - Trigger: prefill requests in `execute_model` when hook flag is active.
+- Note on autograd scorer: we load a separate Hugging Face scorer model from the same local snapshot as the serving model, because vLLM's execution path is inference-optimized and does not always expose a reliable autograd graph for custom backward passes. By loading from the same snapshot, we preserve model architecture, weights, and tokenizer during gradient computation.
 - Responsibilities:
   - compute `token_scores` per prompt
   - choose applied driver indices (`soft_indices`)

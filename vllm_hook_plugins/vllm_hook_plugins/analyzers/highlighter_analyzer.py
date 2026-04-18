@@ -30,7 +30,7 @@ class HighlighterAnalyzer:
         cfg = analyzer_spec or {}
         top_k = int(cfg.get("top_k", 5))
 
-        # TODO: Optional analyzer-side override should re-rank token_scores only
+        # Potential feature/update: Optional analyzer-side override should re-rank token_scores only
         # (for report flexibility) while keeping worker-applied soft_indices intact.
         # Reporting highlighting results per prompt.
         results = [] 
