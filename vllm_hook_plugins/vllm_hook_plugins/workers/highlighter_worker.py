@@ -128,7 +128,7 @@ class HighlighterWorker(V1Worker):
             snapshot_path,
             trust_remote_code=True,
             local_files_only=True,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ).to(self._grad_device)
         self._grad_tokenizer = AutoTokenizer.from_pretrained(
             snapshot_path,
