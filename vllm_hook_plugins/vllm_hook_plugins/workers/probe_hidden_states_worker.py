@@ -48,7 +48,6 @@ class ProbeHiddenStatesWorker(V1Worker):
         self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hs_mode = os.environ.get("VLLM_HOOK_HS_MODE", "last_token")
-        # tp_rank = int(ps.get_tensor_model_parallel_rank())
 
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
             print("Missing hook environment variables")
@@ -71,8 +70,6 @@ class ProbeHiddenStatesWorker(V1Worker):
                 self._shm_ready_flag = os.environ["VLLM_HOOK_SHM_READY_FLAG"]
                 layer_order_str = os.environ.get("VLLM_HOOK_SHM_LAYER_ORDER", "")
                 self._shm_layer_order = [int(x) for x in layer_order_str.split(";") if x]
-                # print(f"SHM attached: {shm_name} "
-                #       f"({self._shm_num_layers} layers, hidden_size={self._shm_hidden_size})")
             except Exception as e:
                 print(f"SHM attach failed: {e} — falling back to disk path")
                 self._shm = None
@@ -177,16 +174,19 @@ class ProbeHiddenStatesWorker(V1Worker):
                 "layer_num": layer_num,
             }
 
+        # layer numbers follow the HuggingFace/Eagle convention:
+        # layer N = output after the Nth transformer block (1-based).
+        # PyTorch module names are 0-based, so layer N maps to model.layers.N-1.
         self._hooks = []
         matched = []
         for name, module in model.named_modules():
             layer_num = match_layer(name)
             if layer_num is None:
                 continue
-            if layer_num not in self.target_layers:
+            if (layer_num + 1) not in self.target_layers:
                 continue
             hook = module.register_forward_hook(
-                lambda m, i, o, n=name, ln=layer_num: hs_hook(o, n, ln)
+                lambda m, i, o, n=name, ln=layer_num+1: hs_hook(o, n, ln)
             )
             self._hooks.append(hook)
             matched.append(name)
@@ -291,7 +291,6 @@ class ProbeHiddenStatesWorker(V1Worker):
                 self._save_queue.task_done()
 
     def execute_model(self, *args, **kwargs):
-        # --- Refresh per-pass state (filesystem I/O done once here, not in hook) ---
         hooks_configured = all([
             getattr(self, "hook_dir", None),
             getattr(self, "hook_flag", None),
@@ -315,29 +314,56 @@ class ProbeHiddenStatesWorker(V1Worker):
 
         result = super().execute_model(*args, **kwargs)
 
+        if self._hook_active:
+            # Read req_ids after the forward pass — input_batch is populated
+            # by super().execute_model() from the scheduler_output.
+            try:
+                num_reqs = self.model_runner.input_batch.num_reqs
+                _req_ids_raw = self.model_runner.input_batch.req_ids
+                self._current_req_ids = list(_req_ids_raw[:num_reqs])
+            except Exception:
+                self._current_req_ids = None
+
         # --- Post-pass: GPU→CPU transfer and save (once per pass, not per layer) ---
         run_id = self._current_run_id
         if self._hook_active and run_id is not None:
             cache = self._run_cache.get(run_id)
-            if cache is not None:
+            # Skip warmup/profiling passes that collected no tensors
+            has_data = cache is not None and any(
+                entry["hidden_states"]
+                for entry in cache.get("hs_cache", {}).values()
+            )
+            if has_data:
                 tp_rank = int(ps.get_tensor_model_parallel_rank())
                 run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
                 os.makedirs(run_dir, exist_ok=True)
 
-                # Move all accumulated GPU tensors to CPU in one pass
+                # Sort into input order: vLLM assigns req_ids monotonically in
+                # input order, so sorting by req_id recovers the original order.
+                req_ids = getattr(self, "_current_req_ids", None)
+                if req_ids is not None:
+                    perm = sorted(range(len(req_ids)), key=lambda i: req_ids[i])
+                else:
+                    perm = None
+
+                def _to_cpu_sorted(tensors):
+                    cpu = [t.cpu() for t in tensors]
+                    return [cpu[i] for i in perm] if perm is not None else cpu
+
                 cpu_cache = {
                     "config": cache["config"],
                     "hs_cache": {
                         mod: {
-                            "hidden_states": [t.cpu() for t in entry["hidden_states"]],
+                            "hidden_states": _to_cpu_sorted(entry["hidden_states"]),
                             "layer_num": entry["layer_num"],
                         }
                         for mod, entry in cache["hs_cache"].items()
                     },
                     "peak_gpu_mb": peak_gpu_mb,
                 }
-                # Evict stale run entries to prevent unbounded memory growth
-                for stale_id in [k for k in self._run_cache if k != run_id]:
+                # Clear this run's cache after saving so subsequent decode
+                # steps within the same run don't re-save stale data.
+                for stale_id in list(self._run_cache):
                     del self._run_cache[stale_id]
 
                 if self._shm is not None:
