@@ -40,11 +40,16 @@ def _hs_glob(hook_dir: str, run_id: str, filename: str, timeout: float = 0.0) ->
     paths = glob.glob(patt, recursive=True)
     if paths or timeout <= 0:
         return paths
+    json_patt = (
+        os.path.join(hook_dir, run_id, "**", "hidden_states.json")
+        if filename == "hidden_states.safetensors" else None
+    )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        time.sleep(0.005)
+        time.sleep(0.001)
         paths = glob.glob(patt, recursive=True)
-        if paths:
+        # the main tensor exist and either we're not looking for a JSON sidecar (non-safetensors case), or the JSON also exists 
+        if paths and (json_patt is None or glob.glob(json_patt, recursive=True)):
             return paths
     return []
 
