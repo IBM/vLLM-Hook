@@ -97,8 +97,11 @@ class ProbeHiddenStatesWorker(V1Worker):
                 [torch.tensor([0]).to(last_indices.device), last_indices]
             )
 
-            # output is a tuple (hidden_states, ...) or just a tensor
-            if isinstance(output, tuple):
+            # vLLM uses a fused residual pattern: transformer blocks return
+            # (hidden_states, residual) where the residual has not yet been added. 
+            if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], torch.Tensor):
+                hidden = output[0] + output[1]
+            elif isinstance(output, tuple):
                 hidden = output[0]
             else:
                 hidden = output
