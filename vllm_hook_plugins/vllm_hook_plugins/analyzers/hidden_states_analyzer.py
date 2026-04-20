@@ -12,8 +12,9 @@ class HiddenStatesAnalyzer:
         self.hook_dir = hook_dir
 
     def analyze(self, analyzer_spec: Optional[Dict] = None) -> Dict:
+        peak_gpu_mb = None
         if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
-            hs_cache = load_from_shm(self.hook_dir, os.environ.get("VLLM_RUN_ID"))
+            hs_cache, peak_gpu_mb = load_from_shm(self.hook_dir, os.environ.get("VLLM_RUN_ID"))
         else:
             run_id_file = os.environ.get("VLLM_RUN_ID")
             run_id = latest_run_id(run_id_file)
@@ -39,4 +40,7 @@ class HiddenStatesAnalyzer:
             else:
                 raise NotImplementedError(f"Unknown reduce: {reduce}")
 
-        return {"hidden_states": result}
+        out = {"hidden_states": result}
+        if peak_gpu_mb is not None:
+            out["peak_gpu_mb"] = peak_gpu_mb
+        return out

@@ -165,4 +165,4 @@ def load_from_shm(hook_dir: str, run_id_file: str) -> Dict:
             os.fsync(f.fileno())
         os.rename(tmp_path, out_path)
 
-    return hs_cache
+    return hs_cache, peak_gpu_mb
