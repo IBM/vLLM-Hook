@@ -60,9 +60,9 @@ METRICS = [
 ]
 
 SERIES = [
-    ("hook",   "last_token", "vLLM-Hook (last_token)", "#1f77b4", "-"),
-    ("hook",   "all_tokens", "vLLM-Hook (all_tokens)", "#ff7f0e", "--"),
-    ("native", "last_token", "vLLM Eagle (native)",    "#2ca02c", "-."),
+    ("hook",   "last_token", "vLLM-Hook (last_token)", "#1f77b4", "-",  "o"),
+    ("hook",   "all_tokens", "vLLM-Hook (all_tokens)", "#ff7f0e", "--", "s"),
+    ("native", "last_token", "vLLM Eagle (native)",    "#2ca02c", "-.", "^"),
 ]
 
 
@@ -76,7 +76,7 @@ def plot_all(rows, prompt_lens, output_dir):
         for col_idx, (metric, std_col, ylabel) in enumerate(METRICS):
             ax = axes[row_idx][col_idx]
 
-            for system, token_mode, label, color, ls in SERIES:
+            for system, token_mode, label, color, ls, marker in SERIES:
                 points = extract(rows, prompt_len, system, token_mode)
                 valid = [p for p in points if p[metric] is not None]
                 if not valid:
@@ -85,7 +85,7 @@ def plot_all(rows, prompt_lens, output_dir):
                 ys   = [p[metric]     for p in valid]
                 errs = [p[std_col]    for p in valid] if std_col else None
 
-                ax.plot(xs, ys, label=label, color=color, linestyle=ls, marker="o", markersize=4)
+                ax.plot(xs, ys, label=label, color=color, linestyle=ls, marker=marker, markersize=5)
                 if errs and any(e > 0 for e in errs):
                     ax.fill_between(xs,
                                     [y - e for y, e in zip(ys, errs)],
