@@ -27,6 +27,17 @@ This includes dynamic analysis of:
 
 ---
 
+## 📊 Performance Analysis
+
+For a detailed benchmark comparing **vLLM-Hook** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction, see [`Numerical_Analysis/`](Numerical_Analysis/README.md).
+
+Key takeaways:
+- vLLM-Hook (`last_token`) offers significantly lower and prompt-length-invariant latency when only the final-position representation is needed
+- vLLM-Hook (`all_tokens`) is numerically equivalent to Native Eagle while avoiding its GPU memory overhead
+- Native Eagle requires loading a speculative decoding drafter model, reducing available KV cache
+
+---
+
 ## 📦 Installation
 ### 1. Clone the repository
 

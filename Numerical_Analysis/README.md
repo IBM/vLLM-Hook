@@ -4,6 +4,8 @@
 
 This report benchmarks **vLLM-Hook** vs. **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction. Both systems extract intermediate transformer hidden states during inference that would enable supports for activation steering, probing classifiers, etc.
 
+Native vLLM Eagle ref: https://docs.vllm.ai/en/latest/examples/offline_inference/extract_hidden_states/
+
 ---
 
 ## What Have We Compared
