@@ -6,7 +6,7 @@ This report benchmarks **vLLM-Hook** vs. **Native vLLM Eagle** (`ExampleHiddenSt
 
 ---
 
-## What have we compared
+## What Have We Compared
 
 - **Number of layers:** 1 to all
 - **Length of prompts:** around 16, 64, 256, 512 tokens
