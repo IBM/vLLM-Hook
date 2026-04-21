@@ -44,7 +44,12 @@ class HookLLM:
         self.layer_to_heads = {}
         if config_file:
             self.load_config(config_file)
-        
+
+        # (Optional) pre-allocate shared memory before worker subprocess is spawned.
+        self._hook_shm = None
+        if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
+            from vllm_hook_plugins.shm_utils import setup_shm
+            self._hook_shm = setup_shm(config_file, worker_name)
 
         worker = None
         if worker_name:
@@ -181,28 +186,27 @@ class HookLLM:
         
         return self.analyzer.analyze(analyzer_spec)
     
-    
+    def __del__(self):
+        from vllm_hook_plugins.shm_utils import teardown_shm
+        teardown_shm(getattr(self, "_hook_shm", None))
+
     def _setup_hooks(self, cleanup):
         if cleanup:
-            for p in glob.glob(os.path.join(self._hook_dir, "**", "qk.pt"), recursive=True):
-                os.remove(p)
-                print("Cleaned up previous qk cache.")
+            for ext in ("*.pt", "*.safetensors", "*.json"):
+                for p in glob.glob(
+                    os.path.join(self._hook_dir, "**", ext), recursive=True
+                ):
+                    os.remove(p)
             if os.path.exists(self._run_id_file):
                 os.remove(self._run_id_file)
 
         run_id = str(uuid.uuid4())
         with open(self._run_id_file, "a") as f:
             f.write(run_id+ "\n")
-            print("Logged run ID.")
 
         open(self._hook_flag, "a").close()
-        print("Created hook flag.")
-        
 
     def _cleanup_hooks(self):
         if os.path.exists(self._hook_flag):
             os.remove(self._hook_flag)
-            print("Hooks deactivated.")
-        else:
-            print("No hooks to be deactivated.")
     
