@@ -103,6 +103,7 @@ def plot_all(rows, prompt_lens, output_dir):
             ax.legend(fontsize=11)
             ax.grid(True, alpha=0.3)
             ax.tick_params(labelsize=12)
+            ax.ticklabel_format(useOffset=False, style="plain", axis="y")
 
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     os.makedirs(output_dir, exist_ok=True)

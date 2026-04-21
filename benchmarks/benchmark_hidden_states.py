@@ -386,7 +386,7 @@ def run_grid_sweep(dry_run: bool, hook_dir, skip_hook: bool, skip_native: bool) 
             prompt_len, dry_run, hook_dir,
             hook_kwargs, native_kwargs,
             skip_hook,
-            skip_native or (token_mode != "last_token"),
+            skip_native or (token_mode == "last_token"),
         )
 
         if not skip_hook:
