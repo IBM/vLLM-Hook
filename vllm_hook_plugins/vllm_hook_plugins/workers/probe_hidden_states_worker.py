@@ -114,21 +114,21 @@ class ProbeHiddenStatesWorker(V1Worker):
 
             # The HS worker hooks on "model.layers.<i>",
             # so we look up the corresponding attention key.
-            seq_lens = getattr(metadata, "seq_lens", None)
-            if seq_lens is None and isinstance(metadata, dict):
+            # query_start_loc is the cumulative sum of per-request *query* token
+            # counts (shape [bs+1]).  Unlike cumsum(seq_lens), it excludes
+            # prefix-cached tokens and is always within hidden.shape[0].
+            query_start_loc = getattr(metadata, "query_start_loc", None)
+            if query_start_loc is None and isinstance(metadata, dict):
                 attn_key = f"{module_name}.self_attn.attn"
                 entry = metadata.get(attn_key)
                 if entry is not None:
-                    seq_lens = entry.seq_lens
+                    query_start_loc = getattr(entry, "query_start_loc", None)
 
-            if seq_lens is None:
+            if query_start_loc is None:
                 return
 
-            last_indices = torch.cumsum(seq_lens, dim=0)
-            bs = len(last_indices)
-            last_indices = torch.cat(
-                [torch.tensor([0]).to(last_indices.device), last_indices]
-            )
+            bs = len(query_start_loc) - 1
+            last_indices = query_start_loc
 
             # vLLM uses a fused residual pattern: transformer blocks return
             # (hidden_states, residual) where the residual has not yet been added. 
