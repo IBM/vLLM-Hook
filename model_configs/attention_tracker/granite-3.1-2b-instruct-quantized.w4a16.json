@@ -11,6 +11,6 @@
         "important_heads": [[15, 21], [15, 1], [16, 12], [15, 7], [9, 26], [12, 11], [12, 7], [18, 0]]
     },
     "hookq": {
-        "hookq_mode": "all_tokens"
+        "hookq_mode": "last_token"
     }
 }
