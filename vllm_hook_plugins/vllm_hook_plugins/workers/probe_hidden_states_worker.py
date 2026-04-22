@@ -333,22 +333,30 @@ class ProbeHiddenStatesWorker(V1Worker):
                 entry["hidden_states"]
                 for entry in cache.get("hs_cache", {}).values()
             )
-            if has_data:
+            req_ids = getattr(self, "_current_req_ids", None)
+            call_bs = len(req_ids) if req_ids is not None else None
+
+            if has_data and call_bs != 0:
                 tp_rank = int(ps.get_tensor_model_parallel_rank())
                 run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
                 os.makedirs(run_dir, exist_ok=True)
 
                 # Sort into input order: vLLM assigns req_ids monotonically in
                 # input order, so sorting by req_id recovers the original order.
-                req_ids = getattr(self, "_current_req_ids", None)
-                if req_ids is not None:
-                    perm = sorted(range(len(req_ids)), key=lambda i: req_ids[i])
+                # When a batch is spread across multiple execute_model() calls,
+                # apply the sort only to the tail of tensors added in this call,
+                # leaving already-accumulated entries from previous calls intact.
+                if call_bs is not None:
+                    perm = sorted(range(call_bs), key=lambda idx: req_ids[idx])
                 else:
                     perm = None
 
                 def _to_cpu_sorted(tensors):
-                    cpu = [t.cpu() for t in tensors]
-                    return [cpu[i] for i in perm] if perm is not None else cpu
+                    if call_bs is None or perm is None:
+                        return [t.cpu() for t in tensors]
+                    prefix = [t.cpu() for t in tensors[:-call_bs]]
+                    tail = tensors[-call_bs:]
+                    return prefix + [tail[i].cpu() for i in perm]
 
                 cpu_cache = {
                     "config": cache["config"],
@@ -361,9 +369,10 @@ class ProbeHiddenStatesWorker(V1Worker):
                     },
                     "peak_gpu_mb": peak_gpu_mb,
                 }
-                # Clear this run's cache after saving so subsequent decode
-                # steps within the same run don't re-save stale data.
-                for stale_id in list(self._run_cache):
+                # Evict stale run IDs (previous generate() calls) but keep
+                # the current run_id so tensors accumulate across multiple
+                # execute_model() calls when vLLM schedules one request at a time.
+                for stale_id in [k for k in self._run_cache if k != run_id]:
                     del self._run_cache[stale_id]
 
                 if self._shm is not None:
