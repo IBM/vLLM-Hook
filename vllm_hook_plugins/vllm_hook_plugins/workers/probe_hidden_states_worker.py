@@ -8,8 +8,10 @@ from vllm.forward_context import get_forward_context
 from vllm.distributed import parallel_state as ps
 
 LAYER_PATTERNS = [
-    # LLaMA / Qwen / Granite: model.layers.<i>
+    # LLaMA / Qwen2.x / Granite: model.layers.<i>
     re.compile(r"^model\.layers\.(\d+)$"),
+    # Qwen3.5 multimodal (Qwen3_5ForConditionalGeneration): language_model.model.layers.<i>
+    re.compile(r"^language_model\.model\.layers\.(\d+)$"),
     # GPT-2: transformer.h.<i>
     re.compile(r"^transformer\.h\.(\d+)$"),
     # OPT: model.decoder.layers.<i>
@@ -92,8 +94,10 @@ class ProbeHiddenStatesWorker(V1Worker):
         self._current_run_id = None
 
         cfg = model.config
-        hidden_size = int(getattr(cfg, "hidden_size"))
-        num_layers = int(getattr(cfg, "num_hidden_layers", 0))
+        # Multimodal models (e.g. Qwen3.5) nest text config under text_config.
+        text_cfg = getattr(cfg, "text_config", cfg)
+        hidden_size = int(getattr(text_cfg, "hidden_size"))
+        num_layers = int(getattr(text_cfg, "num_hidden_layers", 0))
         self._conf = {"hidden_size": hidden_size, "num_layers": num_layers}
 
         def hs_hook(output, module_name, layer_num):
@@ -112,17 +116,17 @@ class ProbeHiddenStatesWorker(V1Worker):
             if torch.cuda.is_current_stream_capturing():
                 return None
 
-            # The HS worker hooks on "model.layers.<i>",
-            # so we look up the corresponding attention key.
-            # query_start_loc is the cumulative sum of per-request *query* token
-            # counts (shape [bs+1]).  Unlike cumsum(seq_lens), it excludes
-            # prefix-cached tokens and is always within hidden.shape[0].
+            # The HS worker hooks on "model.layers.<i>", so we look up the corresponding attention key.
+            # query_start_loc is the cumulative sum of per-request *query* token counts (shape [bs+1]).  
+            # Unlike cumsum(seq_lens), it excludes prefix-cached tokens and is always within hidden.shape[0].
+            # For hybrid models (e.g. Qwen3.5), linear_attention layers have no entry in the metadata dict under their own key, 
+            # so we grab query_start_loc from any available entry rather than only the current layer's key.
             query_start_loc = getattr(metadata, "query_start_loc", None)
             if query_start_loc is None and isinstance(metadata, dict):
-                attn_key = f"{module_name}.self_attn.attn"
-                entry = metadata.get(attn_key)
-                if entry is not None:
+                for entry in metadata.values():
                     query_start_loc = getattr(entry, "query_start_loc", None)
+                    if query_start_loc is not None:
+                        break
 
             if query_start_loc is None:
                 return
