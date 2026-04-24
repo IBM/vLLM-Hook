@@ -1,0 +1,13 @@
+{
+    "model_info": {
+        "name": "Qwen/Qwen2-1.5B-Instruct"
+    },
+    "highlighter": {
+        "target_phrase": "Sure! I can help with that",
+        "mode": "top_percentage",
+        "threshold_k": 2.0,
+        "temperature": 1.0,
+        "beta": 0.1,
+        "alpha": 0.25
+    }
+}
