@@ -21,11 +21,23 @@ def latest_run_id(run_id_file: str) -> str:
     return ids[-1]
 
 
-def _artifact_glob(hook_dir: str, run_id: str) -> List[str]:
+def _qk_glob(hook_dir: str, run_id: str, filename: str, timeout: float = 0.0) -> List[str]:
     """Return a list of shared artifact files for a run."""
-    patt_new = os.path.join(hook_dir, run_id, "**", "qk.pt")
-    paths = glob.glob(patt_new, recursive=True)
-    return paths
+    patt = os.path.join(hook_dir, run_id, "**", filename)
+    paths = glob.glob(patt, recursive=True)
+    if paths or timeout <= 0:
+        return paths
+    json_patt = (
+        os.path.join(hook_dir, run_id, "**", "qk.json")
+        if filename == "qk.safetensors" else None
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.001)
+        paths = glob.glob(patt, recursive=True)
+        if paths and (json_patt is None or glob.glob(json_patt, recursive=True)):
+            return paths
+    return []
 
 
 def _hs_glob(hook_dir: str, run_id: str, filename: str, timeout: float = 0.0) -> List[str]:
@@ -204,21 +216,111 @@ def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
     return merged
 
 
+def _load_and_merge_qk_safetensors(hook_dir: str, run_id: str, st_paths: List[str]) -> Dict[str, Any]:
+    """Load safetensors Q/K artifacts and merge across TP shards."""
+    import json
+    import torch
+    from safetensors import safe_open
+    from torch.nn.utils.rnn import pad_sequence
+
+    shards = []
+    for p in st_paths:
+        meta_path = p.replace("qk.safetensors", "qk.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        tp_rank = meta.get("tp_rank", 0)
+        hookq_mode = meta.get("hookq_mode", "all_tokens")
+        batch_size = meta.get("batch_size")
+
+        qk_cache: Dict[str, Any] = {}
+        with safe_open(p, framework="pt", device="cpu") as sf:
+            for item in meta["layer_order"]:
+                t_q = sf.get_tensor(item["key_q"])
+                t_k = sf.get_tensor(item["key_k"])
+                seq_lens = meta.get("seq_lens")
+                if hookq_mode == "all_tokens":
+                    # q and k are padded (bs, max_seq, heads*head_dim) — unpad using seq_lens
+                    if seq_lens is not None:
+                        q_list = [t_q[i, :seq_lens[i], :] for i in range(t_q.shape[0])]
+                        k_list = [t_k[i, :seq_lens[i], :] for i in range(t_k.shape[0])]
+                    else:
+                        q_list = [t_q[i] for i in range(t_q.shape[0])]
+                        k_list = [t_k[i] for i in range(t_k.shape[0])]
+                else:
+                    # last_token: q is (bs, head_dim); k is padded (bs, max_seq, head_dim) — unpad k
+                    q_list = [t_q[i] for i in range(t_q.shape[0])]
+                    if seq_lens is not None:
+                        k_list = [t_k[i, :seq_lens[i], :] for i in range(t_k.shape[0])]
+                    else:
+                        k_list = [t_k[i] for i in range(t_k.shape[0])]
+                qk_cache[item["module_name"]] = {
+                    "q": q_list,
+                    "k_all": k_list,
+                    "layer_num": item["layer_num"],
+                }
+
+        shards.append((tp_rank, {"config": meta["config"], "qk_cache": qk_cache}))
+    shards.sort(key=lambda x: x[0])
+
+    if len(shards) == 1:
+        return shards[0][1]
+
+    base_cfg = shards[0][1]["config"]
+    merged: Dict[str, Any] = {"config": base_cfg, "qk_cache": {}}
+    module_names: set = set()
+    for _, shard in shards:
+        module_names.update(shard["qk_cache"].keys())
+
+    for module_name in module_names:
+        layer_num = None
+        per_shard_q: List[List[Any]] = []
+        per_shard_k: List[List[Any]] = []
+        for _, shard in shards:
+            entry = shard["qk_cache"].get(module_name)
+            if entry is None:
+                continue
+            if layer_num is None:
+                layer_num = entry["layer_num"]
+            per_shard_q.append(entry["q"])
+            per_shard_k.append(entry["k_all"])
+
+        bs = len(per_shard_q[0])
+        merged["qk_cache"][module_name] = {
+            "q": [torch.cat([qs[i] for qs in per_shard_q], dim=-1) for i in range(bs)],
+            "k_all": [torch.cat([ks[i] for ks in per_shard_k], dim=-1) for i in range(bs)],
+            "layer_num": layer_num,
+        }
+
+    return merged
+
+
 def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     """
     Load all shareds for run_id and merge into a single cache.
     Returns a dict with keys: config, qk_cache, meta.
+    Auto-detects safetensors format when VLLM_HOOK_USE_SAFETENSORS=1.
     """
     import torch
 
-    shared_paths = _artifact_glob(hook_dir, run_id)
-    if not shared_paths:
+    async_save = os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1"
+    poll_timeout = 5.0 if async_save else 0.0
+
+    if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+        st_paths = _qk_glob(hook_dir, run_id, "qk.safetensors", timeout=poll_timeout)
+        if not st_paths:
+            raise FileNotFoundError(
+               f"No safetensors artifacts found for run_id={run_id} under {hook_dir}"
+            )
+        return _load_and_merge_qk_safetensors(hook_dir, run_id, st_paths)
+
+    paths = _qk_glob(hook_dir, run_id, "qk.pt", timeout=poll_timeout)
+    if not paths:
         raise FileNotFoundError(
             f"No Q/K cache artifacts found for run_id={run_id} under {hook_dir}"
         )
 
     shareds = []
-    for p in shared_paths:
+    for p in paths:
         cache = torch.load(p, map_location="cpu")
         meta = cache.get("meta", {})
         tp_rank = int(meta.get("tp_rank", 0))
