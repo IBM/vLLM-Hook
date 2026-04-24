@@ -6,6 +6,8 @@ import time
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
+os.environ.setdefault("VLLM_HOOK_ASYNC_SAVE", "1")
 
 from vllm_hook_plugins import HookLLM
 
@@ -41,6 +43,7 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: 
 if __name__ == "__main__":
 
     cache_dir = "./cache/"
+    hook_dir  = "/dev/shm/vllm_hook" # None # 
     model = 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' # 'mistralai/Mistral-7B-Instruct-v0.3' # 
     
     dtype_map = {
@@ -55,6 +58,7 @@ if __name__ == "__main__":
         analyzer_name="attn_tracker",
         config_file=f'model_configs/attention_tracker/{model.split("/")[-1]}.json',
         download_dir=cache_dir,
+        hook_dir=hook_dir,
         gpu_memory_utilization=0.7,
         max_model_len=2048,
         trust_remote_code=True,
