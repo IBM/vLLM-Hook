@@ -1,12 +1,41 @@
-# Running the Colab Notebooks
+# Running the Notebooks
+
+The `notebooks/` directory includes local notebooks and Google Colab variants
+for the same demos.
+
+Use the standard notebooks when running from a local checkout:
+
+- [demo_attntracker.ipynb](demo_attntracker.ipynb)
+- [demo_corer.ipynb](demo_corer.ipynb)
+- [demo_actsteer.ipynb](demo_actsteer.ipynb)
 
 Use the `_colab.ipynb` notebooks when running in Google Colab:
 
-- [demo_attntracker_colab.ipynb](<path-to-directory>/vLLM-Hook/notebooks/demo_attntracker_colab.ipynb)
-- [demo_corer_colab.ipynb](<path-to-directory>/vLLM-Hook/notebooks/demo_corer_colab.ipynb)
-- [demo_actsteer_colab.ipynb](<path-to-directory>/vLLM-Hook/notebooks/demo_actsteer_colab.ipynb)
+- [demo_attntracker_colab.ipynb](demo_attntracker_colab.ipynb)
+- [demo_corer_colab.ipynb](demo_corer_colab.ipynb)
+- [demo_actsteer_colab.ipynb](demo_actsteer_colab.ipynb)
 
-## Runtime Requirements
+## Local Notebook Setup
+
+If you plan to use the local notebooks, install the project dependencies from
+the repository root:
+
+```bash
+pip install -r requirement.txt
+pip install -e vllm_hook_plugins
+```
+
+Install the notebook-specific tools and register the environment as a Jupyter
+kernel:
+
+```bash
+pip install jupyter ipykernel nbformat
+python -m ipykernel install --user --name vllm_hook_env --display-name "vllm_hook_env"
+```
+
+Then select `vllm_hook_env` inside Jupyter Lab or Notebook.
+
+## Colab Runtime Requirements
 
 Use a GPU runtime in Colab.
 
@@ -27,8 +56,8 @@ If you open directly from GitHub, make sure you open the `_colab.ipynb` version,
 The Colab install cell is designed to:
 
 - detect Colab
-- clone `https://github.com/tburleyinfo/vLLM-Hook.git`
-- check out the `sandbox` branch
+- clone `https://github.com/IBM/vLLM-Hook.git`
+- check out the `main` branch
 - install `requirement.txt`
 - install `vllm_hook_plugins` in editable mode
 - switch into the repo `notebooks/` directory
@@ -48,7 +77,8 @@ Do not skip directly to later cells in a fresh runtime.
 
 ## Defaults
 
-- The notebooks currently default to `ibm-granite/granite-4.0-micro`.
+- The Colab notebooks currently default to `RedHatAI/granite-3.1-2b-instruct-quantized.w4a16`.
+- The local notebooks use the model defaults shown in each notebook.
 - If you change the model, make sure the config cell matches the selected model.
 
 ## Common Issues
