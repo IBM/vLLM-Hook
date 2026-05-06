@@ -107,6 +107,18 @@ CLI 🧰 :
 python examples/demo_corer.py
 ```
 
+### 4. Spotlight (Inference-time attention steering for instruction following)
+
+Steers attention toward emphasized text spans (e.g. "Answer in JSON format") at inference time — no fine-tuning required. Based on [Venkateswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/).
+
+Notebook 📓: `notebooks/demo_spotlight.ipynb` <br />
+CLI 🧰 : 
+```bash
+python examples/demo_spotlight.py
+```
+
+See [SPOTLIGHT.md](SPOTLIGHT.md) for architecture details.
+
 You can customize model configurations in the `model_configs/` folder, e.g.:
 
 ```
@@ -125,9 +137,15 @@ vllm_hook_plugins/
 ├── analyzers/
 │   ├── attention_tracker_analyzer.py
 │   ├── core_reranker_analyzer.py
+│   ├── hidden_states_analyzer.py
 ├── workers/
 │   ├── probe_hookqk_worker.py
+│   ├── probe_hidden_states_worker.py
 │   ├── steer_activation_worker.py
+│   ├── spotlight_worker.py
+├── utils/
+│   ├── spotlight/
+│       ├── utils.py
 ├── hook_llm.py
 ├── registry.py
 ```
