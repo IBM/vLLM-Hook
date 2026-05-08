@@ -1,13 +1,19 @@
 import os
 import math
+import pickle
 import queue
 import re
 import threading
 import torch
-from typing import Dict, List
-from vllm.v1.worker.gpu_worker import Worker as V1Worker
+from typing import TYPE_CHECKING, Any, Dict, List
+import zstandard as zstd
 from vllm.forward_context import get_forward_context
 from vllm.distributed import parallel_state as ps
+
+if TYPE_CHECKING:
+    from vllm.config import ParallelConfig
+
+_ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 ATTN_PATTERNS = [
     # GPT-2: transformer.h.<i>.attn
@@ -27,20 +33,34 @@ def match_attn(name: str):
             return int(m.group(1))
     return None
 
-class ProbeHookQKWorker(V1Worker):
+class ProbeHookQKWorker:
+    """Mixin injected into vLLM's GPU Worker via worker_extension_cls.
 
-    def load_model(self, *args, **kwargs):
-        r = super().load_model(*args, **kwargs)
-        
-        try:
-            self._install_hooks()
-            print("Hooks installed successfully")
-        except Exception as e:
-            print(f"Hook installation failed: {e}")
-            
-        return r
+    vLLM does Worker.__bases__ += (ProbeHookQKWorker,) at runtime,
+    so self is the Worker instance. Methods are callable via collective_rpc.
+    """
 
-    def _install_hooks(self):
+    if TYPE_CHECKING:
+        model_runner: Any
+        rank: int
+        parallel_config: "ParallelConfig"
+
+    # Per-request captured QK states (API serving path):
+    # internal_req_id -> {module_name -> {"q": [...], "k_all": [...], "layer_num": int}}
+    _captured_states: dict = {}
+    _hooks_installed: bool = False
+
+    def install_hooks(self):
+        """Install forward hooks on all target attention modules. Idempotent.
+
+        Callable via collective_rpc("install_hooks") — the plugin calls this
+        lazily on the first request that sets output_qk in extra_args.
+        """
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        # Reset to instance-level dicts (class-level defaults are shared)
+        self._captured_states = {}
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
@@ -53,7 +73,6 @@ class ProbeHookQKWorker(V1Worker):
 
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
             print("Missing hook environment variables")
-            return            
 
         self.layer_to_heads = self._parse_layer_heads()
         self.important_layers = set(self.layer_to_heads.keys())
@@ -92,9 +111,14 @@ class ProbeHookQKWorker(V1Worker):
             attention_multiplier=attn_mult,
         )
 
+        # Only TP rank 0 captures — residual streams are replicated across
+        # TP ranks after all-reduce, so the data is identical.
+        tp_size = self.parallel_config.tensor_parallel_size
+        self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
+
         def qkv_hook(input, module_name):
             # Fast-path: checked once per execute_model() call, not per hook.
-            if not self._hook_active:
+            if not self._hook_active and not self._should_capture:
                 return None
 
             run_id = self._current_run_id
@@ -109,9 +133,9 @@ class ProbeHookQKWorker(V1Worker):
                 return None
 
             # The HS worker hooks on "model.layers.<i>", so we look up the corresponding attention key.
-            # query_start_loc is the cumulative sum of per-request *query* token counts (shape [bs+1]).  
+            # query_start_loc is the cumulative sum of per-request *query* token counts (shape [bs+1]).
             # Unlike cumsum(seq_lens), it excludes prefix-cached tokens and is always within hidden.shape[0].
-            # For hybrid models (e.g. Qwen3.5), linear_attention layers have no entry in the metadata dict under their own key, 
+            # For hybrid models (e.g. Qwen3.5), linear_attention layers have no entry in the metadata dict under their own key,
             # so we grab query_start_loc from any available entry rather than only the current layer's key.
             query_start_loc = getattr(metadata, "query_start_loc", None)
             if query_start_loc is None and isinstance(metadata, dict):
@@ -126,52 +150,107 @@ class ProbeHookQKWorker(V1Worker):
             bs = len(query_start_loc) - 1
             last_indices = query_start_loc
 
-            cache = self._run_cache.get(run_id)
-            if cache is None:
-                cache = {"config": self._conf, "qk_cache": {}}
-                self._run_cache[run_id] = cache
-            if module_name not in cache["qk_cache"]:     # this means it is the first time the hook is called for this layer under the run ID
-                q_tokens = []
-                k_all_tokens = []
-            else:
-                q_tokens = cache["qk_cache"][module_name]['q']
-                k_all_tokens = cache["qk_cache"][module_name]['k_all']
-
             layer_num = match_attn(module_name)
-            # Accumulate GPU tensors — clone() copies the data immediately so
-            # we own the buffer and don't need a synchronize() before post-pass.
-            # No .cpu() here; transfer happens once in execute_model().
-            if self.hookq_mode == "all_tokens":
-                q_tokens.extend([
-                    input[0][last_indices[i]:last_indices[i+1], :].detach().clone()
-                    for i in range(bs)
-                ])
-            elif self.hookq_mode == "last_token":
-                q_tokens.extend([
-                    input[0][last_indices[i+1] - 1, :].detach().clone()
-                    for i in range(bs)
-                ])
-            else:
-                raise NotImplementedError
-            k_all_tokens.extend([
-                input[1][last_indices[i]:last_indices[i+1], :].detach().clone()
-                for i in range(bs)
-            ])
 
-            cache["qk_cache"][module_name] = {
-                'q': q_tokens,
-                'k_all': k_all_tokens,
-                'layer_num': layer_num
-            }
+            # --- Legacy offline path ---
+            if self._hook_active and run_id is not None:
+                cache = self._run_cache.get(run_id)
+                if cache is None:
+                    cache = {"config": self._conf, "qk_cache": {}}
+                    self._run_cache[run_id] = cache
+                if module_name not in cache["qk_cache"]:     # this means it is the first time the hook is called for this layer under the run ID
+                    q_tokens = []
+                    k_all_tokens = []
+                else:
+                    q_tokens = cache["qk_cache"][module_name]['q']
+                    k_all_tokens = cache["qk_cache"][module_name]['k_all']
+
+                # Accumulate GPU tensors — clone() copies the data immediately so
+                # we own the buffer and don't need a synchronize() before post-pass.
+                # No .cpu() here; transfer happens once in execute_model().
+                if self.hookq_mode == "all_tokens":
+                    q_tokens.extend([
+                        input[0][last_indices[i]:last_indices[i+1], :].detach().clone()
+                        for i in range(bs)
+                    ])
+                elif self.hookq_mode == "last_token":
+                    q_tokens.extend([
+                        input[0][last_indices[i+1] - 1, :].detach().clone()
+                        for i in range(bs)
+                    ])
+                else:
+                    raise NotImplementedError
+                k_all_tokens.extend([
+                    input[1][last_indices[i]:last_indices[i+1], :].detach().clone()
+                    for i in range(bs)
+                ])
+
+                cache["qk_cache"][module_name] = {
+                    'q': q_tokens,
+                    'k_all': k_all_tokens,
+                    'layer_num': layer_num
+                }
+
+            # --- API serving path: accumulate under internal req_id (rank 0 only) ---
+            if self._should_capture:
+                try:
+                    req_ids = self.model_runner.input_batch.req_ids
+                except Exception:
+                    return
+
+                for i in range(bs):
+                    req_id = req_ids[i]
+                    req_state = self.model_runner.requests.get(req_id)
+                    if req_state is None or req_state.sampling_params is None:
+                        continue
+                    extra = req_state.sampling_params.extra_args
+                    if not extra or extra.get("output_qk") is None:
+                        continue
+
+                    # output_qk accepts three forms, matching the old layer_to_heads config:
+                    #   True             -> capture all layers
+                    #   [layer_ids]      -> capture specific layers
+                    #   {layer: [heads]} -> capture specific layers (heads used downstream by analyzer)
+                    # The worker only uses the keys for layer filtering — head info is
+                    # forwarded to the analyzer by the caller, same as the old env-var flow.
+                    output_spec = extra.get("output_qk")
+                    if isinstance(output_spec, dict):
+                        layer_set = {int(k) for k in output_spec.keys()}
+                        if layer_num not in layer_set:
+                            continue
+                    elif isinstance(output_spec, list):
+                        if layer_num not in output_spec:
+                            continue
+
+                    start = int(last_indices[i].item())
+                    end = int(last_indices[i + 1].item())
+
+                    # Accumulate GPU tensors — .cpu() deferred to get_captured_states().
+                    if self.hookq_mode == "all_tokens":
+                        q_tok = input[0][start:end, :].detach().clone()
+                    else:
+                        q_tok = input[0][end - 1, :].detach().clone()
+                    k_tok = input[1][start:end, :].detach().clone()
+
+                    if req_id not in self._captured_states:
+                        self._captured_states[req_id] = {}
+                    layer_states = self._captured_states[req_id]
+                    if module_name not in layer_states:
+                        layer_states[module_name] = {"q": [], "k_all": [], "layer_num": layer_num}
+                    layer_states[module_name]["q"].append(q_tok)
+                    layer_states[module_name]["k_all"].append(k_tok)
 
         # register hooks on attention modules 
         self._hooks = []
         matched = []
+        # When important_layers is empty (API path, no VLLM_HOOK_LAYER_HEADS env var),
+        # hook every attention module. Per-request filtering via extra_args['output_qk']
+        # happens inside the hook closure.
         for name, module in model.named_modules():
             layer_num = match_attn(name)
-            if layer_num is None: # not an attention module 
+            if layer_num is None: # not an attention module
                 continue
-            if layer_num not in self.important_layers:
+            if self.important_layers and layer_num not in self.important_layers:
                 continue
             hook = module.register_forward_hook(
                 lambda _m, i, _o, n=name: qkv_hook(i, n)
@@ -197,6 +276,47 @@ class ProbeHookQKWorker(V1Worker):
             result[layer_idx] = head_indices
         
         return result
+
+    # ------------------------------------------------------------------
+    # API serving: collective_rpc-callable artifact retrieval
+    # ------------------------------------------------------------------
+
+    def get_captured_states(self, external_req_id: str) -> bytes | None:
+        """Retrieve and remove captured QK states for a completed request.
+
+        Matches by "{external_req_id}-" prefix because vLLM internally
+        transforms the user-provided request_id into "{request_id}-{random_suffix}".
+
+        CPU transfer happens here (once per request, not per hook).
+        Returns zstd-compressed pickle, or None if nothing was captured.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._captured_states):
+            if req_id == external_req_id or req_id.startswith(prefix):
+                layer_dict = self._captured_states.pop(req_id)
+                cpu_dict = {}
+                for mod_name, entry in layer_dict.items():
+                    from torch.nn.utils.rnn import pad_sequence
+                    if self.hookq_mode == "all_tokens":
+                        q_stacked = pad_sequence([t.cpu() for t in entry["q"]], batch_first=True)
+                    else:
+                        q_stacked = torch.stack([t.cpu() for t in entry["q"]])
+                    k_stacked = pad_sequence([t.cpu() for t in entry["k_all"]], batch_first=True)
+                    cpu_dict[mod_name] = {"q": q_stacked, "k_all": k_stacked, "layer_num": entry["layer_num"]}
+                payload = {
+                    "qk_cache": cpu_dict,
+                    "config": self._conf,
+                    "hookq_mode": self.hookq_mode,
+                }
+                return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
+        return None
+
+    def clear_captured_states(self, external_req_id: str) -> None:
+        """Remove captured states without returning them (cleanup on abort/disconnect)."""
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._captured_states):
+            if req_id == external_req_id or req_id.startswith(prefix):
+                del self._captured_states[req_id]
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
         import json as _json
@@ -279,89 +399,3 @@ class ProbeHookQKWorker(V1Worker):
             finally:
                 self._save_queue.task_done()
 
-    def execute_model(self, *args, **kwargs):
-        hooks_configured = all([
-            getattr(self, "hook_dir", None),
-            getattr(self, "hook_flag", None),
-            getattr(self, "run_id_file", None),
-        ])
-
-        if hooks_configured and os.path.exists(self.hook_flag):
-            if os.path.exists(self.run_id_file):
-                run_id = open(self.run_id_file).read().strip().split("\n")[-1]
-            else:
-                run_id = None
-            self._hook_active = run_id is not None
-            self._current_run_id = run_id
-        else:
-            self._hook_active = False
-            self._current_run_id = None
-
-        result = super().execute_model(*args, **kwargs)
-
-        if self._hook_active:
-            # Read req_ids after the forward pass — input_batch is populated
-            # by super().execute_model() from the scheduler_output.
-            try:
-                num_reqs = self.model_runner.input_batch.num_reqs
-                _req_ids_raw = self.model_runner.input_batch.req_ids
-                self._current_req_ids = list(_req_ids_raw[:num_reqs])
-            except Exception:
-                self._current_req_ids = None
-
-        # --- Post-pass: GPU→CPU transfer and save (once per pass, not per layer) ---
-        run_id = self._current_run_id
-        if self._hook_active and run_id is not None:
-            cache = self._run_cache.get(run_id)
-            has_data = cache is not None and any(
-                entry['q'] for entry in cache.get("qk_cache", {}).values()
-            )
-            req_ids = getattr(self, "_current_req_ids", None)
-            call_bs = len(req_ids) if req_ids is not None else None
-
-            if has_data and call_bs != 0:
-                tp_rank = int(ps.get_tensor_model_parallel_rank())
-                run_dir = os.path.join(self.hook_dir, run_id, f"tp_rank_{tp_rank}")
-                os.makedirs(run_dir, exist_ok=True)
-
-                if call_bs is not None:
-                    perm = sorted(range(call_bs), key=lambda idx: req_ids[idx])
-                else:
-                    perm = None
-
-                def _to_cpu_sorted(tensors):
-                    if call_bs is None or perm is None:
-                        return [t.cpu() for t in tensors]
-                    prefix = [t.cpu() for t in tensors[:-call_bs]]
-                    tail = tensors[-call_bs:]
-                    return prefix + [tail[i].cpu() for i in perm]
-
-                cpu_cache = {
-                    "config": cache["config"],
-                    "qk_cache": {
-                        mod: {
-                            "q": _to_cpu_sorted(entry["q"]),
-                            "k_all": _to_cpu_sorted(entry["k_all"]),
-                            "layer_num": entry["layer_num"],
-                        }
-                        for mod, entry in cache["qk_cache"].items()
-                    },
-                }
-
-                for stale_id in [k for k in self._run_cache if k != run_id]:
-                    del self._run_cache[stale_id]
-
-                if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
-                    self._save_queue.put((run_id, cpu_cache, run_dir))
-                elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-                    self._save_safetensors(cpu_cache, run_dir)
-                else:
-                    out_path = os.path.join(run_dir, "qk.pt")
-                    tmp_path = out_path + ".tmp"
-                    with open(tmp_path, "wb") as f:
-                        torch.save(cpu_cache, f)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.rename(tmp_path, out_path)
-
-        return result

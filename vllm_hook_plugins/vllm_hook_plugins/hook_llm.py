@@ -61,7 +61,7 @@ class HookLLM:
         self.llm = LLM(
             model=model,
             download_dir=download_dir,
-            worker_cls=worker,
+            worker_extension_cls=worker,
             enforce_eager = enforce_eager,
             **vllm_kwargs
         )

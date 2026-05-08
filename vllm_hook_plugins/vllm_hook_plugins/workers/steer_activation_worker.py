@@ -1,22 +1,32 @@
 import os
 import json
 import torch
-from typing import Dict, Optional
-from vllm.v1.worker.gpu_worker import Worker as V1Worker
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from vllm.config import ParallelConfig
 
 
-class SteerHookActWorker(V1Worker):
-    
-    def load_model(self, *args, **kwargs):
-        r = super().load_model(*args, **kwargs)
-        
+class SteerHookActWorker:
+    """Mixin injected into vLLM's GPU Worker via worker_extension_cls.
+
+    vLLM does Worker.__bases__ += (SteerHookActWorker,) at runtime,
+    so self is the Worker instance. Methods are callable via collective_rpc.
+    """
+
+    if TYPE_CHECKING:
+        model_runner: Any
+
+    def install_hooks(self):
+        """Install steering hook. Idempotent. Callable via collective_rpc."""
+        if getattr(self, "_hooks_installed", False):
+            return
+        self._hooks_installed = True
         try:
             self._install_hooks()
             print("Hooks installed successfully")
         except Exception as e:
             print(f"Hook installation failed: {e}")
-        
-        return r
     
     def _install_hooks(self):
         model = getattr(self.model_runner, "model", None)
@@ -106,6 +116,3 @@ class SteerHookActWorker(V1Worker):
             "vector_path": steering_config.get("vector_path"),
             "apply_at_all_positions": steering_config.get("apply_at_all_positions", True)
         }
-
-    def execute_model(self, *args, **kwargs):
-        return super().execute_model(*args, **kwargs)
