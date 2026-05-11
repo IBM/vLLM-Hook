@@ -11,9 +11,9 @@ from vllm_hook_plugins.analyzers.hidden_states_analyzer import HiddenStatesAnaly
 def register_plugins():
 
     # Register workers
-    PluginRegistry.register_worker("probe_hook_qk",       ProbeHookQKWorker,       hooks_on=(True,  False))
-    PluginRegistry.register_worker("steer_hook_act",      SteerHookActWorker,      hooks_on=(False, True))
-    PluginRegistry.register_worker("probe_hidden_states", ProbeHiddenStatesWorker, hooks_on=(True,  False))
+    PluginRegistry.register_worker("probe_hook_qk",       ProbeHookQKWorker)
+    PluginRegistry.register_worker("steer_hook_act",      SteerHookActWorker)
+    PluginRegistry.register_worker("probe_hidden_states", ProbeHiddenStatesWorker)
 
     # Register analyzers
     PluginRegistry.register_analyzer("attn_tracker",   AttntrackerAnalyzer)

@@ -126,13 +126,10 @@ class HookLLM:
                 sampling_params = SamplingParams(**kwargs)
             return self.llm.generate(prompts, sampling_params)
         
-        worker_entry = PluginRegistry.get_worker(self.worker_name)
-        hooks_on_prefill, hooks_on_generate = worker_entry.hooks_on if worker_entry else (False, False)
-
         return self._generate_with_hooks(
             prompts, sampling_params, cleanup,
-            hooks_on_prefill=hooks_on_prefill,
-            hooks_on_generate=hooks_on_generate,
+            hooks_on_prefill=True,
+            hooks_on_generate=False,
             **kwargs
         )
 
