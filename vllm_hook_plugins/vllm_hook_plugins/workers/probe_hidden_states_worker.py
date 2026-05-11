@@ -47,6 +47,10 @@ class ProbeHiddenStatesWorker:
         rank: int
         parallel_config: "ParallelConfig"
 
+    # Default capture phase — matches the old hooks_on=(True, False) registry entry.
+    # Can be overridden per-request via extra_args["hooks_on"].
+    _default_hooks_on: str = "prefill"
+
     # Per-request captured hidden states (API serving path):
     # internal_req_id -> {module_name -> {"hidden_states": [...], "layer_num": int}}
     _captured_states: dict = {}
@@ -62,25 +66,18 @@ class ProbeHiddenStatesWorker:
             return
         self._hooks_installed = True
         # Reset to instance-level dicts (class-level defaults are shared)
-        self._captured_states = {}
+        self._captured_states = {}  # RPC path: req_id -> {module: {hidden_states, layer_num}}
+        self._disk_states = {}      # disk path: req_id -> {module: {hidden_states, layer_num}} + {"_meta": {run_id, hook_dir}}
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
             return
 
-        self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
-        self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
-        self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hs_mode = os.environ.get("VLLM_HOOK_HS_MODE", "last_token")
-
-        if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
-            print("Missing hook environment variables")
-
         self.target_layers = self._parse_target_layers()
 
-        self._run_cache = {}
-
-        # attach to pre-allocated SharedMemory block if enabled.
+        # SHM path is a specialized same-machine transport, independent of the
+        # per-request RPC/disk paths. Kept as-is for backward compat.
         self._shm = None
         if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
             try:
@@ -97,8 +94,9 @@ class ProbeHiddenStatesWorker:
                 print(f"SHM attach failed: {e} — falling back to disk path")
                 self._shm = None
 
-        # Background I/O thread (only when VLLM_HOOK_ASYNC_SAVE=1, and SHM is not used).
-        elif os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+        # Background I/O thread for async safetensors/.pt writes. Shared by
+        # all disk-save requests on this worker.
+        if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
             if not getattr(self, '_io_thread_started', False):
                 self._save_queue: queue.Queue = queue.Queue(maxsize=4)
                 self._io_thread = threading.Thread(
@@ -108,11 +106,6 @@ class ProbeHiddenStatesWorker:
                 )
                 self._io_thread.start()
                 self._io_thread_started = True
-
-        # Per-pass state written by execute_model(), read by the hook.
-        # Avoids all filesystem I/O inside the hook closure.
-        self._hook_active = False
-        self._current_run_id = None
 
         cfg = model.config
         # Multimodal models (e.g. Qwen3.5) nest text config under text_config.
@@ -127,11 +120,9 @@ class ProbeHiddenStatesWorker:
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
         def hs_hook(output, module_name, layer_num):
-            # Fast-path: checked once per execute_model() call, not per hook.
-            if not self._hook_active and not self._should_capture:
+            # Fast-path: only rank 0 captures (RPC and disk paths both need it).
+            if not self._should_capture:
                 return None
-
-            run_id = self._current_run_id
 
             ctx = get_forward_context()
             metadata = getattr(ctx, "attn_metadata", None)
@@ -148,10 +139,12 @@ class ProbeHiddenStatesWorker:
             # For hybrid models (e.g. Qwen3.5), linear_attention layers have no entry in the metadata dict under their own key, 
             # so we grab query_start_loc from any available entry rather than only the current layer's key.
             query_start_loc = getattr(metadata, "query_start_loc", None)
+            seq_lens = getattr(metadata, "seq_lens", None)
             if query_start_loc is None and isinstance(metadata, dict):
                 for entry in metadata.values():
                     query_start_loc = getattr(entry, "query_start_loc", None)
                     if query_start_loc is not None:
+                        seq_lens = getattr(entry, "seq_lens", None)
                         break
 
             if query_start_loc is None:
@@ -169,78 +162,63 @@ class ProbeHiddenStatesWorker:
             else:
                 hidden = output
 
-            # --- Legacy offline path ---
-            if self._hook_active and run_id is not None:
-                cache = self._run_cache.get(run_id)
-                if cache is None:
-                    cache = {"config": self._conf, "hs_cache": {}}
-                    self._run_cache[run_id] = cache
+            # Per-request capture. Each request in the batch may route to
+            # either _captured_states (RPC path) or _disk_states (disk path)
+            # based on its extra_args.
+            try:
+                req_ids = self.model_runner.input_batch.req_ids
+            except Exception:
+                return
 
-                if module_name not in cache["hs_cache"]:
-                    batch_hs = []
+            for i in range(bs):
+                req_id = req_ids[i]
+                req_state = self.model_runner.requests.get(req_id)
+                if req_state is None or req_state.sampling_params is None:
+                    continue
+                extra = req_state.sampling_params.extra_args
+                if not extra or extra.get("output_hidden_states") is None:
+                    continue
+
+                output_layers = extra.get("output_hidden_states")
+                if isinstance(output_layers, list) and (layer_num not in output_layers):
+                    continue
+
+                # hooks_on: "prefill" (default) | "decode" | "both"
+                # Derived from attn_metadata: query_len == seq_len means all
+                # tokens are new (prefill); query_len == 1 < seq_len means
+                # decode. Works per-request in mixed batches without touching
+                # engine-side state.
+                hooks_on = extra.get("hooks_on", self._default_hooks_on)
+                if hooks_on != "both":
+                    query_len_i = int(last_indices[i + 1].item()) - int(last_indices[i].item())
+                    seq_len_i = int(seq_lens[i].item()) if seq_lens is not None else query_len_i
+                    is_prefill = query_len_i == seq_len_i
+                    if hooks_on == "prefill" and not is_prefill:
+                        continue
+                    if hooks_on == "decode" and is_prefill:
+                        continue
+
+                # Per-request mode: extra_args["hs_mode"] overrides the worker default.
+                req_mode = extra.get("hs_mode", self.hs_mode)
+
+                start = int(last_indices[i].item())
+                end = int(last_indices[i + 1].item())
+
+                # Accumulate GPU tensors — clone() copies data immediately so we
+                # own the buffer; .cpu() is deferred to the retrieval/flush call.
+                if req_mode == "last_token":
+                    activation = hidden[end - 1].detach().clone()
                 else:
-                    batch_hs = cache["hs_cache"][module_name]["hidden_states"]
+                    activation = hidden[start:end].detach().clone()
 
-                # Accumulate GPU tensors — clone() copies the data immediately so
-                # we own the buffer and don't need a synchronize() before post-pass.
-                # No .cpu() here; transfer happens once in execute_model().
-                if self.hs_mode == "last_token":
-                    batch_hs.extend(
-                        [
-                            hidden[last_indices[i + 1] - 1].detach().clone()
-                            for i in range(bs)
-                        ]
-                    )
-                elif self.hs_mode == "all_tokens":
-                    batch_hs.extend(
-                        [
-                            hidden[last_indices[i] : last_indices[i + 1]].detach().clone()
-                            for i in range(bs)
-                        ]
-                    )
-                else:
-                    raise NotImplementedError(f"Unknown hs_mode: {self.hs_mode}")
-
-                cache["hs_cache"][module_name] = {
-                    "hidden_states": batch_hs,
-                    "layer_num": layer_num,
-                }
-
-            # --- API serving path: accumulate under internal req_id (rank 0 only) ---
-            if self._should_capture:
-                try:
-                    req_ids = self.model_runner.input_batch.req_ids
-                except Exception:
-                    return
-
-                for i in range(bs):
-                    req_id = req_ids[i]
-                    req_state = self.model_runner.requests.get(req_id)
-                    if req_state is None or req_state.sampling_params is None:
-                        continue
-                    extra = req_state.sampling_params.extra_args
-                    if not extra or extra.get("output_hidden_states") is None:
-                        continue
-
-                    output_layers = extra.get("output_hidden_states")
-                    if isinstance(output_layers, list) and (layer_num not in output_layers):
-                        continue
-
-                    start = int(last_indices[i].item())
-                    end = int(last_indices[i + 1].item())
-
-                    # Accumulate GPU tensors — .cpu() deferred to get_captured_states().
-                    if self.hs_mode == "last_token":
-                        activation = hidden[end - 1].detach().clone()
-                    else:
-                        activation = hidden[start:end].detach().clone()
-
-                    if req_id not in self._captured_states:
-                        self._captured_states[req_id] = {}
-                    layer_states = self._captured_states[req_id]
-                    if module_name not in layer_states:
-                        layer_states[module_name] = {"hidden_states": [], "layer_num": layer_num}
-                    layer_states[module_name]["hidden_states"].append(activation)
+                # Route to disk or RPC bucket based on save_to_disk flag.
+                bucket = self._disk_states if extra.get("save_to_disk") else self._captured_states
+                if req_id not in bucket:
+                    bucket[req_id] = {}
+                layer_states = bucket[req_id]
+                if module_name not in layer_states:
+                    layer_states[module_name] = {"hidden_states": [], "layer_num": layer_num, "hs_mode": req_mode}
+                layer_states[module_name]["hidden_states"].append(activation)
 
         # layer numbers follow the HuggingFace/Eagle convention:
         # layer N = output after the Nth transformer block (1-based).
@@ -293,16 +271,16 @@ class ProbeHiddenStatesWorker:
                 cpu_dict = {}
                 for mod_name, entry in layer_dict.items():
                     tensors = entry["hidden_states"]
-                    if self.hs_mode == "last_token":
+                    mode = entry.get("hs_mode", self.hs_mode)
+                    if mode == "last_token":
                         stacked = torch.stack([t.cpu() for t in tensors])
                     else:
                         from torch.nn.utils.rnn import pad_sequence
                         stacked = pad_sequence([t.cpu() for t in tensors], batch_first=True)
-                    cpu_dict[mod_name] = {"hidden_states": stacked, "layer_num": entry["layer_num"]}
+                    cpu_dict[mod_name] = {"hidden_states": stacked, "layer_num": entry["layer_num"], "hs_mode": mode}
                 payload = {
-                    "hidden_states": cpu_dict,
+                    "hs_cache": cpu_dict,
                     "config": self._conf,
-                    "hs_mode": self.hs_mode,
                 }
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
@@ -313,6 +291,52 @@ class ProbeHiddenStatesWorker:
         for req_id in list(self._captured_states):
             if req_id == external_req_id or req_id.startswith(prefix):
                 del self._captured_states[req_id]
+
+    def flush_disk(self, external_req_id: str, run_id: str, hook_dir: str) -> bool:
+        """Write captured hidden states to disk under {hook_dir}/{run_id}/tp_rank_N/.
+
+        Called via collective_rpc after generation finishes for a request that
+        set save_to_disk=True. GPU->CPU transfer happens once here (post-pass),
+        then the write goes through the same safetensors/.pt/async-save pipeline
+        as the old flag-file path.
+
+        Returns True if artifacts were written, False if nothing was captured.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._disk_states):
+            if req_id != external_req_id and not req_id.startswith(prefix):
+                continue
+            layer_dict = self._disk_states.pop(req_id)
+            if not layer_dict:
+                return False
+
+            # Build the cpu_cache dict the existing write helpers expect.
+            cpu_cache: dict = {"config": self._conf, "hs_cache": {}}
+            for mod_name, entry in layer_dict.items():
+                cpu_cache["hs_cache"][mod_name] = {
+                    "hidden_states": [t.cpu() for t in entry["hidden_states"]],
+                    "layer_num": entry["layer_num"],
+                    "hs_mode": entry.get("hs_mode", self.hs_mode),
+                }
+
+            tp_rank = int(ps.get_tensor_model_parallel_rank())
+            run_dir = os.path.join(hook_dir, run_id, f"tp_rank_{tp_rank}")
+            os.makedirs(run_dir, exist_ok=True)
+
+            if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+                self._save_queue.put((run_id, cpu_cache, run_dir))
+            elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+                self._save_safetensors(cpu_cache, run_dir)
+            else:
+                out_path = os.path.join(run_dir, "hidden_states.pt")
+                tmp_path = out_path + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    torch.save(cpu_cache, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.rename(tmp_path, out_path)
+            return True
+        return False
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
         """Optionally write cpu_cache as a safetensors file + JSON sidecar.
@@ -339,8 +363,10 @@ class ProbeHiddenStatesWorker:
         for mod_name, entry in cpu_cache["hs_cache"].items():
             hs_list = entry["hidden_states"]
             safe_key = mod_name.replace(".", "__")
+            # Use per-layer stashed mode (falls back to worker default).
+            mode = entry.get("hs_mode", self.hs_mode)
 
-            if self.hs_mode == "all_tokens":
+            if mode == "all_tokens":
                 # Variable seq_len per prompt — pad to (bs, max_seq_len, hidden_size)
                 # pad_sequence expects (seq_len, hidden_size) inputs, pads along dim 0
                 stacked = pad_sequence(hs_list, batch_first=True)  # (bs, max_seq, hidden)
@@ -356,6 +382,7 @@ class ProbeHiddenStatesWorker:
                 "key": safe_key,
                 "module_name": mod_name,
                 "layer_num": entry["layer_num"],
+                "hs_mode": mode,
             })
 
         _st_save(flat_dict, tmp_path)
@@ -365,7 +392,7 @@ class ProbeHiddenStatesWorker:
             "config": cpu_cache["config"],
             "layer_order": layer_order,
             "batch_size": batch_size,
-            "hs_mode": self.hs_mode,
+            "hs_mode": self.hs_mode,  # worker default for reference
             "peak_gpu_mb": cpu_cache.get("peak_gpu_mb", 0.0),
             "tp_rank": int(ps.get_tensor_model_parallel_rank()),
         }

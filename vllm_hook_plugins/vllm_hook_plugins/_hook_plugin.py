@@ -117,6 +117,7 @@ async def _patched_generate(
     wants_hs = extra.get("output_hidden_states") is not None
     wants_qk = extra.get("output_qk") is not None
     needs_hooks = wants_hs or wants_qk
+    save_to_disk = bool(extra.get("save_to_disk"))
 
     if needs_hooks and not getattr(self, "_vllm_hook_installed", False):
         await self.collective_rpc("install_hooks")
@@ -135,19 +136,31 @@ async def _patched_generate(
             reasoning_ended=reasoning_ended,
         ):
             if output.finished and needs_hooks:
-                states = await self.collective_rpc("get_captured_states", args=(request_id,))
-                parts = [_decompress(s) for s in states if s is not None]
-                if parts:
-                    probes = parts[0]  # rank 0 result; PP merge not yet needed
-                    n_prompt = len(output.prompt_token_ids)
-                    n_gen = len(output.outputs[0].token_ids)
-                    expected_len = n_prompt + n_gen - 1
-                    _trim_probes(probes, "hidden_states", expected_len)
-                    _trim_probes(probes, "qk_cache", expected_len)
-                    output.probes = probes
+                if save_to_disk:
+                    import os
+                    run_id = extra.get("run_id") or request_id
+                    hook_dir = extra.get("hook_dir") or os.environ.get("VLLM_HOOK_DIR", "")
+                    if not hook_dir:
+                        raise ValueError(
+                            "save_to_disk=True but no hook_dir provided in extra_args "
+                            "and VLLM_HOOK_DIR env var is not set."
+                        )
+                    await self.collective_rpc("flush_disk", args=(request_id, run_id, hook_dir))
+                    # Leave output.probes unset — caller reads artifacts from disk.
+                else:
+                    states = await self.collective_rpc("get_captured_states", args=(request_id,))
+                    parts = [_decompress(s) for s in states if s is not None]
+                    if parts:
+                        probes = parts[0]  # rank 0 result; PP merge not yet needed
+                        n_prompt = len(output.prompt_token_ids)
+                        n_gen = len(output.outputs[0].token_ids)
+                        expected_len = n_prompt + n_gen - 1
+                        _trim_probes(probes, "hs_cache", expected_len)
+                        _trim_probes(probes, "qk_cache", expected_len)
+                        output.probes = probes
             yield output
     finally:
-        if needs_hooks:
+        if needs_hooks and not save_to_disk:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
 
 
@@ -157,7 +170,12 @@ async def _patched_generate(
 
 
 def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwargs) -> list:
-    """Wrap LLM.generate to install hooks and attach probes."""
+    """Wrap LLM.generate to install hooks and dispatch post-generation.
+
+    Each request is dispatched based on its own extra_args:
+    - save_to_disk=True -> collective_rpc("flush_disk"); output.probes unset.
+    - otherwise        -> collective_rpc("get_captured_states"); attach to output.probes.
+    """
     if isinstance(sampling_params, (list, tuple)):
         params_list = list(sampling_params)
     elif sampling_params is not None:
@@ -179,18 +197,35 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
 
     if needs_hooks:
-        for output in outputs:
+        import os
+        for idx, output in enumerate(outputs):
             req_id = output.request_id
-            states = self.collective_rpc("get_captured_states", args=(req_id,))
-            parts = [_decompress(s) for s in states if s is not None]
-            if parts:
-                probes = parts[0]
-                n_prompt = len(output.prompt_token_ids)
-                n_gen = len(output.outputs[0].token_ids)
-                expected_len = n_prompt + n_gen - 1
-                _trim_probes(probes, "hidden_states", expected_len)
-                _trim_probes(probes, "qk_cache", expected_len)
-                output.probes = probes
+            # Find the SamplingParams that applied to this output. vLLM preserves
+            # input order in outputs; a single SP means it applied to all prompts.
+            sp = params_list[idx] if idx < len(params_list) else params_list[0] if params_list else None
+            extra = (sp.extra_args if sp is not None else None) or {}
+
+            if extra.get("save_to_disk"):
+                run_id = extra.get("run_id") or req_id
+                hook_dir = extra.get("hook_dir") or os.environ.get("VLLM_HOOK_DIR", "")
+                if not hook_dir:
+                    raise ValueError(
+                        "save_to_disk=True but no hook_dir provided in extra_args "
+                        "and VLLM_HOOK_DIR env var is not set."
+                    )
+                self.collective_rpc("flush_disk", args=(req_id, run_id, hook_dir))
+                # Leave output.probes unset — caller reads artifacts from disk.
+            else:
+                states = self.collective_rpc("get_captured_states", args=(req_id,))
+                parts = [_decompress(s) for s in states if s is not None]
+                if parts:
+                    probes = parts[0]
+                    n_prompt = len(output.prompt_token_ids)
+                    n_gen = len(output.outputs[0].token_ids)
+                    expected_len = n_prompt + n_gen - 1
+                    _trim_probes(probes, "hs_cache", expected_len)
+                    _trim_probes(probes, "qk_cache", expected_len)
+                    output.probes = probes
 
     return outputs
 

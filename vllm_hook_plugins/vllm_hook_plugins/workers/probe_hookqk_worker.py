@@ -45,6 +45,10 @@ class ProbeHookQKWorker:
         rank: int
         parallel_config: "ParallelConfig"
 
+    # Default capture phase — matches the old hooks_on=(True, False) registry entry.
+    # Can be overridden per-request via extra_args["hooks_on"].
+    _default_hooks_on: str = "prefill"
+
     # Per-request captured QK states (API serving path):
     # internal_req_id -> {module_name -> {"q": [...], "k_all": [...], "layer_num": int}}
     _captured_states: dict = {}
@@ -60,26 +64,19 @@ class ProbeHookQKWorker:
             return
         self._hooks_installed = True
         # Reset to instance-level dicts (class-level defaults are shared)
-        self._captured_states = {}
+        self._captured_states = {}  # RPC path
+        self._disk_states = {}      # disk path: same shape, written via flush_disk()
         model = getattr(self.model_runner, "model", None)
         if model is None:
             print("no model; skip hooks")
             return
 
-        self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
-        self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
-        self.run_id_file = os.environ.get("VLLM_RUN_ID")
         self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens") # ["last_token", "all_tokens"]
-
-        if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
-            print("Missing hook environment variables")
 
         self.layer_to_heads = self._parse_layer_heads()
         self.important_layers = set(self.layer_to_heads.keys())
 
-        self._run_cache = {}
-
-        # Background I/O thread (only when VLLM_HOOK_ASYNC_SAVE=1).
+        # Background I/O thread (shared by all disk-save requests on this worker).
         if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
             if not getattr(self, '_io_thread_started', False):
                 self._save_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -90,11 +87,6 @@ class ProbeHookQKWorker:
                 )
                 self._io_thread.start()
                 self._io_thread_started = True
-
-        # Per-pass state written by execute_model(), read by the hook.
-        # Avoids all filesystem I/O inside the hook closure.
-        self._hook_active = False
-        self._current_run_id = None
 
         cfg = model.config
         text_cfg = getattr(cfg, "text_config", cfg)
@@ -117,11 +109,9 @@ class ProbeHookQKWorker:
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
         def qkv_hook(input, module_name):
-            # Fast-path: checked once per execute_model() call, not per hook.
-            if not self._hook_active and not self._should_capture:
+            # Fast-path: only rank 0 captures (RPC and disk paths both need it).
+            if not self._should_capture:
                 return None
-
-            run_id = self._current_run_id
 
             ctx = get_forward_context()
             metadata = getattr(ctx, "attn_metadata", None)
@@ -138,10 +128,12 @@ class ProbeHookQKWorker:
             # For hybrid models (e.g. Qwen3.5), linear_attention layers have no entry in the metadata dict under their own key,
             # so we grab query_start_loc from any available entry rather than only the current layer's key.
             query_start_loc = getattr(metadata, "query_start_loc", None)
+            seq_lens = getattr(metadata, "seq_lens", None)
             if query_start_loc is None and isinstance(metadata, dict):
                 for entry in metadata.values():
                     query_start_loc = getattr(entry, "query_start_loc", None)
                     if query_start_loc is not None:
+                        seq_lens = getattr(entry, "seq_lens", None)
                         break
 
             if query_start_loc is None:
@@ -152,93 +144,76 @@ class ProbeHookQKWorker:
 
             layer_num = match_attn(module_name)
 
-            # --- Legacy offline path ---
-            if self._hook_active and run_id is not None:
-                cache = self._run_cache.get(run_id)
-                if cache is None:
-                    cache = {"config": self._conf, "qk_cache": {}}
-                    self._run_cache[run_id] = cache
-                if module_name not in cache["qk_cache"]:     # this means it is the first time the hook is called for this layer under the run ID
-                    q_tokens = []
-                    k_all_tokens = []
-                else:
-                    q_tokens = cache["qk_cache"][module_name]['q']
-                    k_all_tokens = cache["qk_cache"][module_name]['k_all']
+            # Per-request capture. Each request in the batch may route to
+            # either _captured_states (RPC path) or _disk_states (disk path)
+            # based on its extra_args.
+            try:
+                req_ids = self.model_runner.input_batch.req_ids
+            except Exception:
+                return
 
-                # Accumulate GPU tensors — clone() copies the data immediately so
-                # we own the buffer and don't need a synchronize() before post-pass.
-                # No .cpu() here; transfer happens once in execute_model().
-                if self.hookq_mode == "all_tokens":
-                    q_tokens.extend([
-                        input[0][last_indices[i]:last_indices[i+1], :].detach().clone()
-                        for i in range(bs)
-                    ])
-                elif self.hookq_mode == "last_token":
-                    q_tokens.extend([
-                        input[0][last_indices[i+1] - 1, :].detach().clone()
-                        for i in range(bs)
-                    ])
-                else:
-                    raise NotImplementedError
-                k_all_tokens.extend([
-                    input[1][last_indices[i]:last_indices[i+1], :].detach().clone()
-                    for i in range(bs)
-                ])
+            for i in range(bs):
+                req_id = req_ids[i]
+                req_state = self.model_runner.requests.get(req_id)
+                if req_state is None or req_state.sampling_params is None:
+                    continue
+                extra = req_state.sampling_params.extra_args
+                if not extra or extra.get("output_qk") is None:
+                    continue
 
-                cache["qk_cache"][module_name] = {
-                    'q': q_tokens,
-                    'k_all': k_all_tokens,
-                    'layer_num': layer_num
-                }
-
-            # --- API serving path: accumulate under internal req_id (rank 0 only) ---
-            if self._should_capture:
-                try:
-                    req_ids = self.model_runner.input_batch.req_ids
-                except Exception:
-                    return
-
-                for i in range(bs):
-                    req_id = req_ids[i]
-                    req_state = self.model_runner.requests.get(req_id)
-                    if req_state is None or req_state.sampling_params is None:
+                # output_qk accepts three forms, matching the old layer_to_heads config:
+                #   True             -> capture all layers
+                #   [layer_ids]      -> capture specific layers
+                #   {layer: [heads]} -> capture specific layers (heads used downstream by analyzer)
+                # The worker only uses the keys for layer filtering — head info is
+                # forwarded to the analyzer by the caller, same as the old env-var flow.
+                output_spec = extra.get("output_qk")
+                if isinstance(output_spec, dict):
+                    layer_set = {int(k) for k in output_spec.keys()}
+                    if layer_num not in layer_set:
                         continue
-                    extra = req_state.sampling_params.extra_args
-                    if not extra or extra.get("output_qk") is None:
+                elif isinstance(output_spec, list):
+                    if layer_num not in output_spec:
                         continue
 
-                    # output_qk accepts three forms, matching the old layer_to_heads config:
-                    #   True             -> capture all layers
-                    #   [layer_ids]      -> capture specific layers
-                    #   {layer: [heads]} -> capture specific layers (heads used downstream by analyzer)
-                    # The worker only uses the keys for layer filtering — head info is
-                    # forwarded to the analyzer by the caller, same as the old env-var flow.
-                    output_spec = extra.get("output_qk")
-                    if isinstance(output_spec, dict):
-                        layer_set = {int(k) for k in output_spec.keys()}
-                        if layer_num not in layer_set:
-                            continue
-                    elif isinstance(output_spec, list):
-                        if layer_num not in output_spec:
-                            continue
+                # hooks_on: "prefill" (default) | "decode" | "both"
+                # Derived from attn_metadata: query_len == seq_len means all
+                # tokens are new (prefill); query_len == 1 < seq_len means
+                # decode. Works per-request in mixed batches without touching
+                # engine-side state.
+                hooks_on = extra.get("hooks_on", self._default_hooks_on)
+                if hooks_on != "both":
+                    query_len_i = int(last_indices[i + 1].item()) - int(last_indices[i].item())
+                    seq_len_i = int(seq_lens[i].item()) if seq_lens is not None else query_len_i
+                    is_prefill = query_len_i == seq_len_i
+                    if hooks_on == "prefill" and not is_prefill:
+                        continue
+                    if hooks_on == "decode" and is_prefill:
+                        continue
 
-                    start = int(last_indices[i].item())
-                    end = int(last_indices[i + 1].item())
+                # Per-request mode: extra_args["hookq_mode"] overrides the worker default.
+                req_mode = extra.get("hookq_mode", self.hookq_mode)
 
-                    # Accumulate GPU tensors — .cpu() deferred to get_captured_states().
-                    if self.hookq_mode == "all_tokens":
-                        q_tok = input[0][start:end, :].detach().clone()
-                    else:
-                        q_tok = input[0][end - 1, :].detach().clone()
-                    k_tok = input[1][start:end, :].detach().clone()
+                start = int(last_indices[i].item())
+                end = int(last_indices[i + 1].item())
 
-                    if req_id not in self._captured_states:
-                        self._captured_states[req_id] = {}
-                    layer_states = self._captured_states[req_id]
-                    if module_name not in layer_states:
-                        layer_states[module_name] = {"q": [], "k_all": [], "layer_num": layer_num}
-                    layer_states[module_name]["q"].append(q_tok)
-                    layer_states[module_name]["k_all"].append(k_tok)
+                # Accumulate GPU tensors — clone() copies data immediately so we
+                # own the buffer; .cpu() is deferred to retrieval/flush.
+                if req_mode == "all_tokens":
+                    q_tok = input[0][start:end, :].detach().clone()
+                else:
+                    q_tok = input[0][end - 1, :].detach().clone()
+                k_tok = input[1][start:end, :].detach().clone()
+
+                # Route to disk or RPC bucket based on save_to_disk flag.
+                bucket = self._disk_states if extra.get("save_to_disk") else self._captured_states
+                if req_id not in bucket:
+                    bucket[req_id] = {}
+                layer_states = bucket[req_id]
+                if module_name not in layer_states:
+                    layer_states[module_name] = {"q": [], "k_all": [], "layer_num": layer_num, "hookq_mode": req_mode}
+                layer_states[module_name]["q"].append(q_tok)
+                layer_states[module_name]["k_all"].append(k_tok)
 
         # register hooks on attention modules 
         self._hooks = []
@@ -297,16 +272,16 @@ class ProbeHookQKWorker:
                 cpu_dict = {}
                 for mod_name, entry in layer_dict.items():
                     from torch.nn.utils.rnn import pad_sequence
-                    if self.hookq_mode == "all_tokens":
+                    mode = entry.get("hookq_mode", self.hookq_mode)
+                    if mode == "all_tokens":
                         q_stacked = pad_sequence([t.cpu() for t in entry["q"]], batch_first=True)
                     else:
                         q_stacked = torch.stack([t.cpu() for t in entry["q"]])
                     k_stacked = pad_sequence([t.cpu() for t in entry["k_all"]], batch_first=True)
-                    cpu_dict[mod_name] = {"q": q_stacked, "k_all": k_stacked, "layer_num": entry["layer_num"]}
+                    cpu_dict[mod_name] = {"q": q_stacked, "k_all": k_stacked, "layer_num": entry["layer_num"], "hookq_mode": mode}
                 payload = {
                     "qk_cache": cpu_dict,
                     "config": self._conf,
-                    "hookq_mode": self.hookq_mode,
                 }
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
@@ -317,6 +292,51 @@ class ProbeHookQKWorker:
         for req_id in list(self._captured_states):
             if req_id == external_req_id or req_id.startswith(prefix):
                 del self._captured_states[req_id]
+
+    def flush_disk(self, external_req_id: str, run_id: str, hook_dir: str) -> bool:
+        """Write captured Q/K to disk under {hook_dir}/{run_id}/tp_rank_N/.
+
+        Called via collective_rpc after generation finishes for a request that
+        set save_to_disk=True. Uses the same safetensors/.pt/async pipeline as
+        the old flag-file path.
+
+        Returns True if artifacts were written, False if nothing was captured.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id in list(self._disk_states):
+            if req_id != external_req_id and not req_id.startswith(prefix):
+                continue
+            layer_dict = self._disk_states.pop(req_id)
+            if not layer_dict:
+                return False
+
+            cpu_cache: dict = {"config": self._conf, "qk_cache": {}}
+            for mod_name, entry in layer_dict.items():
+                cpu_cache["qk_cache"][mod_name] = {
+                    "q": [t.cpu() for t in entry["q"]],
+                    "k_all": [t.cpu() for t in entry["k_all"]],
+                    "layer_num": entry["layer_num"],
+                    "hookq_mode": entry.get("hookq_mode", self.hookq_mode),
+                }
+
+            tp_rank = int(ps.get_tensor_model_parallel_rank())
+            run_dir = os.path.join(hook_dir, run_id, f"tp_rank_{tp_rank}")
+            os.makedirs(run_dir, exist_ok=True)
+
+            if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+                self._save_queue.put((run_id, cpu_cache, run_dir))
+            elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+                self._save_safetensors(cpu_cache, run_dir)
+            else:
+                out_path = os.path.join(run_dir, "qk.pt")
+                tmp_path = out_path + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    torch.save(cpu_cache, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.rename(tmp_path, out_path)
+            return True
+        return False
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
         import json as _json
@@ -335,8 +355,9 @@ class ProbeHookQKWorker:
         for mod_name, entry in cpu_cache["qk_cache"].items():
             safe_key_q = mod_name.replace(".", "__") + "__q"
             safe_key_k = mod_name.replace(".", "__") + "__k"
+            mode = entry.get("hookq_mode", self.hookq_mode)
 
-            if self.hookq_mode == "all_tokens":
+            if mode == "all_tokens":
                 flat_dict[safe_key_q] = pad_sequence(entry['q'], batch_first=True)
                 flat_dict[safe_key_k] = pad_sequence(entry['k_all'], batch_first=True)
                 if not seq_lens:
@@ -355,6 +376,7 @@ class ProbeHookQKWorker:
                 "key_k": safe_key_k,
                 "module_name": mod_name,
                 "layer_num": entry["layer_num"],
+                "hookq_mode": mode,
             })
 
         _st_save(flat_dict, tmp_path)
