@@ -6,6 +6,84 @@ import time
 from typing import Dict, List, Any
 
 
+# ---------------------------------------------------------------------------
+# Artifact format conversion utilities
+#
+# Two retrieval paths produce different formats for the same underlying data:
+#
+# RPC path (get_captured_states / output.probes):
+#   Optimised for API consumers that want a single array to index directly.
+#   Hidden states are stacked/padded into one tensor:
+#     last_token → Tensor(N_passes, hidden)
+#     all_tokens → Tensor(N_passes, max_seq, hidden)
+#   QK:
+#     all_tokens → q: Tensor(N_passes, max_seq, hidden), k: same
+#     last_token → q: Tensor(N_passes, hidden),          k: Tensor(N_passes, max_seq, hidden)
+#
+# Disk path (flush_disk / .pt file hs_cache / qk_cache):
+#   Optimised for offline analysis — preserves variable-length per-pass
+#   tensors without padding:
+#     last_token → hidden_states: List[Tensor(hidden,)]
+#     all_tokens → hidden_states: List[Tensor(seq_i, hidden)]
+#   QK:
+#     all_tokens → q: List[Tensor(seq_i, hidden)], k_all: List[Tensor(seq_i, kv_hidden)]
+#     last_token → q: List[Tensor(hidden,)],       k_all: List[Tensor(seq_i, kv_hidden)]
+#
+# The functions below normalise either format to a list of per-pass tensors
+# so that analyzers (AttntrackerAnalyzer, CorerAnalyzer, HiddenStatesAnalyzer)
+# can consume both retrieval paths with the same code.
+# ---------------------------------------------------------------------------
+
+
+def unpack_hidden_states(entry: dict) -> "List[Any]":
+    """Return hidden states as a list of per-pass tensors.
+
+    Accepts both the RPC format (single stacked/padded tensor) and the disk
+    format (list of tensors). The returned list always has one element per
+    forward pass that was captured.
+
+    Example::
+
+        # works on both output.probes["hidden_states"]["model.layers.11"]
+        # and cache["hs_cache"]["model.layers.11"] loaded from disk
+        tensors = unpack_hidden_states(entry)
+        for t in tensors:
+            print(t.shape)  # (hidden,) for last_token, (seq_len, hidden) for all_tokens
+    """
+    import torch
+    hs = entry["hidden_states"]
+    if isinstance(hs, list):
+        return hs  # disk format
+    if isinstance(hs, torch.Tensor):
+        return list(hs.unbind(0))  # RPC format: split along pass dim
+    raise TypeError(f"Unexpected hidden_states type: {type(hs)}")
+
+
+def unpack_qk(entry: dict) -> "tuple[List[Any], List[Any]]":
+    """Return Q and K as lists of per-pass tensors.
+
+    Accepts both the RPC format (stacked/padded tensors) and the disk format
+    (lists of tensors). Returns (q_list, k_list) where each element is one
+    forward pass.
+
+    Example::
+
+        q_passes, k_passes = unpack_qk(entry)
+        for q, k in zip(q_passes, k_passes):
+            print(q.shape, k.shape)
+    """
+    import torch
+
+    def _unpack(t):
+        if isinstance(t, list):
+            return t
+        if isinstance(t, torch.Tensor):
+            return list(t.unbind(0))
+        raise TypeError(f"Unexpected tensor type: {type(t)}")
+
+    return _unpack(entry["q"]), _unpack(entry["k_all"])
+
+
 def read_run_ids(run_id_file: str) -> List[str]:
     """Read all run IDs from the RUN_ID file."""
     if not run_id_file or not os.path.exists(run_id_file):
