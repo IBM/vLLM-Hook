@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -173,6 +174,14 @@ def ensure_spawn_start_method() -> None:
         pass
 
 
+def vllm_supports_engine_arg(name: str) -> bool:
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+    except Exception:
+        return False
+    return name in inspect.signature(EngineArgs).parameters
+
+
 def git_commit() -> str:
     try:
         completed = subprocess.run(
@@ -308,8 +317,14 @@ def make_llm(args: argparse.Namespace, out_dir: Path) -> Any:
         tensor_parallel_size=args.tensor_parallel_size,
     )
     if args.backend == "non-metal":
-        if args.device:
+        if args.device and args.device != "auto" and vllm_supports_engine_arg("device"):
             kwargs["device"] = args.device
+        elif args.device and args.device != "auto":
+            print(
+                "Installed vLLM does not expose EngineArgs.device; "
+                f"recording requested device={args.device!r} without passing it to LLM.",
+                flush=True,
+            )
         from vllm_hook_plugins import HookLLM
 
         print(
