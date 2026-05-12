@@ -1,0 +1,46 @@
+You are Codex, an AI pair-programmer.  
+Create a Python tool named continuity_runner.py that tests **workflow continuity** when migrating from vllm_hook (GPU) to mlx_hook (CPU / Apple Silicon).
+
+The script SHALL:
+
+1. Accept CLI arguments  
+      --workflow_dir          path to a directory containing one or more hook-based analysis scripts (*.py or *.ipynb)  
+      --libA_import           default "from vllm_hook import HookedLM"  
+      --libB_import           default "from mlx_hook import HookedLM"  
+      --endpointA             URL for vLLM server (optional; defaults to http://127.0.0.1:8000)  
+      --endpointB             URL for MLX server (optional; defaults to http://127.0.0.1:8001)  
+      --timeout               per script timeout in seconds (default 300)  
+      --output_dir            default ./continuity_reports  
+      --mlflow_run_name       optional; log results if supplied
+
+2. Discover all scripts in --workflow_dir.  
+      • For *.ipynb files, convert to a temporary .py via nbconvert.  
+      • Exclude files that already import mlx_hook to avoid double swapping.
+
+3. For EACH script:  
+      A. Run original version (Library A) inside a subprocess with the supplied endpointA  
+          • Capture exit status, wall-clock time, and stderr (truncate to 2 kB).  
+      B. Create an in-memory variant where libA_import is replaced by libB_import, then run with endpointB.  
+      C. Record:  
+          run_success_A, run_success_B, lines_modified, exec_time_A, exec_time_B, stderr_A, stderr_B.
+
+4. Compute per-script continuity_score = 1 if run_success_B is True AND lines_modified ≤ 3 ELSE 0.  
+   Aggregate dataset-level metrics: mean continuity_score, success_rate_B, median slowdown factor.
+
+5. Emit two artifacts in --output_dir:  
+      • continuity_summary.md – human-readable table plus an overall verdict  
+      • continuity_results.json – machine-readable report with all raw metrics
+
+6. If --mlflow_run_name is provided, create an MLflow run and log:  
+      parameters, per-script metrics, aggregated metrics, and attach both artifacts.
+
+7. Use only stdlib plus: nbconvert, pygments (for diff highlighting), mlflow, tqdm.  
+      Detect missing optional packages and print installation hints rather than crashing.
+
+8. Follow PEP 8, include type hints and docstrings, and provide a __main__ block.  
+      Example usage:  
+
+      python continuity_runner.py --workflow_dir ./examples \
+        --mlflow_run_name wf_continuity_demo
+
+Return ONLY the Python source code; do not add commentary.

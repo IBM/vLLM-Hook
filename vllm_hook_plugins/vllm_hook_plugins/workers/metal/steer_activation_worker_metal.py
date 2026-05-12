@@ -11,7 +11,10 @@ from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.utils import set_wired_limit
 from vllm_metal.v1.worker import MetalWorker
 
-TARGET_LAYER_TEMPLATE = "model.layers.{layer_num}"
+TARGET_LAYER_TEMPLATES = (
+    "model.layers.{layer_num}",
+    "model.model.layers.{layer_num}",
+)
 
 
 class MLXSteeringWrapper(nn.Module):
@@ -170,7 +173,11 @@ class SteerHookActWorkerMetal(MetalWorker):
         if not os.path.exists(vector_path):
             raise FileNotFoundError(f"Steering vector not found at: {vector_path}")
 
-        steering_data = torch.load(vector_path, map_location="cpu")
+        steering_data = torch.load(
+            vector_path,
+            map_location="cpu",
+            weights_only=False,
+        )
         self.dir = torch.as_tensor(steering_data["dir"]).detach().cpu()
         # These cached MLX copies remain because Metal layers may emit MLX
         # arrays, while the non-Metal worker only needs torch tensors.
@@ -184,17 +191,15 @@ class SteerHookActWorkerMetal(MetalWorker):
 
         self._hooks = []
         self._matched_hook_modules = []
-        target_layer_name = TARGET_LAYER_TEMPLATE.format(layer_num=self.optimal_layer)
+        target_layer_names = {
+            template.format(layer_num=self.optimal_layer)
+            for template in TARGET_LAYER_TEMPLATES
+        }
         named_modules = dict(model.named_modules())
 
-        for name, module in named_modules.items():
-            if name != target_layer_name:
-                continue
-
-            parent_name, target_name = name.rsplit(".", 1)
-            parent = named_modules.get(parent_name)
+        def install_wrapper(name, module, parent, target_name) -> bool:
             if parent is None:
-                break
+                return False
 
             # This remains a wrapper replacement instead of `register_forward_hook`
             # because the Metal MLX modules do not expose the same hook API as
@@ -204,7 +209,10 @@ class SteerHookActWorkerMetal(MetalWorker):
                 name=name,
                 hook_fn=self._steering_hook,
             )
-            setattr(parent, target_name, wrapped_module)
+            if isinstance(parent, list):
+                parent[target_name] = wrapped_module
+            else:
+                setattr(parent, target_name, wrapped_module)
             self._hooks.append(
                 {
                     "parent": parent,
@@ -213,7 +221,40 @@ class SteerHookActWorkerMetal(MetalWorker):
                 }
             )
             self._matched_hook_modules.append(name)
-            break
+            return True
+
+        for name, module in named_modules.items():
+            if name not in target_layer_names:
+                continue
+            parent_name, target_name = name.rsplit(".", 1)
+            parent = named_modules.get(parent_name)
+            if install_wrapper(name, module, parent, target_name):
+                break
+
+        if not self._matched_hook_modules:
+            try:
+                from vllm_metal.paged_attention_common import find_layers
+            except Exception:
+                find_layers = None
+
+            if find_layers is not None:
+                layers = find_layers(model)
+                if 0 <= self.optimal_layer < len(layers):
+                    module = layers[self.optimal_layer]
+                    for name, candidate in named_modules.items():
+                        if candidate is not module or "." not in name:
+                            continue
+                        parent_name, target_name = name.rsplit(".", 1)
+                        parent = named_modules.get(parent_name)
+                        if install_wrapper(name, module, parent, target_name):
+                            break
+                    if not self._matched_hook_modules:
+                        install_wrapper(
+                            f"layers.{self.optimal_layer}",
+                            module,
+                            layers,
+                            self.optimal_layer,
+                        )
 
         print(
             f"Installed {len(self._matched_hook_modules)} hooks on layers: "
@@ -380,7 +421,10 @@ class SteerHookActWorkerMetal(MetalWorker):
             None: Wrapped modules are restored in-place.
         """
         for entry in reversed(getattr(self, "_hooks", [])):
-            setattr(entry["parent"], entry["target_name"], entry["original_module"])
+            if isinstance(entry["parent"], list):
+                entry["parent"][entry["target_name"]] = entry["original_module"]
+            else:
+                setattr(entry["parent"], entry["target_name"], entry["original_module"])
         if hasattr(self, "_hooks"):
             self._hooks.clear()
 

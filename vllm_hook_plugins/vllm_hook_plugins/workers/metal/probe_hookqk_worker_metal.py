@@ -14,6 +14,7 @@ from vllm_metal.v1.worker import MetalWorker
 
 ATTN_PATTERNS = [
     re.compile(r"^model\.layers\.(\d+)\.self_attn$"),
+    re.compile(r"^model\.model\.layers\.(\d+)\.self_attn$"),
 ]
 
 PROJ_MODULE_NAME_TEMPLATE = "model.layers.{layer_num}.self_attn.attn.{proj_kind}"
@@ -76,9 +77,9 @@ class MLXHookWrapper(nn.Module):
         Returns:
             Any: Output produced by the wrapped module.
         """
-        self.hook_fn("pre", args, None, self.name)
+        self.hook_fn("pre", args, kwargs, None, self.name)
         output = self.module(*args, **kwargs)
-        self.hook_fn("post", args, output, self.name)
+        self.hook_fn("post", args, kwargs, output, self.name)
         return output
 
 
@@ -446,7 +447,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             )
 
     def _capture_from_self_attn(
-        self, run_id: str, layer_num: int, attn_module, input_args
+        self, run_id: str, layer_num: int, attn_module, input_args, input_kwargs
     ) -> None:
         """
         Recompute and record the Q/K/V tensors used by a self-attention call.
@@ -461,7 +462,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             None: Recomputed tensors are recorded into the run cache.
         """
         raw_x = input_args[0]
-        cache = input_args[2] if len(input_args) > 2 else None
+        cache = input_kwargs.get("cache") if input_kwargs else None
+        if cache is None:
+            cache = input_args[2] if len(input_args) > 2 else None
         batch, seq_len, _ = raw_x.shape
 
         queries = attn_module.q_proj(raw_x).reshape(
@@ -575,13 +578,13 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         )
 
         named_modules = dict(model.named_modules())
-        for name, module in named_modules.items():
-            layer_idx = match_attn(name)
-            if layer_idx is None:
-                continue
-            if layer_idx not in self.important_layers:
-                continue
-            if not all(
+        seen_targets = set()
+
+        def capture_module_for(module):
+            return getattr(module, "_inner", module)
+
+        def has_capture_api(module) -> bool:
+            return all(
                 hasattr(module, attr)
                 for attr in (
                     "q_proj",
@@ -591,23 +594,26 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                     "n_heads",
                     "n_kv_heads",
                 )
-            ):
-                continue
+            )
 
-            parent_name, target_name = name.rsplit(".", 1)
-            parent = named_modules.get(parent_name)
-            if parent is None:
-                continue
+        def install_wrapper(name, parent, target_name, layer_idx, module) -> bool:
+            target_key = (id(parent), target_name)
+            if target_key in seen_targets:
+                return False
+            capture_attn = capture_module_for(module)
+            if not has_capture_api(capture_attn):
+                return False
 
             original_attn = module
 
             def attention_hook(
                 phase,
                 input_args,
+                input_kwargs,
                 _output,
                 _module_name,
                 layer_num=layer_idx,
-                attn=original_attn,
+                attn=capture_attn,
             ):
                 """
                 Capture one self-attention call when the active run is armed.
@@ -615,6 +621,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 Args:
                     phase: Wrapper callback phase, such as ``pre`` or ``post``.
                     input_args: Positional arguments passed to self-attention.
+                    input_kwargs: Keyword arguments passed to self-attention.
                     _output: Output produced by the wrapped module.
                     _module_name: Hook-reported module name.
                     layer_num (int): Bound transformer layer index.
@@ -628,7 +635,9 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                     return None
                 if phase != self.capture_phase:
                     return None
-                self._capture_from_self_attn(run_id, layer_num, attn, input_args)
+                self._capture_from_self_attn(
+                    run_id, layer_num, attn, input_args, input_kwargs or {}
+                )
                 return None
 
             # This remains a wrapper replacement instead of `register_forward_hook`
@@ -640,6 +649,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 hook_fn=attention_hook,
             )
             setattr(parent, target_name, wrapped_attn)
+            seen_targets.add(target_key)
             self._hooks.append(
                 {
                     "parent": parent,
@@ -648,6 +658,42 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                 }
             )
             self._matched_hook_modules.append(name)
+            return True
+
+        for name, module in named_modules.items():
+            layer_idx = match_attn(name)
+            if layer_idx is None:
+                continue
+            if layer_idx not in self.important_layers:
+                continue
+
+            parent_name, target_name = name.rsplit(".", 1)
+            parent = named_modules.get(parent_name)
+            if parent is None:
+                continue
+
+            install_wrapper(name, parent, target_name, layer_idx, module)
+
+        if not self._matched_hook_modules:
+            try:
+                from vllm_metal.paged_attention_common import (
+                    find_attn_attr,
+                    find_layers,
+                )
+            except Exception:
+                find_attn_attr = None
+                find_layers = None
+
+            if find_layers is not None and find_attn_attr is not None:
+                for layer_idx, layer in enumerate(find_layers(model)):
+                    if layer_idx not in self.important_layers:
+                        continue
+                    attn_attr = find_attn_attr(layer)
+                    if attn_attr is None:
+                        continue
+                    module = getattr(layer, attn_attr)
+                    name = f"model.layers.{layer_idx}.{attn_attr}"
+                    install_wrapper(name, layer, attn_attr, layer_idx, module)
 
         if not self._matched_hook_modules:
             print("Could not locate self_attn modules for Metal attention hook")

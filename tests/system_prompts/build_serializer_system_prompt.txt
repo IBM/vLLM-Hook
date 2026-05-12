@@ -1,0 +1,98 @@
+You are Codex, an AI pair-programmer.  
+Create a lightweight package **parity_serializers** that supplies common primitives for
+mechanistic-interpretability tooling across heterogeneous back-ends.
+
+┌─────────────────────────────────┐
+│  Package layout & key objects   │
+└─────────────────────────────────┘
+
+parity_serializers/
+    __init__.py        – exports registry and base classes
+    base.py            – AbstractSerializer, ManifestEntry dataclass
+    registry.py        – SerializerRegistry with register() decorator
+    utils.py           – helper: hash_tensor(), save_numpy(), save_stensors()
+    cli.py             – parity_dump CLI: python -m parity_serializers.cli …
+
+┌─────────────────────────────────┐
+│  Design requirements            │
+└─────────────────────────────────┘
+
+1. **AbstractSerializer** (abc):
+       serialize_run(run: RunContext, out_dir: Path) -> None
+       deserialize(path: Path) -> RunBundle
+       Each concrete subclass must set:  TOOL_NAME, PLATFORM_NAME.
+
+2. **Manifest format** (manifest.json):
+       {
+         "tool":      "vllm_hook",
+         "platform":  "GPU",
+         "model_id":  "...",
+         "dtype":     "float16",
+         "files": [ { "name": "hidden_0.npy",
+                      "shape": [seq, dim],
+                      "dtype": "float16",
+                      "sha256": "…" }, … ]
+       }
+
+3. **SerializerRegistry**:
+       get(tool: str, platform: str) → AbstractSerializer subclass
+       register(cls) decorator auto-adds to registry on import.
+
+4. **Utilities**:
+       hash_tensor(arr) → sha256
+       save_numpy(arr, path)          (fallback for all platforms)
+       save_stensors(tensor_dict, path)  (optional safetensors)
+
+5. **CLI** parity_dump:
+       Arguments:
+            --tool        required  (e.g., vllm_hook)
+            --platform    required  (e.g., GPU)
+            --out_dir     required
+            --prompt      optional text
+       Workflow:
+            • locate serializer via registry
+            • instantiate, capture current run, write artefacts
+            • print absolute path of manifest.json
+
+6. **Dependencies**: only stdlib + numpy + safetensors (optional).  
+   Detect missing optional imports and print install hints rather than exit(1).
+
+7. **Style**:
+       • Python ≥3.10, type hints, PEP 8, docstrings.
+       • No hard-coded paths. Use pathlib throughout.
+       • All public APIs documented in __init__.py.
+
+┌─────────────────────────────────┐
+│  Example stub for a concrete    │
+│  serializer (to be extended)    │
+└─────────────────────────────────┘
+
+```python
+# vllm_gpu.py
+from parity_serializers.base import AbstractSerializer
+from parity_serializers.utils import save_numpy, hash_tensor
+import numpy as np, json, pathlib
+
+class VLLMGPUSerializer(AbstractSerializer):
+    TOOL_NAME      = "vllm_hook"
+    PLATFORM_NAME  = "GPU"
+
+    def serialize_run(self, run, out_dir: pathlib.Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.save(out_dir / "tokens.npy", np.array(run.tokens, dtype=np.int32))
+        np.save(out_dir / "logits.npy", run.logits.astype(np.float32))
+        hidden = run.hidden_states.astype(np.float16)
+        save_numpy(hidden, out_dir / "hidden_0.npy")
+
+        manifest = {
+            "tool": self.TOOL_NAME,
+            "platform": self.PLATFORM_NAME,
+            "model_id": run.model_id,
+            "dtype": str(hidden.dtype),
+            "files": [
+                {"name": "tokens.npy",  "sha256": hash_tensor(run.tokens)},
+                {"name": "logits.npy",  "sha256": hash_tensor(run.logits)},
+                {"name": "hidden_0.npy","sha256": hash_tensor(hidden)},
+            ],
+        }
+        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))

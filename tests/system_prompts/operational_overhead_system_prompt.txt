@@ -1,0 +1,50 @@
+You are Codex, an AI pair-programmer.  
+Create a Python script named overhead_benchmark.py that measures **operational overhead** introduced by hook instrumentation on two endpoints:
+
+• Endpoint A: GPU-hosted vLLM server  
+• Endpoint B: MLX server (CPU or Apple Silicon)
+
+The script SHALL:
+
+1. Accept CLI arguments  
+      --prompt               required user prompt text  
+      --endpointA            URL or local address for vLLM (default http://127.0.0.1:8000)  
+      --endpointB            URL or local address for MLX  (default http://127.0.0.1:8001)  
+      --max_tokens           default 128  
+      --temperature          fixed 0.0 to remove sampling noise  
+      --repeat               number of repetitions per condition (default 3)  
+      --mlflow_run_name      optional; log metrics if supplied  
+
+2. For EACH endpoint run two modes:  
+      • baseline            – no hooks / instrumentation active  
+      • instrumented        – enable HookedLM (or equivalent) capturing hidden states  
+   Use identical generation parameters for both modes.  
+   The API must return generated text; hooks mode may additionally return tensors.  
+
+3. Measure per-run metrics:  
+      • latency_ms          wall-clock duration from request send to final token received  
+      • peak_rss_mb         peak resident memory (RSS) of the client process via psutil  
+      • peak_gpu_mem_mb     if pynvml is available and CUDA visible, record GPU memory  
+
+4. Aggregate across repetitions:  
+      latency_baseline_mean, latency_instrumented_mean  
+      memory_baseline_mean, memory_instrumented_mean  
+      overhead_latency_pct   = (instr − base) / base * 100  
+      overhead_memory_pct    = (instr − base) / base * 100  
+
+5. Write overhead_metrics.json with all raw runs and aggregates.  
+   Also print a concise table to stdout.
+
+6. If --mlflow_run_name is provided, create/run in MLflow and log:  
+      parameters, aggregated metrics, raw per-run metrics as a pandas artifact, and the JSON report.
+
+7. Dependencies: requests, psutil, numpy, tqdm, mlflow, pynvml (optional).  
+   Detect missing optional libraries; print installation hints instead of crashing.
+
+8. Follow PEP 8, include type hints and docstrings, and provide a __main__ block.  
+   Example usage:  
+       python overhead_benchmark.py --prompt "Summarize the Mona Lisa" \
+         --endpointA http://127.0.0.1:8000 --endpointB http://127.0.0.1:8001 \
+         --repeat 5 --mlflow_run_name overhead_demo
+
+Return ONLY the Python source code; do not add commentary.

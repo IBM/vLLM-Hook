@@ -1,4 +1,5 @@
 import glob
+import gc
 import json
 import os
 import tempfile
@@ -162,6 +163,32 @@ class HookLLMMetal:
                 pass
         if engine is not None and hasattr(engine, "shutdown"):
             engine.shutdown()
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            if hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+        except Exception:
+            pass
+
+    def _build_hook_llm_with_memory_retry(self) -> LLM:
+        try:
+            return self._build_llm(use_hook_worker=True)
+        except ValueError as exc:
+            if "Paged attention: computed num_blocks too low" not in str(exc):
+                raise
+            if self.llm is None:
+                raise
+            print(
+                "Hook worker load hit Metal KV-cache pressure; "
+                "releasing base engine and retrying hook capture.",
+                flush=True,
+            )
+            self._dispose_llm(self.llm)
+            self.llm = None
+            self.llm_engine = None
+            return self._build_llm(use_hook_worker=True)
 
     def load_config(self, config_file: str):
         with open(config_file, "r") as f:
@@ -230,7 +257,18 @@ class HookLLMMetal:
         hook_llm = None
         try:
             self._setup_hooks(cleanup)
-            hook_llm = self._build_llm(use_hook_worker=True)
+            if (
+                os.environ.get("VLLM_HOOK_RECLAIM_BASE_FOR_ENCODE", "0") == "1"
+                and self.llm is not None
+            ):
+                print(
+                    "Releasing base engine before Metal encode-hook capture.",
+                    flush=True,
+                )
+                self._dispose_llm(self.llm)
+                self.llm = None
+                self.llm_engine = None
+            hook_llm = self._build_hook_llm_with_memory_retry()
             prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
             hook_llm.generate(prompts, prefill_params)
             self._assert_hook_artifacts_exist()
@@ -240,6 +278,10 @@ class HookLLMMetal:
 
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
+        if self.llm is None:
+            self.llm = self._build_llm(use_hook_worker=False)
+            self.tokenizer = self.llm.get_tokenizer()
+            self.llm_engine = self.llm.llm_engine
         return self.llm.generate(prompts, sampling_params)
 
     def generate_with_decode_hook(self, prompts, sampling_params, cleanup, **kwargs):

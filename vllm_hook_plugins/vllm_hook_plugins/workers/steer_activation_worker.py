@@ -34,7 +34,7 @@ class SteerHookActWorker(V1Worker):
         vector_path = steering_config["vector_path"]
         if not os.path.exists(vector_path):
             raise FileNotFoundError(f"Steering vector not found at: {vector_path}")
-        steering_data = torch.load(vector_path)
+        steering_data = torch.load(vector_path, weights_only=False)
         self.dir = torch.tensor(steering_data["dir"])
         if self.steering_method == "adjust_rs":
             self.avg_proj = steering_data["avg_proj"]
