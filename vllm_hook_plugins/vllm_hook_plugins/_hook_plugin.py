@@ -93,14 +93,7 @@ async def _patched_generate(
     prompt: Any,
     sampling_params: Any,
     request_id: str,
-    *,
-    prompt_text: Any = None,
-    lora_request: Any = None,
-    tokenization_kwargs: Any = None,
-    trace_headers: Any = None,
-    priority: int = 0,
-    data_parallel_rank: Any = None,
-    reasoning_ended: Any = None,
+    **kwargs,
 ) -> AsyncIterator:
     """Wrap AsyncLLM.generate to install hooks and attach probes on finish."""
     # In vLLM v1, the chat endpoint clones SamplingParams into EngineCoreRequest
@@ -113,7 +106,19 @@ async def _patched_generate(
     except ImportError:
         pass
 
-    extra = effective_params.extra_args or {}
+    extra = dict(effective_params.extra_args or {})
+    # vllm_xargs only allows scalar values, so HookClient JSON-encodes nested
+    # structures. Decode them back here before the worker reads extra_args.
+    import json as _json
+    for _k in ("output_qk", "output_hidden_states"):
+        if isinstance(extra.get(_k), str):
+            _decoded = _json.loads(extra[_k])
+            # output_qk comes back as {str_key: list} — restore int keys
+            if _k == "output_qk" and isinstance(_decoded, dict):
+                _decoded = {int(k): v for k, v in _decoded.items()}
+            extra[_k] = _decoded
+    effective_params.extra_args = extra
+
     wants_hs = extra.get("output_hidden_states") is not None
     wants_qk = extra.get("output_qk") is not None
     needs_hooks = wants_hs or wants_qk
@@ -126,14 +131,7 @@ async def _patched_generate(
     assert _original_generate is not None
     try:
         async for output in _original_generate(
-            self, prompt, sampling_params, request_id,
-            prompt_text=prompt_text,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
+            self, prompt, sampling_params, request_id, **kwargs
         ):
             if output.finished and needs_hooks:
                 if save_to_disk:
@@ -145,7 +143,7 @@ async def _patched_generate(
                             "save_to_disk=True but no hook_dir provided in extra_args "
                             "and VLLM_HOOK_DIR env var is not set."
                         )
-                    await self.collective_rpc("flush_disk", args=(request_id, run_id, hook_dir))
+                    await self.collective_rpc("flush_disk", args=([request_id], run_id, hook_dir))
                     # Leave output.probes unset — caller reads artifacts from disk.
                 else:
                     states = await self.collective_rpc("get_captured_states", args=(request_id,))
@@ -232,10 +230,12 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
                     output.probes = probes
 
         # Second pass: flush disk-save requests. All req_ids sharing a run_id
-        # are flushed in sequence so the worker appends rather than overwrites.
+        # are sent in one collective_rpc call so the worker merges the full
+        # batch into a single artifact — matching old execute_model() behavior.
         for run_id, req_list in disk_by_run.items():
-            for req_id, hook_dir in req_list:
-                self.collective_rpc("flush_disk", args=(req_id, run_id, hook_dir))
+            req_ids = [r for r, _ in req_list]
+            _, hook_dir = req_list[0]
+            self.collective_rpc("flush_disk", args=(req_ids, run_id, hook_dir))
 
     return outputs
 
@@ -250,6 +250,10 @@ def _serialize_probes(probes: dict) -> dict:
     import torch
     result = {}
     for key, cache in probes.items():
+        # config is a flat dict of scalars — pass through as-is.
+        if key == "config" and isinstance(cache, dict):
+            result[key] = cache
+            continue
         if not isinstance(cache, dict):
             continue
         result[key] = {}
@@ -338,20 +342,33 @@ def register() -> None:
     LLM.generate = _patched_llm_generate
 
     # Patch OpenAI-compatible response builders (only available with vllm serve).
-    try:
-        from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
-        _original_completion_response = (
-            OpenAIServingCompletion.request_output_to_completion_response
-        )
-        OpenAIServingCompletion.request_output_to_completion_response = (
-            _patched_completion_response
-        )
-    except Exception:
-        pass
+    # Module paths differ across vLLM versions; try all known locations.
+    for _completion_module in (
+        "vllm.entrypoints.openai.completion.serving",   # <0.12
+        "vllm.entrypoints.openai.serving_completion",   # ≥0.12
+    ):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_completion_module)
+            _cls = _mod.OpenAIServingCompletion
+            _original_completion_response = (
+                _cls.request_output_to_completion_response
+            )
+            _cls.request_output_to_completion_response = _patched_completion_response
+            break
+        except Exception:
+            pass
 
-    try:
-        from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-        _original_chat_full_generator = OpenAIServingChat.chat_completion_full_generator
-        OpenAIServingChat.chat_completion_full_generator = _patched_chat_full_generator
-    except Exception:
-        pass
+    for _chat_module in (
+        "vllm.entrypoints.openai.chat_completion.serving",  # <0.12
+        "vllm.entrypoints.openai.serving_chat",             # ≥0.12
+    ):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_chat_module)
+            _cls = _mod.OpenAIServingChat
+            _original_chat_full_generator = _cls.chat_completion_full_generator
+            _cls.chat_completion_full_generator = _patched_chat_full_generator
+            break
+        except Exception:
+            pass
