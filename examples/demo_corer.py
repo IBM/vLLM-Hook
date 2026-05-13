@@ -10,6 +10,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
 os.environ.setdefault("VLLM_HOOK_ASYNC_SAVE", "1")
 
+from vllm import SamplingParams
 from vllm_hook_plugins import HookLLM
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, documents: List[str]):
@@ -212,12 +213,15 @@ if __name__ == "__main__":
         
         # Apply chat template and get ranges
         text, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
-        llm.generate(text, temperature=0.1, max_tokens=1)
-        
+        llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
+                     save_to_disk=True, run_id="corer-doc")
+
         text, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
-        llm.generate(text, cleanup=False, temperature=0.1, max_tokens=1)
-        
-        stats = llm.analyze(analyzer_spec={'query_spec': query_spec, 'na_spec': na_spec})
+        llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
+                     save_to_disk=True, run_id="corer-na")
+
+        stats = llm.analyze(run_ids=["corer-doc", "corer-na"],
+                            analyzer_spec={'query_spec': query_spec, 'na_spec': na_spec})
         print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
 
         llm.llm_engine.reset_prefix_cache()
@@ -246,9 +250,12 @@ if __name__ == "__main__":
         text_nas.append(text_na)
         na_specs.append(na_spec)
     
-    llm.generate(text_querys, temperature=0.1, max_tokens=1)
-    llm.generate(text_nas, cleanup=False, temperature=0.1, max_tokens=1)
-    
-    stats = llm.analyze(analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
+    llm.generate(text_querys, SamplingParams(temperature=0.1, max_tokens=1),
+                 save_to_disk=True, run_id="corer-batch-doc")
+    llm.generate(text_nas, SamplingParams(temperature=0.1, max_tokens=1),
+                 save_to_disk=True, run_id="corer-batch-na")
+
+    stats = llm.analyze(run_ids=["corer-batch-doc", "corer-batch-na"],
+                        analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
     print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
     llm.llm_engine.reset_prefix_cache()

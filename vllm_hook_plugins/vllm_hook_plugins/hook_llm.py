@@ -1,3 +1,4 @@
+import inspect
 import os
 import json
 import uuid
@@ -154,14 +155,16 @@ class HookLLM:
         analyzer_spec: Optional[Dict] = None,
         probes: Optional[Dict] = None,
         run_id: Optional[str] = None,
+        run_ids: Optional[List[str]] = None,
     ) -> Optional[Dict]:
         """Run the configured analyzer.
 
         Two paths:
         - In-memory: pass ``probes=output.probes`` from a generate() call that
           used save_to_disk=False. The analyzer receives the RPC artifacts directly.
-        - Disk: pass ``run_id`` (or omit to use the last generate()'s run_id).
-          The analyzer reads artifacts from {hook_dir}/{run_id}/.
+        - Disk: pass ``run_id`` for single-pass analyzers (HS, AttnTracker), or
+          ``run_ids=[doc_run_id, na_run_id]`` for CoRer. Omitting both falls back
+          to the last generate()'s run_id.
         """
         if self.analyzer is None:
             print("No analyzer configured")
@@ -174,31 +177,18 @@ class HookLLM:
             spec["probes"] = probes
             return self.analyzer.analyze(spec)
 
-        # Disk path: use provided run_id or fall back to last generate()'s run_id.
-        if run_id is not None:
-            import vllm_hook_plugins.run_utils as ru
-            # Temporarily point VLLM_RUN_ID at the requested run so analyzers
-            # that still read the env var work correctly.
-            _orig = os.environ.get("VLLM_RUN_ID")
-            # Write a synthetic RUN_ID file so legacy analyzers can find the run.
-            run_id_file = os.path.join(self._hook_dir, "RUN_ID.txt")
-            with open(run_id_file, "w") as f:
-                f.write(run_id + "\n")
-            os.environ["VLLM_RUN_ID"] = os.path.abspath(run_id_file)
-            try:
-                return self.analyzer.analyze(analyzer_spec)
-            finally:
-                if _orig is not None:
-                    os.environ["VLLM_RUN_ID"] = _orig
-                else:
-                    os.environ.pop("VLLM_RUN_ID", None)
+        # Disk path: resolve run_id from args or _last_run_id fallback.
+        effective_run_id = run_id or getattr(self, "_last_run_id", None)
+        effective_run_ids = run_ids
 
-        # Fall back to last generate()'s run_id if save_to_disk was used.
-        last = getattr(self, "_last_run_id", None)
-        if last:
-            return self.analyze(analyzer_spec=analyzer_spec, run_id=last)
+        sig = inspect.signature(self.analyzer.analyze)
+        kwargs = {"analyzer_spec": analyzer_spec}
+        if "run_ids" in sig.parameters and effective_run_ids is not None:
+            kwargs["run_ids"] = effective_run_ids
+        elif "run_id" in sig.parameters and effective_run_id is not None:
+            kwargs["run_id"] = effective_run_id
 
-        return self.analyzer.analyze(analyzer_spec)
+        return self.analyzer.analyze(**kwargs)
 
     def __del__(self):
         from vllm_hook_plugins.shm_utils import teardown_shm

@@ -184,15 +184,12 @@ class ProbeHiddenStatesWorker:
                     continue
 
                 # hooks_on: "prefill" (default) | "decode" | "both"
-                # Derived from attn_metadata: query_len == seq_len means all
-                # tokens are new (prefill); query_len == 1 < seq_len means
-                # decode. Works per-request in mixed batches without touching
-                # engine-side state.
+                # Uses output_token_ids == [] on the worker-side CachedRequestState
+                # to detect the first (prefill) pass. This is robust to prefix
+                # caching where query_len < seq_len even on the first pass.
                 hooks_on = extra.get("hooks_on", self._default_hooks_on)
                 if hooks_on != "both":
-                    query_len_i = int(last_indices[i + 1].item()) - int(last_indices[i].item())
-                    seq_len_i = int(seq_lens[i].item()) if seq_lens is not None else query_len_i
-                    is_prefill = query_len_i == seq_len_i
+                    is_prefill = len(req_state.output_token_ids) == 0
                     if hooks_on == "prefill" and not is_prefill:
                         continue
                     if hooks_on == "decode" and is_prefill:
@@ -292,64 +289,60 @@ class ProbeHiddenStatesWorker:
             if req_id == external_req_id or req_id.startswith(prefix):
                 del self._captured_states[req_id]
 
-    def flush_disk(self, external_req_id: str, run_id: str, hook_dir: str) -> bool:
-        """Write captured hidden states to disk under {hook_dir}/{run_id}/tp_rank_N/.
+    def flush_disk(self, external_req_ids: list, run_id: str, hook_dir: str) -> bool:
+        """Write captured hidden states for all requests in the batch to one artifact.
 
-        Called via collective_rpc after generation finishes for a request that
-        set save_to_disk=True. GPU->CPU transfer happens once here (post-pass),
-        then the write goes through the same safetensors/.pt/async-save pipeline
-        as the old flag-file path.
+        Accepts a list of external_req_ids so all requests sharing a run_id
+        are merged into one cpu_cache before writing — matching the old
+        execute_model() behavior where the full batch was saved atomically.
 
-        Returns True if artifacts were written, False if nothing was captured.
+        Returns True if any artifacts were written, False if nothing captured.
         """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._disk_states):
-            if req_id != external_req_id and not req_id.startswith(prefix):
-                continue
-            layer_dict = self._disk_states.pop(req_id)
-            if not layer_dict:
-                return False
+        cpu_cache: dict = {"config": self._conf, "hs_cache": {}}
+        found_any = False
 
-            # Build the cpu_cache dict the existing write helpers expect.
-            cpu_cache: dict = {"config": self._conf, "hs_cache": {}}
-            for mod_name, entry in layer_dict.items():
-                cpu_cache["hs_cache"][mod_name] = {
-                    "hidden_states": [t.cpu() for t in entry["hidden_states"]],
-                    "layer_num": entry["layer_num"],
-                    "hs_mode": entry.get("hs_mode", self.hs_mode),
-                }
+        for external_req_id in external_req_ids:
+            prefix = f"{external_req_id}-"
+            for req_id in list(self._disk_states):
+                if req_id != external_req_id and not req_id.startswith(prefix):
+                    continue
+                layer_dict = self._disk_states.pop(req_id)
+                if not layer_dict:
+                    continue
+                found_any = True
+                for mod_name, entry in layer_dict.items():
+                    cpu_entry = {
+                        "hidden_states": [t.cpu() for t in entry["hidden_states"]],
+                        "layer_num": entry["layer_num"],
+                        "hs_mode": entry.get("hs_mode", self.hs_mode),
+                    }
+                    if mod_name in cpu_cache["hs_cache"]:
+                        cpu_cache["hs_cache"][mod_name]["hidden_states"].extend(
+                            cpu_entry["hidden_states"]
+                        )
+                    else:
+                        cpu_cache["hs_cache"][mod_name] = cpu_entry
 
-            tp_rank = int(ps.get_tensor_model_parallel_rank())
-            run_dir = os.path.join(hook_dir, run_id, f"tp_rank_{tp_rank}")
-            os.makedirs(run_dir, exist_ok=True)
+        if not found_any:
+            return False
 
-            if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
-                self._save_queue.put((run_id, cpu_cache, run_dir))
-            elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-                self._save_safetensors(cpu_cache, run_dir)
-            else:
-                out_path = os.path.join(run_dir, "hidden_states.pt")
-                # Merge with existing artifact if present — multiple flush_disk()
-                # calls for different requests sharing the same run_id append
-                # their tensors rather than overwriting.
-                if os.path.exists(out_path):
-                    existing = torch.load(out_path, map_location="cpu", weights_only=False)
-                    for mod_name, entry in cpu_cache["hs_cache"].items():
-                        if mod_name in existing.get("hs_cache", {}):
-                            existing["hs_cache"][mod_name]["hidden_states"].extend(
-                                entry["hidden_states"]
-                            )
-                        else:
-                            existing.setdefault("hs_cache", {})[mod_name] = entry
-                    cpu_cache = existing
-                tmp_path = out_path + ".tmp"
-                with open(tmp_path, "wb") as f:
-                    torch.save(cpu_cache, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.rename(tmp_path, out_path)
-            return True
-        return False
+        tp_rank = int(ps.get_tensor_model_parallel_rank())
+        run_dir = os.path.join(hook_dir, run_id, f"tp_rank_{tp_rank}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+            self._save_queue.put((run_id, cpu_cache, run_dir))
+        elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+            self._save_safetensors(cpu_cache, run_dir)
+        else:
+            out_path = os.path.join(run_dir, "hidden_states.pt")
+            tmp_path = out_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                torch.save(cpu_cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_path, out_path)
+        return found_any
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
         """Optionally write cpu_cache as a safetensors file + JSON sidecar.

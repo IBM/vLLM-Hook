@@ -33,6 +33,47 @@ def match_attn(name: str):
             return int(m.group(1))
     return None
 
+
+def _read_cached_keys(
+    attn_module,
+    attn_metadata,
+    req_idx: int,
+    num_cached: int,
+    total_len: int,
+):
+    """Read cached prefix keys from vLLM's paged KV cache.
+
+    When prefix caching is active, the hook only fires for non-cached tokens.
+    This function reconstructs the missing prefix keys by reading directly from
+    vLLM's KV cache blocks, keyed by the block_table entry for this request.
+
+    Returns a tensor of shape (num_cached, num_kv_heads * head_size) on the
+    same device as the KV cache, or None on any error (caller falls back to
+    new-tokens-only capture).
+    """
+    try:
+        virtual_engine = get_forward_context().virtual_engine
+        # kv_cache shape: [2, num_blocks, block_size, num_kv_heads, head_size]
+        kv_cache = attn_module.kv_cache[virtual_engine]
+        key_cache = kv_cache[0]  # [num_blocks, block_size, num_kv_heads, head_size]
+
+        block_size   = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_size    = key_cache.shape[3]
+
+        # block_table: [batch_size, max_blocks_per_seq]
+        block_table = attn_metadata.block_table
+        num_blocks_needed = math.ceil(total_len / block_size)
+        block_ids = block_table[req_idx, :num_blocks_needed]  # [num_blocks_needed]
+
+        # Gather and flatten: [num_blocks_needed * block_size, kv_hidden]
+        prefix_keys = key_cache[block_ids].reshape(-1, num_kv_heads * head_size)
+
+        # Trim to exact cached token count (last block may be partially filled)
+        return prefix_keys[:num_cached].detach()
+    except Exception:
+        return None
+
 class ProbeHookQKWorker:
     """Mixin injected into vLLM's GPU Worker via worker_extension_cls.
 
@@ -108,7 +149,7 @@ class ProbeHookQKWorker:
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
-        def qkv_hook(input, module_name):
+        def qkv_hook(input, module_name, attn_module=None):
             # Fast-path: only rank 0 captures (RPC and disk paths both need it).
             if not self._should_capture:
                 return None
@@ -177,15 +218,12 @@ class ProbeHookQKWorker:
                         continue
 
                 # hooks_on: "prefill" (default) | "decode" | "both"
-                # Derived from attn_metadata: query_len == seq_len means all
-                # tokens are new (prefill); query_len == 1 < seq_len means
-                # decode. Works per-request in mixed batches without touching
-                # engine-side state.
+                # Uses output_token_ids == [] on the worker-side CachedRequestState
+                # to detect the first (prefill) pass. This is robust to prefix
+                # caching where query_len < seq_len even on the first pass.
                 hooks_on = extra.get("hooks_on", self._default_hooks_on)
                 if hooks_on != "both":
-                    query_len_i = int(last_indices[i + 1].item()) - int(last_indices[i].item())
-                    seq_len_i = int(seq_lens[i].item()) if seq_lens is not None else query_len_i
-                    is_prefill = query_len_i == seq_len_i
+                    is_prefill = len(req_state.output_token_ids) == 0
                     if hooks_on == "prefill" and not is_prefill:
                         continue
                     if hooks_on == "decode" and is_prefill:
@@ -204,6 +242,23 @@ class ProbeHookQKWorker:
                 else:
                     q_tok = input[0][end - 1, :].detach().clone()
                 k_tok = input[1][start:end, :].detach().clone()
+
+                # Reconstruct full k_all when prefix caching is active.
+                # seq_lens[i] = total sequence length (cached + new tokens).
+                # query_len = new tokens only (what the hook captured above).
+                # If num_cached > 0, read the missing prefix keys directly from
+                # vLLM's paged KV cache and prepend them to k_tok.
+                if seq_lens is not None and attn_module is not None:
+                    try:
+                        total_len = int(seq_lens[i].item()) if hasattr(seq_lens[i], 'item') else int(seq_lens[i])
+                        query_len = end - start
+                        num_cached = total_len - query_len
+                        if num_cached > 0:
+                            prefix_k = _read_cached_keys(attn_module, metadata if not isinstance(metadata, dict) else next(iter(metadata.values())), i, num_cached, total_len)
+                            if prefix_k is not None:
+                                k_tok = torch.cat([prefix_k.to(k_tok.device, dtype=k_tok.dtype), k_tok], dim=0)
+                    except Exception:
+                        pass
 
                 # Route to disk or RPC bucket based on save_to_disk flag.
                 bucket = self._disk_states if extra.get("save_to_disk") else self._captured_states
@@ -228,7 +283,7 @@ class ProbeHookQKWorker:
             if self.important_layers and layer_num not in self.important_layers:
                 continue
             hook = module.register_forward_hook(
-                lambda _m, i, _o, n=name: qkv_hook(i, n)
+                lambda _m, i, _o, n=name: qkv_hook(i, n, _m)
             )
             self._hooks.append(hook)
             matched.append(name)
@@ -293,62 +348,60 @@ class ProbeHookQKWorker:
             if req_id == external_req_id or req_id.startswith(prefix):
                 del self._captured_states[req_id]
 
-    def flush_disk(self, external_req_id: str, run_id: str, hook_dir: str) -> bool:
-        """Write captured Q/K to disk under {hook_dir}/{run_id}/tp_rank_N/.
+    def flush_disk(self, external_req_ids: list, run_id: str, hook_dir: str) -> bool:
+        """Write captured Q/K for all requests in the batch to one artifact.
 
-        Called via collective_rpc after generation finishes for a request that
-        set save_to_disk=True. Uses the same safetensors/.pt/async pipeline as
-        the old flag-file path.
+        Accepts a list of external_req_ids so all requests sharing a run_id
+        are merged into one cpu_cache before writing — matching the old
+        execute_model() behavior where the full batch was saved atomically.
 
-        Returns True if artifacts were written, False if nothing was captured.
+        Returns True if any artifacts were written, False if nothing captured.
         """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._disk_states):
-            if req_id != external_req_id and not req_id.startswith(prefix):
-                continue
-            layer_dict = self._disk_states.pop(req_id)
-            if not layer_dict:
-                return False
+        cpu_cache: dict = {"config": self._conf, "qk_cache": {}}
+        found_any = False
 
-            cpu_cache: dict = {"config": self._conf, "qk_cache": {}}
-            for mod_name, entry in layer_dict.items():
-                cpu_cache["qk_cache"][mod_name] = {
-                    "q": [t.cpu() for t in entry["q"]],
-                    "k_all": [t.cpu() for t in entry["k_all"]],
-                    "layer_num": entry["layer_num"],
-                    "hookq_mode": entry.get("hookq_mode", self.hookq_mode),
-                }
+        for external_req_id in external_req_ids:
+            prefix = f"{external_req_id}-"
+            for req_id in list(self._disk_states):
+                if req_id != external_req_id and not req_id.startswith(prefix):
+                    continue
+                layer_dict = self._disk_states.pop(req_id)
+                if not layer_dict:
+                    continue
+                found_any = True
+                for mod_name, entry in layer_dict.items():
+                    cpu_entry = {
+                        "q": [t.cpu() for t in entry["q"]],
+                        "k_all": [t.cpu() for t in entry["k_all"]],
+                        "layer_num": entry["layer_num"],
+                        "hookq_mode": entry.get("hookq_mode", self.hookq_mode),
+                    }
+                    if mod_name in cpu_cache["qk_cache"]:
+                        cpu_cache["qk_cache"][mod_name]["q"].extend(cpu_entry["q"])
+                        cpu_cache["qk_cache"][mod_name]["k_all"].extend(cpu_entry["k_all"])
+                    else:
+                        cpu_cache["qk_cache"][mod_name] = cpu_entry
 
-            tp_rank = int(ps.get_tensor_model_parallel_rank())
-            run_dir = os.path.join(hook_dir, run_id, f"tp_rank_{tp_rank}")
-            os.makedirs(run_dir, exist_ok=True)
+        if not found_any:
+            return False
 
-            if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
-                self._save_queue.put((run_id, cpu_cache, run_dir))
-            elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-                self._save_safetensors(cpu_cache, run_dir)
-            else:
-                out_path = os.path.join(run_dir, "qk.pt")
-                # Merge with existing artifact if present — multiple flush_disk()
-                # calls for different requests sharing the same run_id append
-                # their tensors rather than overwriting.
-                if os.path.exists(out_path):
-                    existing = torch.load(out_path, map_location="cpu", weights_only=False)
-                    for mod_name, entry in cpu_cache["qk_cache"].items():
-                        if mod_name in existing.get("qk_cache", {}):
-                            existing["qk_cache"][mod_name]["q"].extend(entry["q"])
-                            existing["qk_cache"][mod_name]["k_all"].extend(entry["k_all"])
-                        else:
-                            existing.setdefault("qk_cache", {})[mod_name] = entry
-                    cpu_cache = existing
-                tmp_path = out_path + ".tmp"
-                with open(tmp_path, "wb") as f:
-                    torch.save(cpu_cache, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.rename(tmp_path, out_path)
-            return True
-        return False
+        tp_rank = int(ps.get_tensor_model_parallel_rank())
+        run_dir = os.path.join(hook_dir, run_id, f"tp_rank_{tp_rank}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
+            self._save_queue.put((run_id, cpu_cache, run_dir))
+        elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+            self._save_safetensors(cpu_cache, run_dir)
+        else:
+            out_path = os.path.join(run_dir, "qk.pt")
+            tmp_path = out_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                torch.save(cpu_cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_path, out_path)
+        return found_any
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
         import json as _json
