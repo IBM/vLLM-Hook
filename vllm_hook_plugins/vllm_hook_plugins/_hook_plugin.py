@@ -198,10 +198,15 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
 
     if needs_hooks:
         import os
+
+        # First pass: handle RPC (in-memory) requests immediately, and collect
+        # disk-save requests grouped by run_id so all requests sharing the same
+        # run_id are flushed together — preventing the second flush from
+        # overwriting the first when a batch shares one run_id.
+        disk_by_run: dict = {}  # run_id -> [(req_id, hook_dir)]
+
         for idx, output in enumerate(outputs):
             req_id = output.request_id
-            # Find the SamplingParams that applied to this output. vLLM preserves
-            # input order in outputs; a single SP means it applied to all prompts.
             sp = params_list[idx] if idx < len(params_list) else params_list[0] if params_list else None
             extra = (sp.extra_args if sp is not None else None) or {}
 
@@ -213,8 +218,7 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
                         "save_to_disk=True but no hook_dir provided in extra_args "
                         "and VLLM_HOOK_DIR env var is not set."
                     )
-                self.collective_rpc("flush_disk", args=(req_id, run_id, hook_dir))
-                # Leave output.probes unset — caller reads artifacts from disk.
+                disk_by_run.setdefault(run_id, []).append((req_id, hook_dir))
             else:
                 states = self.collective_rpc("get_captured_states", args=(req_id,))
                 parts = [_decompress(s) for s in states if s is not None]
@@ -226,6 +230,12 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
                     _trim_probes(probes, "hs_cache", expected_len)
                     _trim_probes(probes, "qk_cache", expected_len)
                     output.probes = probes
+
+        # Second pass: flush disk-save requests. All req_ids sharing a run_id
+        # are flushed in sequence so the worker appends rather than overwrites.
+        for run_id, req_list in disk_by_run.items():
+            for req_id, hook_dir in req_list:
+                self.collective_rpc("flush_disk", args=(req_id, run_id, hook_dir))
 
     return outputs
 

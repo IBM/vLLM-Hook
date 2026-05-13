@@ -329,6 +329,19 @@ class ProbeHiddenStatesWorker:
                 self._save_safetensors(cpu_cache, run_dir)
             else:
                 out_path = os.path.join(run_dir, "hidden_states.pt")
+                # Merge with existing artifact if present — multiple flush_disk()
+                # calls for different requests sharing the same run_id append
+                # their tensors rather than overwriting.
+                if os.path.exists(out_path):
+                    existing = torch.load(out_path, map_location="cpu", weights_only=False)
+                    for mod_name, entry in cpu_cache["hs_cache"].items():
+                        if mod_name in existing.get("hs_cache", {}):
+                            existing["hs_cache"][mod_name]["hidden_states"].extend(
+                                entry["hidden_states"]
+                            )
+                        else:
+                            existing.setdefault("hs_cache", {})[mod_name] = entry
+                    cpu_cache = existing
                 tmp_path = out_path + ".tmp"
                 with open(tmp_path, "wb") as f:
                     torch.save(cpu_cache, f)

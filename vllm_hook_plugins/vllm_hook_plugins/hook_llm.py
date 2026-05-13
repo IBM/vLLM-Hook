@@ -1,6 +1,5 @@
 import os
 import json
-import glob
 import uuid
 from typing import Optional, Dict, List
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
@@ -21,7 +20,7 @@ class HookLLM:
         enforce_eager: bool = True,
         **vllm_kwargs
     ):
-        
+
         self.model_name = model
         self.worker_name = worker_name
         self.analyzer_name = analyzer_name
@@ -31,17 +30,14 @@ class HookLLM:
         if hook_dir is not None:
             HOOK_DIR = hook_dir
         else:
-            HOOK_DIR = os.path.join(download_dir,'_v1_qk_peeks')
+            HOOK_DIR = os.path.join(download_dir, '_v1_qk_peeks')
         os.makedirs(HOOK_DIR, exist_ok=True)
         self._hook_dir = HOOK_DIR
-        self._hook_flag = os.path.join(self._hook_dir, "EXTRACT.flag")
-        self._run_id_file = os.path.join(self._hook_dir, "RUN_ID.txt")
-        
+
         os.environ["VLLM_HOOK_DIR"] = os.path.abspath(self._hook_dir)
-        os.environ["VLLM_HOOK_FLAG"] = os.path.abspath(self._hook_flag)
-        os.environ["VLLM_RUN_ID"] = os.path.abspath(self._run_id_file)
-        
+
         self.layer_to_heads = {}
+        self._output_layers = None   # set by load_config for HS worker
         if config_file:
             self.load_config(config_file)
 
@@ -55,17 +51,16 @@ class HookLLM:
         if worker_name:
             import vllm.plugins
             vllm.plugins.load_general_plugins()
-            
             worker = PluginRegistry.get_worker(worker_name).path
 
         self.llm = LLM(
             model=model,
             download_dir=download_dir,
             worker_extension_cls=worker,
-            enforce_eager = enforce_eager,
+            enforce_eager=enforce_eager,
             **vllm_kwargs
         )
-            
+
         self.tokenizer = self.llm.get_tokenizer()
         self.llm_engine = self.llm.llm_engine
 
@@ -74,30 +69,29 @@ class HookLLM:
             self.analyzer = PluginRegistry.get_analyzer(analyzer_name).analyzer
             self.analyzer = self.analyzer(self._hook_dir, self.layer_to_heads)
 
-    
+
     def load_config(self, config_file: str):
         with open(config_file, 'r') as f:
             config_data = json.load(f)
-        
+
         if "params" in config_data and "important_heads" in config_data["params"]:
             self.important_heads = config_data["params"]["important_heads"]
-            # self.important_heads = [[i, j] for i in range(32) for j in range(32)]
             self.layer_to_heads = {}
             for layer_idx, head_idx in self.important_heads:
                 if layer_idx not in self.layer_to_heads:
                     self.layer_to_heads[layer_idx] = []
                 self.layer_to_heads[layer_idx].append(head_idx)
-            
+
             layer_to_heads_string = ";".join([
                 f"{layer}:{','.join(map(str, heads))}"
                 for layer, heads in sorted(self.layer_to_heads.items())
             ])
             os.environ["VLLM_HOOK_LAYER_HEADS"] = layer_to_heads_string
-        
+
         if "hookq" in config_data:
             hookq_mode = config_data["hookq"]["hookq_mode"]
             os.environ["VLLM_HOOKQ_MODE"] = hookq_mode
-        
+
         if "steering" in config_data:
             os.environ["VLLM_ACTSTEER_CONFIG"] = os.path.abspath(config_file)
 
@@ -107,103 +101,105 @@ class HookLLM:
             os.environ["VLLM_HOOK_LAYERS"] = ";".join(map(str, layers))
             mode = hs_cfg.get("mode", "last_token")
             os.environ["VLLM_HOOK_HS_MODE"] = mode
+            self._output_layers = layers if layers else True
+
+    def _build_extra_args(self, save_to_disk: bool, run_id: str) -> dict:
+        """Build extra_args for the probe worker based on worker_name and config."""
+        extra = {}
+        if self.worker_name == "probe_hidden_states":
+            extra["output_hidden_states"] = self._output_layers if self._output_layers else True
+        elif self.worker_name == "probe_hook_qk":
+            # Pass layer_to_heads dict for head-level metadata; worker uses keys for layer filtering.
+            extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
+        # steer_hook_act: no output_* key needed — steering fires on every prefill automatically.
+
+        if save_to_disk:
+            extra["save_to_disk"] = True
+            extra["run_id"] = run_id
+            extra["hook_dir"] = self._hook_dir
+
+        return extra
 
     def generate(
         self,
         prompts: List[str],
         sampling_params: Optional[SamplingParams] = None,
         use_hook: Optional[bool] = None,
-        cleanup: Optional[bool] = True,
+        save_to_disk: bool = False,
+        run_id: Optional[str] = None,
         **kwargs
     ):
         hook = use_hook if use_hook is not None else self.enable_hook
-        
+
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        if not hook or not self.worker_name:
-            if sampling_params is None:
-                sampling_params = SamplingParams(**kwargs)
-            return self.llm.generate(prompts, sampling_params)
-        
-        return self._generate_with_hooks(
-            prompts, sampling_params, cleanup,
-            hooks_on_prefill=True,
-            hooks_on_generate=False,
-            **kwargs
-        )
-
-    def _generate_with_hooks(self, prompts, sampling_params, cleanup,
-                              hooks_on_prefill: bool, hooks_on_generate: bool, **kwargs):
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
 
-        if hooks_on_prefill and hooks_on_generate:
-            # Single-pass: hooks active throughout
-            self._setup_hooks(cleanup)
-            try:
-                return self.llm.generate(prompts, sampling_params)
-            finally:
-                self._cleanup_hooks()
-        else:
-            # Two-pass: prefill (max_tokens=1) then full generation
-            prefill_params = SamplingParams(temperature=0.1, max_tokens=1)
+        if hook and self.worker_name:
+            if run_id is None:
+                run_id = str(uuid.uuid4())
+            extra = dict(sampling_params.extra_args or {})
+            extra.update(self._build_extra_args(save_to_disk, run_id))
+            sampling_params.extra_args = extra
+            # Store last run_id so analyze() can find the artifact without
+            # the caller needing to track it.
+            self._last_run_id = run_id
 
-            if hooks_on_prefill:
-                self._setup_hooks(cleanup)
-            self.llm.generate(prompts, prefill_params)
-            if hooks_on_prefill:
-                self._cleanup_hooks()
+        return self.llm.generate(prompts, sampling_params)
 
-            if hooks_on_generate:
-                self._setup_hooks(cleanup)
-            output = self.llm.generate(prompts, sampling_params)
-            if hooks_on_generate:
-                self._cleanup_hooks()
-
-            return output
-
-    ####### depreciated ####### 
-    def generate_with_encode_hook(self, prompts, sampling_params, cleanup, **kwargs):
-        return self._generate_with_hooks(prompts, sampling_params, cleanup,
-                                          hooks_on_prefill=True, hooks_on_generate=False, **kwargs)
-    ####### depreciated ####### 
-    def generate_with_decode_hook(self, prompts, sampling_params, cleanup, **kwargs):
-        return self._generate_with_hooks(prompts, sampling_params, cleanup,
-                                          hooks_on_prefill=False, hooks_on_generate=True, **kwargs)
-    
     def analyze(
         self,
-        analyzer_spec: Optional[Dict] = None
+        analyzer_spec: Optional[Dict] = None,
+        probes: Optional[Dict] = None,
+        run_id: Optional[str] = None,
     ) -> Optional[Dict]:
+        """Run the configured analyzer.
 
+        Two paths:
+        - In-memory: pass ``probes=output.probes`` from a generate() call that
+          used save_to_disk=False. The analyzer receives the RPC artifacts directly.
+        - Disk: pass ``run_id`` (or omit to use the last generate()'s run_id).
+          The analyzer reads artifacts from {hook_dir}/{run_id}/.
+        """
         if self.analyzer is None:
             print("No analyzer configured")
             return None
-        
+
+        if probes is not None:
+            # In-memory path: inject probes into the analyzer_spec so analyzers
+            # that support it can use them directly.
+            spec = dict(analyzer_spec or {})
+            spec["probes"] = probes
+            return self.analyzer.analyze(spec)
+
+        # Disk path: use provided run_id or fall back to last generate()'s run_id.
+        if run_id is not None:
+            import vllm_hook_plugins.run_utils as ru
+            # Temporarily point VLLM_RUN_ID at the requested run so analyzers
+            # that still read the env var work correctly.
+            _orig = os.environ.get("VLLM_RUN_ID")
+            # Write a synthetic RUN_ID file so legacy analyzers can find the run.
+            run_id_file = os.path.join(self._hook_dir, "RUN_ID.txt")
+            with open(run_id_file, "w") as f:
+                f.write(run_id + "\n")
+            os.environ["VLLM_RUN_ID"] = os.path.abspath(run_id_file)
+            try:
+                return self.analyzer.analyze(analyzer_spec)
+            finally:
+                if _orig is not None:
+                    os.environ["VLLM_RUN_ID"] = _orig
+                else:
+                    os.environ.pop("VLLM_RUN_ID", None)
+
+        # Fall back to last generate()'s run_id if save_to_disk was used.
+        last = getattr(self, "_last_run_id", None)
+        if last:
+            return self.analyze(analyzer_spec=analyzer_spec, run_id=last)
+
         return self.analyzer.analyze(analyzer_spec)
-    
+
     def __del__(self):
         from vllm_hook_plugins.shm_utils import teardown_shm
         teardown_shm(getattr(self, "_hook_shm", None))
-
-    def _setup_hooks(self, cleanup):
-        if cleanup:
-            for ext in ("*.pt", "*.safetensors", "*.json"):
-                for p in glob.glob(
-                    os.path.join(self._hook_dir, "**", ext), recursive=True
-                ):
-                    os.remove(p)
-            if os.path.exists(self._run_id_file):
-                os.remove(self._run_id_file)
-
-        run_id = str(uuid.uuid4())
-        with open(self._run_id_file, "a") as f:
-            f.write(run_id+ "\n")
-
-        open(self._hook_flag, "a").close()
-
-    def _cleanup_hooks(self):
-        if os.path.exists(self._hook_flag):
-            os.remove(self._hook_flag)
-    
