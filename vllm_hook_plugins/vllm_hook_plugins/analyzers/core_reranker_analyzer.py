@@ -14,11 +14,22 @@ class CorerAnalyzer:
     
     def analyze(
         self,
-        analyzer_spec: Optional[Dict] = None
+        analyzer_spec: Optional[Dict] = None,
+        run_ids: Optional[List[str]] = None,
     ) -> Optional[Dict]:
-        
-        run_id_file = os.environ.get("VLLM_RUN_ID")
-        run_ids = read_run_ids(run_id_file)
+        """Analyze document relevance using QK artifacts from two generate() passes.
+
+        Args:
+            analyzer_spec: dict with 'query_spec' and 'na_spec' token ranges.
+            run_ids: [doc_run_id, na_run_id] — the run IDs from the document
+                pass and the NA (not-applicable) pass respectively. If omitted,
+                falls back to reading the last two run IDs from VLLM_RUN_ID
+                (legacy behavior).
+        """
+        if run_ids is None:
+            run_id_file = os.environ.get("VLLM_RUN_ID")
+            run_ids = read_run_ids(run_id_file)
+
         if not isinstance(analyzer_spec['query_spec'], list):
             analyzer_spec['query_spec'] = [analyzer_spec['query_spec']]
         if not isinstance(analyzer_spec['na_spec'], list):

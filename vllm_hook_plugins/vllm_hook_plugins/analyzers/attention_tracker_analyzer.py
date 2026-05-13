@@ -15,25 +15,31 @@ class AttntrackerAnalyzer:
     
     def analyze(
         self,
-        analyzer_spec: Optional[Dict] = None
+        analyzer_spec: Optional[Dict] = None,
+        run_id: Optional[str] = None,
+        probes: Optional[Dict] = None,
     ) -> Optional[Dict]:
-        
-        run_id_file = os.environ.get("VLLM_RUN_ID")
 
-        attention_weights = self.compute_attention_from_qk(run_id_file)
+        attention_weights = self.compute_attention_from_qk(run_id, probes=probes)
         score = self.attn2score(attention_weights, analyzer_spec['input_range'], analyzer_spec['attn_func'])
 
         return {
             "score": score
         }
-        
-            
-    def compute_attention_from_qk(self, run_id_file: str) -> Dict[str, Dict]:
 
-        run_id = latest_run_id(run_id_file)
-        cache = load_and_merge_qk_cache(self.hook_dir, run_id)
-        config = cache["config"]
-        qk_cache = cache["qk_cache"]
+
+    def compute_attention_from_qk(self, run_id: str = None, probes: Optional[Dict] = None) -> Dict[str, Dict]:
+
+        if probes is not None:
+            config = probes["config"]
+            qk_cache = probes["qk_cache"]
+        else:
+            if run_id is None:
+                run_id_file = os.environ.get("VLLM_RUN_ID")
+                run_id = latest_run_id(run_id_file)
+            cache = load_and_merge_qk_cache(self.hook_dir, run_id)
+            config = cache["config"]
+            qk_cache = cache["qk_cache"]
         bs = len(next(iter(qk_cache.values()))['q'])
         batch_attention_weights = [dict() for _ in range(bs)]
 
