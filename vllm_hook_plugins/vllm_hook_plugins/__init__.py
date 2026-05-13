@@ -1,5 +1,6 @@
 from vllm_hook_plugins.registry import PluginRegistry
 from vllm_hook_plugins.hook_llm import HookLLM
+from vllm_hook_plugins.hook_client import HookClient
 from vllm_hook_plugins.workers.probe_hookqk_worker import ProbeHookQKWorker
 from vllm_hook_plugins.workers.steer_activation_worker import SteerHookActWorker
 from vllm_hook_plugins.workers.probe_hidden_states_worker import ProbeHiddenStatesWorker
@@ -23,6 +24,7 @@ def register_plugins():
 __all__ = [
     "PluginRegistry",
     "HookLLM",
+    "HookClient",
     "ProbeHookQKWorker",
     "SteerHookActWorker",
     "ProbeHiddenStatesWorker",
