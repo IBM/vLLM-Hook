@@ -1,3 +1,4 @@
+import copy
 import inspect
 import os
 import json
@@ -112,7 +113,8 @@ class HookLLM:
         elif self.worker_name == "probe_hook_qk":
             # Pass layer_to_heads dict for head-level metadata; worker uses keys for layer filtering.
             extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
-        # steer_hook_act: no output_* key needed — steering fires on every prefill automatically.
+        elif self.worker_name == "steer_hook_act":
+            extra["steer"] = True
 
         if save_to_disk:
             extra["save_to_disk"] = True
@@ -141,6 +143,7 @@ class HookLLM:
         if hook and self.worker_name:
             if run_id is None:
                 run_id = str(uuid.uuid4())
+            sampling_params = copy.copy(sampling_params)
             extra = dict(sampling_params.extra_args or {})
             extra.update(self._build_extra_args(save_to_disk, run_id))
             sampling_params.extra_args = extra

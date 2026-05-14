@@ -34,8 +34,7 @@ class SteerHookActWorker:
             print("no model; skip hooks")
             return
         
-        self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
-        steering_config = self._parse_steering_config()   
+        steering_config = self._parse_steering_config()
         self.steering_method = steering_config["method"]
         self.optimal_layer = steering_config["optimal_layer"]
         self.coefficient = steering_config["coefficient"]
@@ -44,15 +43,22 @@ class SteerHookActWorker:
         vector_path = steering_config["vector_path"]
         if not os.path.exists(vector_path):
             raise FileNotFoundError(f"Steering vector not found at: {vector_path}")
-        steering_data = torch.load(vector_path)
+        steering_data = torch.load(vector_path, weights_only=False)
         self.dir = torch.tensor(steering_data["dir"])
         if self.steering_method == "adjust_rs":
             self.avg_proj = steering_data["avg_proj"]
             self.unit_vector = self.dir # / torch.norm(self.dir)
         
         def steering_hook(input, output):
-            
-            if not os.path.exists(self.hook_flag):
+            # Apply only when at least one request in the batch has steer=True.
+            req_ids = getattr(self.model_runner.input_batch, "req_ids", [])
+            active = False
+            for r in req_ids:
+                req_state = self.model_runner.requests.get(r)
+                if req_state and (req_state.sampling_params.extra_args or {}).get("steer"):
+                    active = True
+                    break
+            if not active:
                 return output
             is_tuple = isinstance(output, tuple)
             if is_tuple:
@@ -100,7 +106,7 @@ class SteerHookActWorker:
                 self._hooks.append(hook)
                 break
 
-        print(f"Installed {len(self._hooks)} hooks on layers: {name}")
+        print(f"Installed {len(self._hooks)} steering hooks on layer: {target_layer_name}")
     
     def _parse_steering_config(self) -> Dict:
         config_path = os.environ.get("VLLM_ACTSTEER_CONFIG")

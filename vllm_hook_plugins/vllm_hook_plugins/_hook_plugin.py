@@ -33,6 +33,7 @@ _original_chat_full_generator: Callable | None = None
 
 _WORKER_EXT_HS = "vllm_hook_plugins.workers.probe_hidden_states_worker.ProbeHiddenStatesWorker"
 _WORKER_EXT_QK = "vllm_hook_plugins.workers.probe_hookqk_worker.ProbeHookQKWorker"
+_WORKER_EXT_STEER = "vllm_hook_plugins.workers.steer_activation_worker.SteerHookActWorker"
 
 
 def _decompress(data: bytes) -> Any:
@@ -75,6 +76,8 @@ def _patched_create_engine_config(self, *args, **kwargs):
         worker_type = os.environ.get("VLLM_HOOK_WORKER", "hidden_states")
         if worker_type == "qk":
             self.worker_extension_cls = _WORKER_EXT_QK
+        elif worker_type == "steer":
+            self.worker_extension_cls = _WORKER_EXT_STEER
         else:
             self.worker_extension_cls = _WORKER_EXT_HS
     self.enforce_eager = True
@@ -121,7 +124,8 @@ async def _patched_generate(
 
     wants_hs = extra.get("output_hidden_states") is not None
     wants_qk = extra.get("output_qk") is not None
-    needs_hooks = wants_hs or wants_qk
+    wants_steer = bool(extra.get("steer"))
+    needs_hooks = wants_hs or wants_qk or wants_steer
     save_to_disk = bool(extra.get("save_to_disk"))
 
     if needs_hooks and not getattr(self, "_vllm_hook_installed", False):
@@ -133,7 +137,7 @@ async def _patched_generate(
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
-            if output.finished and needs_hooks:
+            if output.finished and needs_hooks and not wants_steer:
                 if save_to_disk:
                     import os
                     run_id = extra.get("run_id") or request_id
@@ -158,7 +162,7 @@ async def _patched_generate(
                         output.probes = probes
             yield output
     finally:
-        if needs_hooks and not save_to_disk:
+        if needs_hooks and not wants_steer and not save_to_disk:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
 
 
@@ -184,6 +188,7 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
     needs_hooks = any(
         (sp.extra_args or {}).get("output_hidden_states") is not None
         or (sp.extra_args or {}).get("output_qk") is not None
+        or bool((sp.extra_args or {}).get("steer"))
         for sp in params_list
     )
 
@@ -208,6 +213,7 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
             sp = params_list[idx] if idx < len(params_list) else params_list[0] if params_list else None
             extra = (sp.extra_args if sp is not None else None) or {}
 
+            wants_artifacts = extra.get("output_hidden_states") is not None or extra.get("output_qk") is not None
             if extra.get("save_to_disk"):
                 run_id = extra.get("run_id") or req_id
                 hook_dir = extra.get("hook_dir") or os.environ.get("VLLM_HOOK_DIR", "")
@@ -217,7 +223,7 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
                         "and VLLM_HOOK_DIR env var is not set."
                     )
                 disk_by_run.setdefault(run_id, []).append((req_id, hook_dir))
-            else:
+            elif wants_artifacts:
                 states = self.collective_rpc("get_captured_states", args=(req_id,))
                 parts = [_decompress(s) for s in states if s is not None]
                 if parts:
