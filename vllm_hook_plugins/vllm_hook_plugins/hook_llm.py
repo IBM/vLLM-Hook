@@ -148,7 +148,30 @@ class HookLLM:
             # the caller needing to track it.
             self._last_run_id = run_id
 
-        return self.llm.generate(prompts, sampling_params)
+        outputs = self.llm.generate(prompts, sampling_params)
+
+        if hook and self.worker_name and not save_to_disk and len(outputs) > 1 and getattr(outputs[0], "probes", None) is not None:
+            # Merge per-request probes onto outputs[0] so callers always use
+            # output[0].probes regardless of batch size. q/k_all become lists
+            # of per-request tensors (unbind dim 0), matching the disk format
+            # that unpack_qk expects. k_all varies in seq_len so can't be cat'd.
+            all_probes = [o.probes for o in outputs]
+            merged = {k: v for k, v in all_probes[0].items() if k not in ("qk_cache", "hs_cache")}
+            for cache_key in ("qk_cache", "hs_cache"):
+                if cache_key not in all_probes[0]:
+                    continue
+                merged[cache_key] = {}
+                for layer in all_probes[0][cache_key]:
+                    first = all_probes[0][cache_key][layer]
+                    entry = {k: v for k, v in first.items() if k not in ("q", "k_all", "hs")}
+                    for tensor_key in ("q", "k_all", "hs"):
+                        if tensor_key not in first:
+                            continue
+                        entry[tensor_key] = [p[cache_key][layer][tensor_key][0] for p in all_probes]
+                    merged[cache_key][layer] = entry
+            outputs[0].probes = merged
+
+        return outputs
 
     def analyze(
         self,
@@ -171,11 +194,7 @@ class HookLLM:
             return None
 
         if probes is not None:
-            # In-memory path: inject probes into the analyzer_spec so analyzers
-            # that support it can use them directly.
-            spec = dict(analyzer_spec or {})
-            spec["probes"] = probes
-            return self.analyzer.analyze(spec)
+            return self.analyzer.analyze(analyzer_spec=analyzer_spec, probes=probes)
 
         # Disk path: resolve run_id from args or _last_run_id fallback.
         effective_run_id = run_id or getattr(self, "_last_run_id", None)

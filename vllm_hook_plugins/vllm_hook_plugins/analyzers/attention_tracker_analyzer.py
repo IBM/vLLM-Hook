@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 
-from vllm_hook_plugins.run_utils import latest_run_id, load_and_merge_qk_cache
+from vllm_hook_plugins.run_utils import latest_run_id, load_and_merge_qk_cache, unpack_qk
 
 
 class AttntrackerAnalyzer:
@@ -40,17 +40,17 @@ class AttntrackerAnalyzer:
             cache = load_and_merge_qk_cache(self.hook_dir, run_id)
             config = cache["config"]
             qk_cache = cache["qk_cache"]
-        bs = len(next(iter(qk_cache.values()))['q'])
-        batch_attention_weights = [dict() for _ in range(bs)]
+        batch_attention_weights = None
 
         for layer_name, qk_data in qk_cache.items():
             layer_num = qk_data['layer_num']
-                
             important_head_indices = self.layer_to_heads[layer_num]
-            
-            for i in range(bs):
-                q_last = qk_data['q'][i]  # [4096]
-                k_all = qk_data['k_all'][i]    # [seq_len, 1024]
+            q_list, k_list = unpack_qk(qk_data)
+
+            if batch_attention_weights is None:
+                batch_attention_weights = [dict() for _ in range(len(q_list))]
+
+            for i, (q_last, k_all) in enumerate(zip(q_list, k_list)):
                 
                 seq_len = k_all.shape[0]
                 
@@ -89,28 +89,23 @@ class AttntrackerAnalyzer:
         for attention, input_range in zip(batch_attention, batch_input_range):
             scores = []
             for _, layer_data in attention.items():
-                head_indices = layer_data['head_indices']
-                attention_tensor = layer_data['attention']  # [num_heads, seq_len]
-                
-                for i, _ in enumerate(head_indices):
-                    head_attention = attention_tensor[i, :].numpy()  # [seq_len]
-                    
-                    # Get instruction and data attention
-                    inst_attn = head_attention[input_range[0][0]:input_range[0][1]]
-                    data_attn = head_attention[input_range[1][0]:input_range[1][1]]
-                    
-                    # Calculate score based on function
-                    if "sum" in attn_func:
-                        score = np.sum(inst_attn)
-                    elif "max" in attn_func:
-                        score = np.max(inst_attn)
-                    else: raise NotImplementedError
-                    
-                    if "normalize" in attn_func:
-                        total = np.sum(inst_attn) + np.sum(data_attn) + 1e-8
-                        score = score / total
-                    
-                    scores.append(score)
+                attn_np = layer_data['attention'].numpy()  # [num_heads, seq_len] — single transfer
+
+                inst_attn = attn_np[:, input_range[0][0]:input_range[0][1]]  # [num_heads, inst_len]
+                data_attn = attn_np[:, input_range[1][0]:input_range[1][1]]  # [num_heads, data_len]
+
+                if "sum" in attn_func:
+                    head_scores = inst_attn.sum(axis=1)
+                elif "max" in attn_func:
+                    head_scores = inst_attn.max(axis=1)
+                else:
+                    raise NotImplementedError
+
+                if "normalize" in attn_func:
+                    total = inst_attn.sum(axis=1) + data_attn.sum(axis=1) + 1e-8
+                    head_scores = head_scores / total
+
+                scores.extend(head_scores.tolist())
             batch_scores.append(np.mean(scores))
         return batch_scores
     
