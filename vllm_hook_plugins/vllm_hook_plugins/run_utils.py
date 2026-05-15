@@ -125,11 +125,6 @@ def _artifact_glob(hook_dir: str, run_id: str, filename: str, timeout: float = 0
     return []
 
 
-# Back-compat aliases for existing callsites
-_qk_glob = _artifact_glob
-_hs_glob = _artifact_glob
-
-
 def _load_safetensors_shards(st_paths: List[str], cache_key: str, basename: str,
                               build_entries):
     """Load a list of safetensors files, parse the JSON sidecar for each, and
@@ -247,14 +242,14 @@ def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
     poll_timeout = 5.0 if async_save else 0.0
 
     if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-        st_paths = _hs_glob(hook_dir, run_id, "hidden_states.safetensors", timeout=poll_timeout)
+        st_paths = _artifact_glob(hook_dir, run_id, "hidden_states.safetensors", timeout=poll_timeout)
         if not st_paths:
             raise FileNotFoundError(
                 f"No safetensors artifacts found for run_id={run_id} under {hook_dir}"
             )
         return _load_and_merge_hs_safetensors(hook_dir, run_id, st_paths)
 
-    paths = _hs_glob(hook_dir, run_id, "hidden_states.pt", timeout=poll_timeout)
+    paths = _artifact_glob(hook_dir, run_id, "hidden_states.pt", timeout=poll_timeout)
     if not paths:
         raise FileNotFoundError(
             f"No hidden-state artifacts found for run_id={run_id} under {hook_dir}"
@@ -356,14 +351,14 @@ def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     poll_timeout = 5.0 if async_save else 0.0
 
     if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-        st_paths = _qk_glob(hook_dir, run_id, "qk.safetensors", timeout=poll_timeout)
+        st_paths = _artifact_glob(hook_dir, run_id, "qk.safetensors", timeout=poll_timeout)
         if not st_paths:
             raise FileNotFoundError(
                f"No safetensors artifacts found for run_id={run_id} under {hook_dir}"
             )
         return _load_and_merge_qk_safetensors(hook_dir, run_id, st_paths)
 
-    paths = _qk_glob(hook_dir, run_id, "qk.pt", timeout=poll_timeout)
+    paths = _artifact_glob(hook_dir, run_id, "qk.pt", timeout=poll_timeout)
     if not paths:
         raise FileNotFoundError(
             f"No Q/K cache artifacts found for run_id={run_id} under {hook_dir}"
