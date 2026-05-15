@@ -90,13 +90,35 @@ class CorerAnalyzer:
         config = cache["config"]
         bs = len(next(iter(cache["qk_cache"].values()))['q'])
 
+        # Check if k_all is already fully reconstructed (worker did prefix cache reconstruction).
+        # When prefix caching is active, k_all is much longer than q (worker prepended cached keys).
+        # When prefix caching is off, k_all and q have the same length per request.
+        first_layer = list(cache["qk_cache"].keys())[0]
+        k_all_full = False
         if past_prefill is not None:
+            na_k = cache["qk_cache"][first_layer]['k_all'][0].shape[0]
+            na_q = cache["qk_cache"][first_layer]['q'][0].shape[0]
+            k_all_full = na_k > na_q  # worker reconstructed prefix, k_all is longer than q
+
+        if past_prefill is not None and not k_all_full:
             qk_cache = {}
             masks = [~torch.isnan(cache["qk_cache"][list(cache["qk_cache"].keys())[0]]['q'][i]).any(dim=1) for i in range(bs)]
             for module_name in past_prefill.keys():
+                merged_q = []
+                merged_k = []
+                for prefill_q, prefill_k, cache_q, cache_k, mask in zip(
+                    past_prefill[module_name]['q'],
+                    past_prefill[module_name]['k_all'],
+                    cache["qk_cache"][module_name]['q'],
+                    cache["qk_cache"][module_name]['k_all'],
+                    masks,
+                ):
+                    valid_q = cache_q[mask]
+                    merged_q.append(torch.cat([prefill_q, valid_q], dim=0))
+                    merged_k.append(torch.cat([prefill_k, cache_k[mask]], dim=0))
                 qk_cache[module_name] = {
-                    'q': [torch.cat([prefill_q, cache_q[mask]], dim=0) for prefill_q, cache_q, mask in zip(past_prefill[module_name]['q'], cache["qk_cache"][module_name]['q'], masks)],
-                    'k_all': [torch.cat([prefill_k, cache_k[mask]], dim=0) for prefill_k, cache_k, mask in zip(past_prefill[module_name]['k_all'], cache["qk_cache"][module_name]['k_all'], masks)],
+                    'q': merged_q,
+                    'k_all': merged_k,
                     'layer_num': past_prefill[module_name]['layer_num']
                 }
         else:
@@ -111,11 +133,22 @@ class CorerAnalyzer:
         for module_name, qk_data in qk_cache.items():
             layer_num = qk_data['layer_num']
 
-            if past_prefill is not None:
+            k_all = qk_data['k_all']    # [seq_len, 1024]
+
+            if past_prefill is not None and not k_all_full:
+                # Legacy path: q was merged with prefill, use relative indices
                 q_query = [qk_data['q'][i][:query_end_tok_idx[i]-query_start_tok_idx[i]+1, :] for i in range(bs)]
             else:
-                q_query = [qk_data['q'][i][query_start_tok_idx[i]:query_end_tok_idx[i]+1, :] for i in range(bs)]  # [query_len, 4096]
-            k_all = qk_data['k_all']    # [seq_len, 1024]
+                # k_all is full (either no past_prefill or worker already reconstructed prefix).
+                # q may only have new tokens — compute offset from k_all vs q lengths.
+                q_query = []
+                for i in range(bs):
+                    q_len = qk_data['q'][i].shape[0]
+                    k_len = k_all[i].shape[0]
+                    offset = k_len - q_len  # number of prefix-cached tokens not in q
+                    qs = max(0, query_start_tok_idx[i] - offset)
+                    qe = max(0, query_end_tok_idx[i] - offset) + 1
+                    q_query.append(qk_data['q'][i][qs:qe, :])
 
             if past_prefill is None:
                 prefill_qk_cache[module_name] = {

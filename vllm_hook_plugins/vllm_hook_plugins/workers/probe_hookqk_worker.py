@@ -35,7 +35,7 @@ def match_attn(name: str):
 
 
 def _read_cached_keys(
-    attn_module,
+    module_name,
     attn_metadata,
     req_idx: int,
     num_cached: int,
@@ -52,9 +52,10 @@ def _read_cached_keys(
     new-tokens-only capture).
     """
     try:
-        virtual_engine = get_forward_context().virtual_engine
-        # kv_cache shape: [2, num_blocks, block_size, num_kv_heads, head_size]
-        kv_cache = attn_module.kv_cache[virtual_engine]
+        ctx = get_forward_context()
+        # kv_cache is bound to the vLLM Attention wrapper in the forward context,
+        # not to the PyTorch module. Access via no_compile_layers[layer_name].kv_cache.
+        kv_cache = ctx.no_compile_layers[module_name].kv_cache
         key_cache = kv_cache[0]  # [num_blocks, block_size, num_kv_heads, head_size]
 
         block_size   = key_cache.shape[1]
@@ -254,7 +255,7 @@ class ProbeHookQKWorker:
                         query_len = end - start
                         num_cached = total_len - query_len
                         if num_cached > 0:
-                            prefix_k = _read_cached_keys(attn_module, metadata if not isinstance(metadata, dict) else next(iter(metadata.values())), i, num_cached, total_len)
+                            prefix_k = _read_cached_keys(module_name, metadata if not isinstance(metadata, dict) else next(iter(metadata.values())), i, num_cached, total_len)
                             if prefix_k is not None:
                                 k_tok = torch.cat([prefix_k.to(k_tok.device, dtype=k_tok.dtype), k_tok], dim=0)
                     except Exception:

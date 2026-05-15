@@ -108,6 +108,7 @@ class HookClient:
         self,
         analyzer_spec: Optional[Dict] = None,
         run_id: Optional[str] = None,
+        run_ids: Optional[List[str]] = None,
     ) -> Optional[Dict]:
         """Run the configured analyzer on the last generate() result.
 
@@ -116,15 +117,21 @@ class HookClient:
 
         Disk path (save_to_disk=True): reads artifacts from hook_dir/run_id,
         runs analyzer. Falls back to last generate()'s run_id if omitted.
+        For two-pass analyzers (CoRer), pass run_ids=[pass1_id, pass2_id].
         """
         if self._last_response is None:
             raise RuntimeError("No generate() call has been made yet.")
 
         if self._last_save_to_disk:
+            import inspect
             effective_run_id = run_id or self._last_run_id
-            if effective_run_id is None:
-                raise ValueError("run_id required for disk path but none was set.")
-            return self.analyzer.analyze(analyzer_spec, run_id=effective_run_id)
+            sig = inspect.signature(self.analyzer.analyze)
+            kwargs = {"analyzer_spec": analyzer_spec}
+            if "run_ids" in sig.parameters and run_ids is not None:
+                kwargs["run_ids"] = run_ids
+            elif "run_id" in sig.parameters and effective_run_id is not None:
+                kwargs["run_id"] = effective_run_id
+            return self.analyzer.analyze(**kwargs)
 
         # In-memory path: probes come back in response.probes as serialized JSON.
         raw_probes = getattr(self._last_response, "probes", None)
