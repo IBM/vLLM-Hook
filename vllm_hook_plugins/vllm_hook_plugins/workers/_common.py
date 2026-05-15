@@ -98,3 +98,61 @@ def init_async_save_thread(worker, target, thread_name: str) -> None:
     worker._io_thread = threading.Thread(target=target, daemon=True, name=thread_name)
     worker._io_thread.start()
     worker._io_thread_started = True
+
+
+def iter_matched_modules(model, match_fn, layer_filter=None):
+    """Yield (name, module, layer_num) for modules matching ``match_fn``.
+
+    ``match_fn(name)`` returns the layer index or None. ``layer_filter`` is
+    optional; when truthy, only modules whose layer index is in the filter
+    set are yielded. ``layer_filter`` is checked with ``layer_num in filter``.
+    """
+    for name, module in model.named_modules():
+        layer_num = match_fn(name)
+        if layer_num is None:
+            continue
+        if layer_filter and layer_num not in layer_filter:
+            continue
+        yield name, module, layer_num
+
+
+def save_safetensors_atomic(flat_dict: dict, meta: dict, run_dir: str, basename: str) -> None:
+    """Write ``flat_dict`` to ``{run_dir}/{basename}.safetensors`` and ``meta``
+    to ``{run_dir}/{basename}.json``, both via tmp+rename for atomicity.
+    """
+    import json as _json
+    from safetensors.torch import save_file as _st_save
+
+    out_path = os.path.join(run_dir, f"{basename}.safetensors")
+    meta_path = os.path.join(run_dir, f"{basename}.json")
+    tmp_st = out_path + ".tmp"
+    tmp_meta = meta_path + ".tmp"
+
+    _st_save(flat_dict, tmp_st)
+    os.rename(tmp_st, out_path)
+
+    with open(tmp_meta, "w") as f:
+        _json.dump(meta, f)
+    os.rename(tmp_meta, meta_path)
+
+
+def background_save_loop(worker, pt_filename: str) -> None:
+    """Drain ``worker._save_queue`` and write artifacts to disk.
+
+    Activated by VLLM_HOOK_ASYNC_SAVE=1. Each queue item is
+    (run_id, cpu_cache, run_dir). Workers must define
+    ``_save_safetensors(cpu_cache, run_dir)`` — used when
+    VLLM_HOOK_USE_SAFETENSORS=1.
+    """
+    while True:
+        run_id, cpu_cache, run_dir = worker._save_queue.get()
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
+                worker._save_safetensors(cpu_cache, run_dir)
+            else:
+                save_pt_atomic(cpu_cache, os.path.join(run_dir, pt_filename))
+        except Exception as e:
+            print(f"background save failed for {run_id}: {e}")
+        finally:
+            worker._save_queue.task_done()

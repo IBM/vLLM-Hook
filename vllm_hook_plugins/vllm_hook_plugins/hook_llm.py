@@ -1,5 +1,4 @@
 import copy
-import inspect
 import os
 import json
 import uuid
@@ -8,6 +7,7 @@ os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 from vllm import LLM, SamplingParams
 from vllm_hook_plugins.registry import PluginRegistry
+from vllm_hook_plugins.run_utils import dispatch_disk_analyze
 
 class HookLLM:
     def __init__(
@@ -201,16 +201,8 @@ class HookLLM:
 
         # Disk path: resolve run_id from args or _last_run_id fallback.
         effective_run_id = run_id or getattr(self, "_last_run_id", None)
-        effective_run_ids = run_ids
-
-        sig = inspect.signature(self.analyzer.analyze)
-        kwargs = {"analyzer_spec": analyzer_spec}
-        if "run_ids" in sig.parameters and effective_run_ids is not None:
-            kwargs["run_ids"] = effective_run_ids
-        elif "run_id" in sig.parameters and effective_run_id is not None:
-            kwargs["run_id"] = effective_run_id
-
-        return self.analyzer.analyze(**kwargs)
+        return dispatch_disk_analyze(self.analyzer, analyzer_spec,
+                                     run_id=effective_run_id, run_ids=run_ids)
 
     def __del__(self):
         from vllm_hook_plugins.shm_utils import teardown_shm

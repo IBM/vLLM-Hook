@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from vllm_hook_plugins.run_utils import dispatch_disk_analyze
+
 
 class HookClient:
     def __init__(
@@ -123,15 +125,9 @@ class HookClient:
             raise RuntimeError("No generate() call has been made yet.")
 
         if self._last_save_to_disk:
-            import inspect
             effective_run_id = run_id or self._last_run_id
-            sig = inspect.signature(self.analyzer.analyze)
-            kwargs = {"analyzer_spec": analyzer_spec}
-            if "run_ids" in sig.parameters and run_ids is not None:
-                kwargs["run_ids"] = run_ids
-            elif "run_id" in sig.parameters and effective_run_id is not None:
-                kwargs["run_id"] = effective_run_id
-            return self.analyzer.analyze(**kwargs)
+            return dispatch_disk_analyze(self.analyzer, analyzer_spec,
+                                         run_id=effective_run_id, run_ids=run_ids)
 
         # In-memory path: probes come back in response.probes as serialized JSON.
         raw_probes = getattr(self._last_response, "probes", None)

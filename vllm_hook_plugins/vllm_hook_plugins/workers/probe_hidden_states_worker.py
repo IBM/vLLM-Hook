@@ -9,11 +9,14 @@ from vllm.forward_context import get_forward_context
 from vllm.distributed import parallel_state as ps
 
 from vllm_hook_plugins.workers._common import (
+    background_save_loop,
     clear_states_for_req,
     get_query_metadata,
     init_async_save_thread,
+    iter_matched_modules,
     iter_matching_req_ids,
     save_pt_atomic,
+    save_safetensors_atomic,
 )
 
 if TYPE_CHECKING:
@@ -201,20 +204,16 @@ class ProbeHiddenStatesWorker:
                     layer_states[module_name] = {"hidden_states": [], "layer_num": layer_num, "hs_mode": req_mode}
                 layer_states[module_name]["hidden_states"].append(activation)
 
-        # layer numbers follow the HuggingFace/Eagle convention:
-        # layer N = output after the Nth transformer block (1-based).
-        # PyTorch module names are 0-based, so layer N maps to model.layers.N-1.
-        self._hooks = []
-        matched = []
         # When target_layers is empty (API path, no VLLM_HOOK_LAYERS env var),
         # hook every decoder layer. Per-request filtering via extra_args['output_hidden_states']
         # happens inside the hook closure.
-        for name, module in model.named_modules():
-            layer_num = match_layer(name)
-            if layer_num is None:
-                continue
-            if self.target_layers and (layer_num + 1) not in self.target_layers:
-                continue
+        # target_layers uses the HuggingFace/Eagle 1-based convention (layer N = output
+        # after the Nth transformer block), but iter_matched_modules / match_layer return
+        # 0-based PyTorch indices (model.layers.N-1). Subtract 1 to align them.
+        layer_filter_0based = {l - 1 for l in self.target_layers} if self.target_layers else None
+        self._hooks = []
+        matched = []
+        for name, module, layer_num in iter_matched_modules(model, match_layer, layer_filter_0based):
             hook = module.register_forward_hook(
                 lambda m, i, o, n=name, ln=layer_num+1: hs_hook(o, n, ln)
             )
@@ -312,7 +311,7 @@ class ProbeHiddenStatesWorker:
         return found_any
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
-        """Optionally write cpu_cache as a safetensors file + JSON sidecar.
+        """Write cpu_cache as a safetensors file + JSON sidecar.
 
         last_token mode: tensors are (hidden_size,) per prompt — stacked to
           (bs, hidden_size).
@@ -320,13 +319,7 @@ class ProbeHiddenStatesWorker:
           seq_len — padded to (bs, max_seq_len, hidden_size) and seq_lens
           stored in the sidecar JSON so the reader can unpad.
         """
-        import json as _json
         from torch.nn.utils.rnn import pad_sequence
-        from safetensors.torch import save_file as _st_save
-
-        out_path = os.path.join(run_dir, "hidden_states.safetensors")
-        tmp_path = out_path + ".tmp"
-        meta_path = os.path.join(run_dir, "hidden_states.json")
 
         flat_dict: dict = {}
         layer_order: list = []
@@ -336,17 +329,13 @@ class ProbeHiddenStatesWorker:
         for mod_name, entry in cpu_cache["hs_cache"].items():
             hs_list = entry["hidden_states"]
             safe_key = mod_name.replace(".", "__")
-            # Use per-layer stashed mode (falls back to worker default).
             mode = entry.get("hs_mode", self.hs_mode)
 
             if mode == "all_tokens":
-                # Variable seq_len per prompt — pad to (bs, max_seq_len, hidden_size)
-                # pad_sequence expects (seq_len, hidden_size) inputs, pads along dim 0
                 stacked = pad_sequence(hs_list, batch_first=True)  # (bs, max_seq, hidden)
                 if not seq_lens:
                     seq_lens = [t.shape[0] for t in hs_list]
             else:
-                # last_token: uniform (hidden_size,) per prompt
                 stacked = torch.stack(hs_list)  # (bs, hidden_size)
 
             batch_size = stacked.shape[0]
@@ -358,41 +347,18 @@ class ProbeHiddenStatesWorker:
                 "hs_mode": mode,
             })
 
-        _st_save(flat_dict, tmp_path)
-        os.rename(tmp_path, out_path)
-
         meta: dict = {
             "config": cpu_cache["config"],
             "layer_order": layer_order,
             "batch_size": batch_size,
-            "hs_mode": self.hs_mode,  # worker default for reference
+            "hs_mode": self.hs_mode,
             "peak_gpu_mb": cpu_cache.get("peak_gpu_mb", 0.0),
             "tp_rank": int(ps.get_tensor_model_parallel_rank()),
         }
         if seq_lens:
             meta["seq_lens"] = seq_lens
-
-        meta_tmp = meta_path + ".tmp"
-        with open(meta_tmp, "w") as f:
-            _json.dump(meta, f)
-        os.rename(meta_tmp, meta_path)
+        save_safetensors_atomic(flat_dict, meta, run_dir, "hidden_states")
 
     def _background_save_loop(self):
-        """Drain the save queue and write artifacts to disk.
-
-        Activated when VLLM_HOOK_ASYNC_SAVE=1. Runs as a daemon thread in the
-        worker subprocess. Each item is (run_id, cpu_cache, run_dir).
-        """
-        while True:
-            run_id, cpu_cache, run_dir = self._save_queue.get()
-            try:
-                os.makedirs(run_dir, exist_ok=True)
-                if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-                    self._save_safetensors(cpu_cache, run_dir)
-                else:
-                    save_pt_atomic(cpu_cache, os.path.join(run_dir, "hidden_states.pt"))
-            except Exception as e:
-                print(f"background save failed for {run_id}: {e}")
-            finally:
-                self._save_queue.task_done()
+        background_save_loop(self, "hidden_states.pt")
 

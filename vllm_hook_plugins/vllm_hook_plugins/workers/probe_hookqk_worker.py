@@ -9,11 +9,14 @@ from vllm.forward_context import get_forward_context
 from vllm.distributed import parallel_state as ps
 
 from vllm_hook_plugins.workers._common import (
+    background_save_loop,
     clear_states_for_req,
     get_query_metadata,
     init_async_save_thread,
+    iter_matched_modules,
     iter_matching_req_ids,
     save_pt_atomic,
+    save_safetensors_atomic,
 )
 
 if TYPE_CHECKING:
@@ -255,24 +258,18 @@ class ProbeHookQKWorker:
                 layer_states[module_name]["q"].append(q_tok)
                 layer_states[module_name]["k_all"].append(k_tok)
 
-        # register hooks on attention modules 
-        self._hooks = []
-        matched = []
         # When important_layers is empty (API path, no VLLM_HOOK_LAYER_HEADS env var),
         # hook every attention module. Per-request filtering via extra_args['output_qk']
         # happens inside the hook closure.
-        for name, module in model.named_modules():
-            layer_num = match_attn(name)
-            if layer_num is None: # not an attention module
-                continue
-            if self.important_layers and layer_num not in self.important_layers:
-                continue
+        self._hooks = []
+        matched = []
+        for name, module, _ in iter_matched_modules(model, match_attn, self.important_layers):
             hook = module.register_forward_hook(
                 lambda _m, i, _o, n=name: qkv_hook(i, n, _m)
             )
             self._hooks.append(hook)
             matched.append(name)
-        
+
         print(f"Installed {len(self._hooks)} hooks on layers: {matched}")
 
     def _parse_layer_heads(self) -> Dict[int, List[int]]:
@@ -372,18 +369,18 @@ class ProbeHookQKWorker:
         return found_any
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
-        import json as _json
+        # safetensors stores fixed-shape tensors only, so per-request variable-length
+        # q/k_all are padded into a single batched tensor and unpadded on load using
+        # the seq_lens stored in the JSON sidecar. q and k_all may have different
+        # lengths when prefix caching is active (q = new tokens, k_all = new+cached),
+        # so we track q_seq_lens and k_seq_lens separately.
         from torch.nn.utils.rnn import pad_sequence
-        from safetensors.torch import save_file as _st_save
-
-        out_path = os.path.join(run_dir, "qk.safetensors")
-        tmp_path = out_path + ".tmp"
-        meta_path = os.path.join(run_dir, "qk.json")
 
         flat_dict: dict = {}
         layer_order: list = []
         batch_size = 0
-        seq_lens: list = []
+        q_seq_lens: list = []  # only populated for all_tokens mode (q is 2D then)
+        k_seq_lens: list = []  # always populated (k_all is always 2D)
 
         for mod_name, entry in cpu_cache["qk_cache"].items():
             safe_key_q = mod_name.replace(".", "__") + "__q"
@@ -393,15 +390,14 @@ class ProbeHookQKWorker:
             if mode == "all_tokens":
                 flat_dict[safe_key_q] = pad_sequence(entry['q'], batch_first=True)
                 flat_dict[safe_key_k] = pad_sequence(entry['k_all'], batch_first=True)
-                if not seq_lens:
-                    seq_lens = [t.shape[0] for t in entry['q']]
+                if not q_seq_lens:
+                    q_seq_lens = [t.shape[0] for t in entry['q']]
             else:
-                # last_token: q is 1D (head_dim,) per request; k_all is 2D (seq_len, head_dim)
-                # with variable seq_len across the batch — pad k, stack q.
+                # last_token: q is 1D (head_dim,) per request — stack instead of pad.
                 flat_dict[safe_key_q] = torch.stack(entry['q'])
                 flat_dict[safe_key_k] = pad_sequence(entry['k_all'], batch_first=True)
-                if not seq_lens:
-                    seq_lens = [t.shape[0] for t in entry['k_all']]
+            if not k_seq_lens:
+                k_seq_lens = [t.shape[0] for t in entry['k_all']]
 
             batch_size = flat_dict[safe_key_q].shape[0]
             layer_order.append({
@@ -412,9 +408,6 @@ class ProbeHookQKWorker:
                 "hookq_mode": mode,
             })
 
-        _st_save(flat_dict, tmp_path)
-        os.rename(tmp_path, out_path)
-
         meta = {
             "config": cpu_cache["config"],
             "layer_order": layer_order,
@@ -422,29 +415,12 @@ class ProbeHookQKWorker:
             "hookq_mode": self.hookq_mode,
             "tp_rank": int(ps.get_tensor_model_parallel_rank()),
         }
-        if seq_lens:
-            meta["seq_lens"] = seq_lens
-        meta_tmp = meta_path + ".tmp"
-        with open(meta_tmp, "w") as f:
-            _json.dump(meta, f)
-        os.rename(meta_tmp, meta_path)
+        if q_seq_lens:
+            meta["q_seq_lens"] = q_seq_lens
+        if k_seq_lens:
+            meta["k_seq_lens"] = k_seq_lens
+        save_safetensors_atomic(flat_dict, meta, run_dir, "qk")
 
     def _background_save_loop(self):
-        """Drain the save queue and write artifacts to disk.
-
-        Activated when VLLM_HOOK_ASYNC_SAVE=1. Runs as a daemon thread in the
-        worker subprocess. Each item is (run_id, cpu_cache, run_dir).
-        """
-        while True:
-            run_id, cpu_cache, run_dir = self._save_queue.get()
-            try:
-                os.makedirs(run_dir, exist_ok=True)
-                if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
-                    self._save_safetensors(cpu_cache, run_dir)
-                else:
-                    save_pt_atomic(cpu_cache, os.path.join(run_dir, "qk.pt"))
-            except Exception as e:
-                print(f"background save failed for {run_id}: {e}")
-            finally:
-                self._save_queue.task_done()
+        background_save_loop(self, "qk.pt")
 
