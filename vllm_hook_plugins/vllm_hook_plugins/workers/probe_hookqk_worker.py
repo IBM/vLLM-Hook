@@ -1,14 +1,20 @@
 import os
 import math
 import pickle
-import queue
 import re
-import threading
 import torch
 from typing import TYPE_CHECKING, Any, Dict, List
 import zstandard as zstd
 from vllm.forward_context import get_forward_context
 from vllm.distributed import parallel_state as ps
+
+from vllm_hook_plugins.workers._common import (
+    clear_states_for_req,
+    get_query_metadata,
+    init_async_save_thread,
+    iter_matching_req_ids,
+    save_pt_atomic,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ParallelConfig
@@ -119,16 +125,7 @@ class ProbeHookQKWorker:
         self.important_layers = set(self.layer_to_heads.keys())
 
         # Background I/O thread (shared by all disk-save requests on this worker).
-        if os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1":
-            if not getattr(self, '_io_thread_started', False):
-                self._save_queue: queue.Queue = queue.Queue(maxsize=4)
-                self._io_thread = threading.Thread(
-                    target=self._background_save_loop,
-                    daemon=True,
-                    name="vllm-hook-qk-io",
-                )
-                self._io_thread.start()
-                self._io_thread_started = True
+        init_async_save_thread(self, self._background_save_loop, "vllm-hook-qk-io")
 
         cfg = model.config
         text_cfg = getattr(cfg, "text_config", cfg)
@@ -164,20 +161,7 @@ class ProbeHookQKWorker:
             if torch.cuda.is_current_stream_capturing():
                 return None
 
-            # The HS worker hooks on "model.layers.<i>", so we look up the corresponding attention key.
-            # query_start_loc is the cumulative sum of per-request *query* token counts (shape [bs+1]).
-            # Unlike cumsum(seq_lens), it excludes prefix-cached tokens and is always within hidden.shape[0].
-            # For hybrid models (e.g. Qwen3.5), linear_attention layers have no entry in the metadata dict under their own key,
-            # so we grab query_start_loc from any available entry rather than only the current layer's key.
-            query_start_loc = getattr(metadata, "query_start_loc", None)
-            seq_lens = getattr(metadata, "seq_lens", None)
-            if query_start_loc is None and isinstance(metadata, dict):
-                for entry in metadata.values():
-                    query_start_loc = getattr(entry, "query_start_loc", None)
-                    if query_start_loc is not None:
-                        seq_lens = getattr(entry, "seq_lens", None)
-                        break
-
+            query_start_loc, seq_lens = get_query_metadata(metadata)
             if query_start_loc is None:
                 return
 
@@ -321,33 +305,25 @@ class ProbeHookQKWorker:
         CPU transfer happens here (once per request, not per hook).
         Returns zstd-compressed pickle, or None if nothing was captured.
         """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_states):
-            if req_id == external_req_id or req_id.startswith(prefix):
-                layer_dict = self._captured_states.pop(req_id)
-                cpu_dict = {}
-                for mod_name, entry in layer_dict.items():
-                    from torch.nn.utils.rnn import pad_sequence
-                    mode = entry.get("hookq_mode", self.hookq_mode)
-                    if mode == "all_tokens":
-                        q_stacked = pad_sequence([t.cpu() for t in entry["q"]], batch_first=True)
-                    else:
-                        q_stacked = torch.stack([t.cpu() for t in entry["q"]])
-                    k_stacked = pad_sequence([t.cpu() for t in entry["k_all"]], batch_first=True)
-                    cpu_dict[mod_name] = {"q": q_stacked, "k_all": k_stacked, "layer_num": entry["layer_num"], "hookq_mode": mode}
-                payload = {
-                    "qk_cache": cpu_dict,
-                    "config": self._conf,
-                }
-                return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
+        for req_id in iter_matching_req_ids(self._captured_states, external_req_id):
+            layer_dict = self._captured_states.pop(req_id)
+            cpu_dict = {}
+            for mod_name, entry in layer_dict.items():
+                from torch.nn.utils.rnn import pad_sequence
+                mode = entry.get("hookq_mode", self.hookq_mode)
+                if mode == "all_tokens":
+                    q_stacked = pad_sequence([t.cpu() for t in entry["q"]], batch_first=True)
+                else:
+                    q_stacked = torch.stack([t.cpu() for t in entry["q"]])
+                k_stacked = pad_sequence([t.cpu() for t in entry["k_all"]], batch_first=True)
+                cpu_dict[mod_name] = {"q": q_stacked, "k_all": k_stacked, "layer_num": entry["layer_num"], "hookq_mode": mode}
+            payload = {"qk_cache": cpu_dict, "config": self._conf}
+            return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured states without returning them (cleanup on abort/disconnect)."""
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_states):
-            if req_id == external_req_id or req_id.startswith(prefix):
-                del self._captured_states[req_id]
+        clear_states_for_req(self._captured_states, external_req_id)
 
     def flush_disk(self, external_req_ids: list, run_id: str, hook_dir: str) -> bool:
         """Write captured Q/K for all requests in the batch to one artifact.
@@ -362,10 +338,7 @@ class ProbeHookQKWorker:
         found_any = False
 
         for external_req_id in external_req_ids:
-            prefix = f"{external_req_id}-"
-            for req_id in list(self._disk_states):
-                if req_id != external_req_id and not req_id.startswith(prefix):
-                    continue
+            for req_id in iter_matching_req_ids(self._disk_states, external_req_id):
                 layer_dict = self._disk_states.pop(req_id)
                 if not layer_dict:
                     continue
@@ -395,13 +368,7 @@ class ProbeHookQKWorker:
         elif os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
             self._save_safetensors(cpu_cache, run_dir)
         else:
-            out_path = os.path.join(run_dir, "qk.pt")
-            tmp_path = out_path + ".tmp"
-            with open(tmp_path, "wb") as f:
-                torch.save(cpu_cache, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.rename(tmp_path, out_path)
+            save_pt_atomic(cpu_cache, os.path.join(run_dir, "qk.pt"))
         return found_any
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
@@ -475,13 +442,7 @@ class ProbeHookQKWorker:
                 if os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1":
                     self._save_safetensors(cpu_cache, run_dir)
                 else:
-                    out_path = os.path.join(run_dir, "qk.pt")
-                    tmp_path = out_path + ".tmp"
-                    with open(tmp_path, "wb") as f:
-                        torch.save(cpu_cache, f)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.rename(tmp_path, out_path)
+                    save_pt_atomic(cpu_cache, os.path.join(run_dir, "qk.pt"))
             except Exception as e:
                 print(f"background save failed for {run_id}: {e}")
             finally:
