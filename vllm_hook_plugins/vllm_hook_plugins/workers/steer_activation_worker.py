@@ -3,6 +3,36 @@ import json
 import torch
 from typing import Dict, Optional
 from vllm.v1.worker.gpu_worker import Worker as V1Worker
+from vllm.forward_context import get_forward_context
+
+
+def _last_token_indices(residuals: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return per-sequence last-query-token indices into the flat residuals.
+
+    Returns None when no real forward is in flight (warmup, CUDA graph
+    capture, or absent attn_metadata) so the caller can no-op.
+
+    Hybrid-model note: in models like Qwen3.5, linear-attention layers may
+    have no entry under their own key, so query_start_loc is taken from any
+    available metadata entry (the query layout is shared across layers).
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    ctx = get_forward_context()
+    metadata = getattr(ctx, "attn_metadata", None)
+    if metadata is None:
+        return None
+
+    query_start_loc = getattr(metadata, "query_start_loc", None)
+    if query_start_loc is None and isinstance(metadata, dict):
+        for entry in metadata.values():
+            query_start_loc = getattr(entry, "query_start_loc", None)
+            if query_start_loc is not None:
+                break
+    if query_start_loc is None:
+        return None
+
+    return query_start_loc[1:] - 1
 
 
 class SteerHookActWorker(V1Worker):
@@ -56,9 +86,23 @@ class SteerHookActWorker(V1Worker):
             if self.steering_method == "add_vector":
                 if self.apply_at_all_positions:
                     steering_vec = steering_vec.view(1, -1)
+                    residuals = residuals + self.coefficient * steering_vec
                 else:
-                    raise NotImplementedError("Only supports apply_at_all_positions=True for now.")
-                residuals = residuals + self.coefficient * steering_vec
+                    # Last-token-per-sequence steering. Mirrors the `last_token`
+                    # idiom used by probe_hidden_states_worker: in vLLM v1 the
+                    # decoder-block output is flattened to [total_tokens, hidden]
+                    # and query_start_loc[i+1]-1 is the last query-token index
+                    # of sequence i (works uniformly for prefill, decode, and
+                    # mixed batches; matches HF-hook "score at final position"
+                    # semantics used by many steering-vector papers).
+                    last_indices = _last_token_indices(residuals)
+                    if last_indices is None:
+                        # Warmup / CUDA graph capture / non-attention pass.
+                        return output
+                    residuals = residuals.clone()
+                    residuals[last_indices] = (
+                        residuals[last_indices] + self.coefficient * steering_vec
+                    )
                 
             elif self.steering_method == "adjust_rs":
                 unit_vec = self.unit_vector.to(residuals.device, dtype=residuals.dtype)
