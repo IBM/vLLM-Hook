@@ -38,6 +38,12 @@ Key takeaways:
 
 ---
 
+## 🧩 Supported Configurations
+
+Each use case (e.g. attention tracker, activation steering, hidden states extraction, etc) runs across a Cartesian product of configuration axes — execution path (`offline` / `vllm serve`), storage (`rpc` / `disk` / `shm`), disk format (`pt` / `safetensors`), and save mode (`sync` / `async`). See [`configs.md`](configs.md) for code snippets showing how to select each config.
+
+---
+
 ## 📦 Installation
 ### 1. Clone the repository
 
