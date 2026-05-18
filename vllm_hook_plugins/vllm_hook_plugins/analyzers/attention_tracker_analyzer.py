@@ -1,10 +1,9 @@
-import os
 import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 
-from vllm_hook_plugins.run_utils import latest_run_id, load_and_merge_qk_cache, unpack_qk
+from vllm_hook_plugins.run_utils import load_and_merge_qk_cache, unpack_qk
 
 
 class AttntrackerAnalyzer:
@@ -35,8 +34,7 @@ class AttntrackerAnalyzer:
             qk_cache = probes["qk_cache"]
         else:
             if run_id is None:
-                run_id_file = os.environ.get("VLLM_RUN_ID")
-                run_id = latest_run_id(run_id_file)
+                raise ValueError("compute_attention_from_qk: pass either probes= or run_id=.")
             cache = load_and_merge_qk_cache(self.hook_dir, run_id)
             config = cache["config"]
             qk_cache = cache["qk_cache"]

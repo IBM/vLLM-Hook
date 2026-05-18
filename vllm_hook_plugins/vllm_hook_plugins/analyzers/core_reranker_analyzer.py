@@ -1,10 +1,9 @@
-import os
 import torch
 from typing import Dict, List, Tuple, Optional
 import glob
 import math
 
-from vllm_hook_plugins.run_utils import read_run_ids, load_and_merge_qk_cache
+from vllm_hook_plugins.run_utils import load_and_merge_qk_cache
 
 class CorerAnalyzer:
      
@@ -22,13 +21,10 @@ class CorerAnalyzer:
         Args:
             analyzer_spec: dict with 'query_spec' and 'na_spec' token ranges.
             run_ids: [doc_run_id, na_run_id] — the run IDs from the document
-                pass and the NA (not-applicable) pass respectively. If omitted,
-                falls back to reading the last two run IDs from VLLM_RUN_ID
-                (legacy behavior).
+                pass and the NA (not-applicable) pass respectively.
         """
-        if run_ids is None:
-            run_id_file = os.environ.get("VLLM_RUN_ID")
-            run_ids = read_run_ids(run_id_file)
+        if run_ids is None or len(run_ids) < 2:
+            raise ValueError("CorerAnalyzer.analyze: pass run_ids=[doc_run_id, na_run_id].")
 
         if not isinstance(analyzer_spec['query_spec'], list):
             analyzer_spec['query_spec'] = [analyzer_spec['query_spec']]

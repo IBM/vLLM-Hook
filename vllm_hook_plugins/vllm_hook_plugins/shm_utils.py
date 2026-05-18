@@ -98,14 +98,15 @@ def teardown_shm(shm: Optional[Any]) -> None:
         pass
 
 
-def load_from_shm(hook_dir: str, run_id_file: str) -> Dict:
+def load_from_shm(hook_dir: str, run_id: Optional[str] = None) -> Dict:
     """Read tensors directly from the shared memory block.
 
     Polls for the ready flag written by the worker, then reads the buffer
     using the layout: [0:4] uint32 num_layers, [4:8] uint32 batch_size,
     [8:] float16 data row-major (layer_slot, batch_item, hidden_dim).
 
-    Optionally persists the artifact to disk when VLLM_HOOK_SHM_PERSIST=1.
+    Optionally persists the artifact to disk when VLLM_HOOK_SHM_PERSIST=1
+    (requires ``run_id`` to be provided).
     """
     import torch
     from multiprocessing.shared_memory import SharedMemory
@@ -149,8 +150,8 @@ def load_from_shm(hook_dir: str, run_id_file: str) -> Dict:
     shm.close()
 
     if os.environ.get("VLLM_HOOK_SHM_PERSIST", "0") == "1":
-        from vllm_hook_plugins.run_utils import latest_run_id
-        run_id = latest_run_id(run_id_file)
+        if not run_id:
+            raise ValueError("VLLM_HOOK_SHM_PERSIST=1 requires a run_id passed to load_from_shm.")
         run_dir = os.path.join(hook_dir, run_id, "tp_rank_0")
         os.makedirs(run_dir, exist_ok=True)
         out_path = os.path.join(run_dir, "hidden_states.pt")

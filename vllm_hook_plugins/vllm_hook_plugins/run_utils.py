@@ -84,21 +84,6 @@ def unpack_qk(entry: dict) -> "tuple[List[Any], List[Any]]":
     return _unpack(entry["q"]), _unpack(entry["k_all"])
 
 
-def read_run_ids(run_id_file: str) -> List[str]:
-    """Read all run IDs from the RUN_ID file."""
-    if not run_id_file or not os.path.exists(run_id_file):
-        return []
-    with open(run_id_file, "r") as f:
-        return [ln.strip() for ln in f.read().splitlines() if ln.strip()]
-
-
-def latest_run_id(run_id_file: str) -> str:
-    ids = read_run_ids(run_id_file)
-    if not ids:
-        raise FileNotFoundError(f"No run IDs found in {run_id_file!r}.")
-    return ids[-1]
-
-
 def _artifact_glob(hook_dir: str, run_id: str, filename: str, timeout: float = 0.0) -> List[str]:
     """Return artifact paths under run_id, optionally polling.
 
