@@ -36,10 +36,11 @@ class HookLLM:
         os.makedirs(HOOK_DIR, exist_ok=True)
         self._hook_dir = HOOK_DIR
 
-        os.environ["VLLM_HOOK_DIR"] = os.path.abspath(self._hook_dir)
-
         self.layer_to_heads = {}
-        self._output_layers = None   # set by load_config for HS worker
+        self._output_layers = None       # set by load_config for HS worker
+        self._hookq_mode = "all_tokens"  # default; overridable in config
+        self._hs_mode = "last_token"     # default; overridable in config
+        self._steering_config: Optional[Dict] = None  # set by load_config for steer worker
         if config_file:
             self.load_config(config_file)
 
@@ -84,25 +85,18 @@ class HookLLM:
                     self.layer_to_heads[layer_idx] = []
                 self.layer_to_heads[layer_idx].append(head_idx)
 
-            layer_to_heads_string = ";".join([
-                f"{layer}:{','.join(map(str, heads))}"
-                for layer, heads in sorted(self.layer_to_heads.items())
-            ])
-            os.environ["VLLM_HOOK_LAYER_HEADS"] = layer_to_heads_string
-
         if "hookq" in config_data:
-            hookq_mode = config_data["hookq"]["hookq_mode"]
-            os.environ["VLLM_HOOKQ_MODE"] = hookq_mode
+            self._hookq_mode = config_data["hookq"]["hookq_mode"]
 
         if "steering" in config_data:
-            os.environ["VLLM_ACTSTEER_CONFIG"] = os.path.abspath(config_file)
+            # vector_path is taken as-is from the config (legacy: usually relative
+            # to the project root / current working directory).
+            self._steering_config = dict(config_data["steering"])
 
         if "hidden_states" in config_data:
             hs_cfg = config_data["hidden_states"]
             layers = hs_cfg.get("layers", [])
-            os.environ["VLLM_HOOK_LAYERS"] = ";".join(map(str, layers))
-            mode = hs_cfg.get("mode", "last_token")
-            os.environ["VLLM_HOOK_HS_MODE"] = mode
+            self._hs_mode = hs_cfg.get("mode", "last_token")
             self._output_layers = layers if layers else True
 
     def _build_extra_args(self, save_to_disk: bool, run_id: str) -> dict:
@@ -110,11 +104,16 @@ class HookLLM:
         extra = {}
         if self.worker_name == "probe_hidden_states":
             extra["output_hidden_states"] = self._output_layers if self._output_layers else True
+            extra["hs_mode"] = self._hs_mode
         elif self.worker_name == "probe_hook_qk":
             # Pass layer_to_heads dict for head-level metadata; worker uses keys for layer filtering.
             extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
+            extra["hookq_mode"] = self._hookq_mode
         elif self.worker_name == "steer_hook_act":
-            extra["steer"] = True
+            # Inject the full steering config (method, coefficient, optimal_layer,
+            # vector_path, apply_at_all_positions). The worker reads these per-request,
+            # so different requests in the same batch can use different configs.
+            extra["steer"] = self._steering_config or True
 
         if save_to_disk:
             extra["save_to_disk"] = True

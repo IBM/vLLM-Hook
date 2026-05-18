@@ -38,7 +38,17 @@ def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
         os.environ["VLLM_HOOK_USE_SHM"] = "0"
         return None
 
-    hs_mode = os.environ.get("VLLM_HOOK_HS_MODE", "last_token")
+    hidden_size = 0
+    target_layers: list = []
+    hs_mode = "last_token"
+    if config_file and os.path.exists(config_file):
+        with open(config_file) as f:
+            cfg = json.load(f)
+        hs_cfg = cfg.get("hidden_states", {})
+        target_layers = hs_cfg.get("layers", [])
+        hidden_size = cfg.get("hidden_size", 0)
+        hs_mode = hs_cfg.get("mode", "last_token")
+
     if hs_mode != "last_token":
         warnings.warn(
             f"VLLM_HOOK_USE_SHM=1 is only supported for 'last_token' mode, "
@@ -47,15 +57,6 @@ def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
         )
         os.environ["VLLM_HOOK_USE_SHM"] = "0"
         return None
-
-    hidden_size = 0
-    target_layers: list = []
-    if config_file and os.path.exists(config_file):
-        with open(config_file) as f:
-            cfg = json.load(f)
-        hs_cfg = cfg.get("hidden_states", {})
-        target_layers = hs_cfg.get("layers", [])
-        hidden_size = cfg.get("hidden_size", 0)
 
     if hidden_size <= 0 or not target_layers:
         print("VLLM_HOOK_USE_SHM=1 but could not read hidden_size / layers "

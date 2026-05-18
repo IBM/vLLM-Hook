@@ -35,6 +35,11 @@ _WORKER_EXT_HS = "vllm_hook_plugins.workers.probe_hidden_states_worker.ProbeHidd
 _WORKER_EXT_QK = "vllm_hook_plugins.workers.probe_hookqk_worker.ProbeHookQKWorker"
 _WORKER_EXT_STEER = "vllm_hook_plugins.workers.steer_activation_worker.SteerHookActWorker"
 
+# Default hook_dir for save_to_disk requests when extra_args["hook_dir"] is not
+# set. /dev/shm/vllm_hook is a RAM tmpfs on Linux — fast and ephemeral, matching
+# HookClient's default.
+_DEFAULT_HOOK_DIR = "/dev/shm/vllm_hook"
+
 
 def _decompress(data: bytes) -> Any:
     if data[:4] == _ZSTD_MAGIC:
@@ -113,9 +118,13 @@ async def _patched_generate(
     # vllm_xargs only allows scalar values, so HookClient JSON-encodes nested
     # structures. Decode them back here before the worker reads extra_args.
     import json as _json
-    for _k in ("output_qk", "output_hidden_states"):
+    for _k in ("output_qk", "output_hidden_states", "steer"):
         if isinstance(extra.get(_k), str):
-            _decoded = _json.loads(extra[_k])
+            try:
+                _decoded = _json.loads(extra[_k])
+            except (ValueError, TypeError):
+                # Plain non-JSON strings (e.g. legacy boolean-like) pass through.
+                continue
             # output_qk comes back as {str_key: list} — restore int keys
             if _k == "output_qk" and isinstance(_decoded, dict):
                 _decoded = {int(k): v for k, v in _decoded.items()}
@@ -139,14 +148,8 @@ async def _patched_generate(
         ):
             if output.finished and needs_hooks and not wants_steer:
                 if save_to_disk:
-                    import os
                     run_id = extra.get("run_id") or request_id
-                    hook_dir = extra.get("hook_dir") or os.environ.get("VLLM_HOOK_DIR", "")
-                    if not hook_dir:
-                        raise ValueError(
-                            "save_to_disk=True but no hook_dir provided in extra_args "
-                            "and VLLM_HOOK_DIR env var is not set."
-                        )
+                    hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
                     await self.collective_rpc("flush_disk", args=([request_id], run_id, hook_dir))
                     # Leave output.probes unset — caller reads artifacts from disk.
                 else:
@@ -216,12 +219,7 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
             wants_artifacts = extra.get("output_hidden_states") is not None or extra.get("output_qk") is not None
             if extra.get("save_to_disk"):
                 run_id = extra.get("run_id") or req_id
-                hook_dir = extra.get("hook_dir") or os.environ.get("VLLM_HOOK_DIR", "")
-                if not hook_dir:
-                    raise ValueError(
-                        "save_to_disk=True but no hook_dir provided in extra_args "
-                        "and VLLM_HOOK_DIR env var is not set."
-                    )
+                hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
                 disk_by_run.setdefault(run_id, []).append((req_id, hook_dir))
             elif wants_artifacts:
                 states = self.collective_rpc("get_captured_states", args=(req_id,))

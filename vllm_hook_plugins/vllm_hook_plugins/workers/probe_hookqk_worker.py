@@ -122,10 +122,8 @@ class ProbeHookQKWorker:
             print("no model; skip hooks")
             return
 
-        self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens") # ["last_token", "all_tokens"]
-
-        self.layer_to_heads = self._parse_layer_heads()
-        self.important_layers = set(self.layer_to_heads.keys())
+        # Worker-wide fallback when extra_args["hookq_mode"] is missing.
+        self.hookq_mode = "all_tokens"
 
         # Background I/O thread (shared by all disk-save requests on this worker).
         init_async_save_thread(self, self._background_save_loop, "vllm-hook-qk-io")
@@ -258,12 +256,11 @@ class ProbeHookQKWorker:
                 layer_states[module_name]["q"].append(q_tok)
                 layer_states[module_name]["k_all"].append(k_tok)
 
-        # When important_layers is empty (API path, no VLLM_HOOK_LAYER_HEADS env var),
-        # hook every attention module. Per-request filtering via extra_args['output_qk']
-        # happens inside the hook closure.
+        # Hook every attention module. Per-request layer filtering via
+        # extra_args['output_qk'] happens inside the hook closure.
         self._hooks = []
         matched = []
-        for name, module, _ in iter_matched_modules(model, match_attn, self.important_layers):
+        for name, module, _ in iter_matched_modules(model, match_attn):
             hook = module.register_forward_hook(
                 lambda _m, i, _o, n=name: qkv_hook(i, n, _m)
             )
@@ -271,23 +268,6 @@ class ProbeHookQKWorker:
             matched.append(name)
 
         print(f"Installed {len(self._hooks)} hooks on layers: {matched}")
-
-    def _parse_layer_heads(self) -> Dict[int, List[int]]:
-        ## Parse 'VLLM_HOOK_LAYER_HEADS' env var from string to dict: '0:0,3,6;15:2' → {0:[0,3,6], 15:[2]}
-        layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
-        result = {}
-        
-        for part in layer_heads.split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            
-            layer_str, heads_str = part.split(":")
-            layer_idx = int(layer_str)
-            head_indices = sorted([int(h) for h in heads_str.split(",") if h])
-            result[layer_idx] = head_indices
-        
-        return result
 
     # ------------------------------------------------------------------
     # API serving: collective_rpc-callable artifact retrieval

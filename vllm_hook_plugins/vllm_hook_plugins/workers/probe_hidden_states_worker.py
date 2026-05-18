@@ -82,8 +82,8 @@ class ProbeHiddenStatesWorker:
             print("no model; skip hooks")
             return
 
-        self.hs_mode = os.environ.get("VLLM_HOOK_HS_MODE", "last_token")
-        self.target_layers = self._parse_target_layers()
+        # Worker-wide fallback when extra_args["hs_mode"] is missing.
+        self.hs_mode = "last_token"
 
         # SHM path is a specialized same-machine transport, independent of the
         # per-request RPC/disk paths. Kept as-is for backward compat.
@@ -204,16 +204,14 @@ class ProbeHiddenStatesWorker:
                     layer_states[module_name] = {"hidden_states": [], "layer_num": layer_num, "hs_mode": req_mode}
                 layer_states[module_name]["hidden_states"].append(activation)
 
-        # When target_layers is empty (API path, no VLLM_HOOK_LAYERS env var),
-        # hook every decoder layer. Per-request filtering via extra_args['output_hidden_states']
-        # happens inside the hook closure.
-        # target_layers uses the HuggingFace/Eagle 1-based convention (layer N = output
-        # after the Nth transformer block), but iter_matched_modules / match_layer return
-        # 0-based PyTorch indices (model.layers.N-1). Subtract 1 to align them.
-        layer_filter_0based = {l - 1 for l in self.target_layers} if self.target_layers else None
+        # Hook every decoder layer. Per-request layer filtering via
+        # extra_args['output_hidden_states'] happens inside the hook closure.
+        # Note: layer_num returned by match_layer is the 0-based PyTorch index
+        # (model.layers.N-1); we expose 1-based numbers (HuggingFace/Eagle
+        # convention: layer N = output after the Nth transformer block) by adding 1.
         self._hooks = []
         matched = []
-        for name, module, layer_num in iter_matched_modules(model, match_layer, layer_filter_0based):
+        for name, module, layer_num in iter_matched_modules(model, match_layer):
             hook = module.register_forward_hook(
                 lambda m, i, o, n=name, ln=layer_num+1: hs_hook(o, n, ln)
             )
@@ -221,15 +219,6 @@ class ProbeHiddenStatesWorker:
             matched.append(name)
 
         print(f"Installed {len(self._hooks)} hidden-state hooks on layers: {matched}")
-
-    def _parse_target_layers(self):
-        raw = os.environ.get("VLLM_HOOK_LAYERS", "")
-        result = set()
-        for part in raw.split(";"):
-            part = part.strip()
-            if part:
-                result.add(int(part))
-        return result
 
     # ------------------------------------------------------------------
     # API serving: collective_rpc-callable artifact retrieval
