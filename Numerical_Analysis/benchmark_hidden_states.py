@@ -2,19 +2,22 @@
 Benchmark: vLLM-Hook (probe_hidden_states) vs. Native vLLM (ExampleHiddenStatesConnector)
 
 Metrics:
-  - Prefill latency        : time for the prefill pass only
-  - Total latency          : prefill latency + time to load/read extracted artifacts
-  - Peak GPU memory        : torch.cuda.max_memory_allocated() over the generation window
-  - Artifact size          : total bytes written to disk per run (all prompts combined)
+  - gen_lat        : wall-clock of llm.generate() (prefill-only run)
+  - total_lat_full : gen_lat + wait-for-artifact + analyze (deserialize + reduce)
+  - peak_mem       : NVML system-wide GPU memory after run (MB)
+  - art_kb         : total artifact size on disk per run (KB)
 
 Usage:
   export VLLM_USE_V1=1
   export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  python benchmarks/benchmark_hidden_states.py
+  python Numerical_Analysis/benchmark_hidden_states.py [flags]
 
-Sweep flags:
-  --sweep-grid        full 3D grid: all combinations of layers × prompt_len × token_mode
-  --output FILE       write CSV results to FILE (default: benchmark_results.csv)
+Common flags (see --help for the full list):
+  --sweep-grid                full 3D sweep: layers × prompt_len × token_mode
+  --variant-last-token VID    storage variant for last_token cells
+  --variant-all-tokens VID    storage variant for all_tokens cells
+  --hook-dir PATH             tmpfs (e.g. /dev/shm/vllm_hook) recommended
+  --output FILE               CSV output path (default: benchmark_results.csv)
 """
 
 import argparse
@@ -197,7 +200,7 @@ def _results_to_grid_row(results: dict, layers, prompt_len: int, token_mode: str
 def _apply_variant_env(variant_id: str):
     """Set the env vars for a storage variant; return a snapshot for restoration."""
     keys = ("VLLM_HOOK_USE_SAFETENSORS", "VLLM_HOOK_ASYNC_SAVE",
-            "VLLM_HOOK_USE_SHM", "VLLM_HOOK_SHM_PERSIST")
+            "VLLM_HOOK_USE_SHM")
     snap = {k: os.environ.get(k) for k in keys}
     # Clear all four first, then apply this variant's overrides.
     for k in keys:
@@ -215,13 +218,14 @@ def _restore_env(snap: dict):
             os.environ[k] = v
 
 
-def _wait_for_artifact(hook_dir: str, run_id: str, timeout_s: float = 10.0) -> bool:
+def _wait_for_artifact(hook_dir: str, run_id: str, flags: dict,
+                       timeout_s: float = 10.0) -> bool:
     """Poll for the artifact under hook_dir/run_id with 10 ms granularity.
 
-    For safetensors: requires BOTH the .safetensors and .json sidecar
-    to be present (analyzer reads both; without the JSON sidecar's
-    metadata, deserialization fails).
-    For .pt: any file present in run_id/** is sufficient.
+    For safetensors (flags["use_safetensors"]): requires BOTH the .safetensors
+    file and the .json sidecar to be present (the analyzer reads both — the
+    sidecar carries metadata required for deserialization).
+    For .pt: any file present under run_id/** is sufficient.
 
     Returns True when ready, False on timeout.
     """
@@ -231,7 +235,7 @@ def _wait_for_artifact(hook_dir: str, run_id: str, timeout_s: float = 10.0) -> b
     any_pattern = os.path.join(base, "**", "*")
     st_pattern  = os.path.join(base, "**", "*.safetensors")
     js_pattern  = os.path.join(base, "**", "*.json")
-    use_st = os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1"
+    use_st = bool(flags.get("use_safetensors"))
     while time.time() < deadline:
         if use_st:
             if _glob.glob(st_pattern, recursive=True) and _glob.glob(js_pattern, recursive=True):
@@ -246,7 +250,6 @@ def _wait_for_artifact(hook_dir: str, run_id: str, timeout_s: float = 10.0) -> b
 def _read_env_flags():
     return {
         "use_shm":          os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1",
-        "shm_persist":      os.environ.get("VLLM_HOOK_SHM_PERSIST", "0") == "1",
         "use_safetensors":  os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1",
         "use_async_save":   os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1",
     }
@@ -275,27 +278,18 @@ def _build_hook_llm(cfg_path: str, hook_dir):
 
 def _read_hook_artifact(hook_dir: str, run_id: str, stats: dict, flags: dict):
     """Read peak GPU MB and artifact size for one hook run. Returns (peak_mb, art_kb)."""
-    use_shm        = flags["use_shm"]
-    shm_persist    = flags["shm_persist"]
+    use_shm         = flags["use_shm"]
     use_safetensors = flags["use_safetensors"]
-    use_async_save = flags["use_async_save"]
+    use_async_save  = flags["use_async_save"]
     base = os.path.join(hook_dir, run_id, "tp_rank_0")
 
-    if use_shm and shm_persist:
-        pt = os.path.join(base, "hidden_states.pt")
-        raw = torch.load(pt, map_location="cpu", weights_only=False)
-        return raw.get("peak_gpu_mb", _gpu_used_mb()), _files_size_kb([pt])
     if use_shm:
         return stats.get("peak_gpu_mb", _gpu_used_mb()), 0.0
     if use_safetensors:
         art_st   = os.path.join(base, "hidden_states.safetensors")
         art_json = os.path.join(base, "hidden_states.json")
         if use_async_save:
-            deadline = time.time() + 60.0
-            while time.time() < deadline:
-                if os.path.exists(art_json) and os.path.exists(art_st):
-                    break
-                time.sleep(0.01)
+            _wait_for_artifact(hook_dir, run_id, flags, timeout_s=60.0)
         try:
             with open(art_json) as f:
                 peak = json.load(f).get("peak_gpu_mb", _gpu_used_mb())
@@ -383,12 +377,11 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
                            save_to_disk=save_to_disk, run_id=run_id)
         t1 = time.perf_counter()  # gen done
 
-        # Wait for the artifact to appear on disk (no deserialize). For
-        # rpc/shm, probes are already in memory — nothing to wait for.
+        # Wait for the artifact to appear on disk (no deserialize) when an
+        # async save thread is in play. For rpc/shm, probes are already in
+        # memory — nothing to wait for, so t1_stat == t1.
         if save_to_disk and flags.get("use_async_save"):
-            _wait_for_artifact(_hook_dir, run_id, timeout_s=10.0)
-        if storage == "rpc":
-            pass
+            _wait_for_artifact(_hook_dir, run_id, flags, timeout_s=10.0)
         t1_stat = time.perf_counter()
 
         if save_to_disk:
@@ -397,7 +390,7 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
             except FileNotFoundError:
                 if not flags.get("use_async_save"):
                     raise
-                _wait_for_artifact(_hook_dir, run_id, timeout_s=20.0)
+                _wait_for_artifact(_hook_dir, run_id, flags, timeout_s=20.0)
                 stats = llm.analyze(analyzer_spec={"reduce": "none"})
         else:
             probes = getattr(out[0], "probes", None)
@@ -562,14 +555,9 @@ def _run_prompt_len_sweep_point(target_len, dry_run, hook_dir,
 
             final_art_kb = None
             for cand_id in candidates:
-                cand_st   = os.path.join(hook_dir_used, cand_id, "tp_rank_0", "hidden_states.safetensors")
-                cand_json = os.path.join(hook_dir_used, cand_id, "tp_rank_0", "hidden_states.json")
-                deadline = time.time() + 5.0
-                while time.time() < deadline:
-                    if os.path.exists(cand_json) and os.path.exists(cand_st):
-                        break
-                    time.sleep(0.01)
-                if os.path.exists(cand_json) and os.path.exists(cand_st):
+                if _wait_for_artifact(hook_dir_used, cand_id, flags, timeout_s=5.0):
+                    cand_st   = os.path.join(hook_dir_used, cand_id, "tp_rank_0", "hidden_states.safetensors")
+                    cand_json = os.path.join(hook_dir_used, cand_id, "tp_rank_0", "hidden_states.json")
                     final_art_kb = _files_size_kb([cand_st, cand_json])
                     break
 
@@ -611,9 +599,6 @@ if __name__ == "__main__":
     parser.add_argument("--use-shm", action="store_true",
                         help="Use shared memory instead of disk I/O "
                              "(sets VLLM_HOOK_USE_SHM=1). Supports last_token mode only.")
-    parser.add_argument("--shm-persist", action="store_true",
-                        help="With --use-shm: also write a .pt artifact to disk "
-                             "(sets VLLM_HOOK_SHM_PERSIST=1).")
     parser.add_argument("--sweep-grid", action="store_true",
                         help="Full 3D grid sweep: all combinations of layers × prompt_len × token_mode")
     parser.add_argument("--variant-last-token", default="disk-pt",
@@ -657,8 +642,6 @@ if __name__ == "__main__":
         os.environ["VLLM_HOOK_USE_SAFETENSORS"] = "1"
     if args.use_shm:
         os.environ["VLLM_HOOK_USE_SHM"] = "1"
-    if args.shm_persist:
-        os.environ["VLLM_HOOK_SHM_PERSIST"] = "1"
 
     if args.sweep_grid:
         variant_per_mode = {
