@@ -164,3 +164,34 @@ resp = client.chat.completions.create(
 ```
 
 `VLLM_HOOK_USE_SAFETENSORS` / `VLLM_HOOK_ASYNC_SAVE` are set when launching `vllm serve` (the server's worker process reads them at hook-fire time).
+
+---
+
+## Preliminary study regarding the storage variant choice
+
+We have done a preliminary test regarding different storage variants using hidden-states extraction as an example. Numbers below are means over 16 grid points (prompt lengths {16, 64, 256, 512} × layer counts {1, 4, 16, 28}), 5 timed repetitions per point (after 5 warm-up runs that are discarded), on Qwen2-1.5B-Instruct.
+
+### `last_token` mode (artifact ≈ 300 KB)
+
+| Variant | gen (ms) | total (ms) | analyze overhead (ms) |
+|---|---:|---:|---:|
+| **disk-st-async**  | 31.8 | **33.5** | 1.7 |
+| disk-pt-async | 34.4 | 43.2 | 8.8 |
+| shm | 44.8 | 44.8 | 0.0 |
+| disk-pt | 42.9 | 49.0 | 6.1 |
+| rpc | 58.9 | 58.9 | 0.0 |
+
+### `all_tokens` mode (artifact ≈ 60 MB)
+
+| Variant | gen (ms) | total (ms) | analyze overhead (ms) |
+|---|---:|---:|---:|
+| **disk-st-async**  | 48.5 | 137.7 | 89.3 |
+| disk-pt-async | 50.8 | 123.4 | 72.5 |
+| disk-pt | 91.0 | 123.8 | 32.8 |
+| rpc | 2274.6 | 2274.6 | 0.0 |
+
+### Takeaways
+
+- **disk-st-async is the recommended based on current findings.** It minimizes generate-side latency (async I/O off the critical path) and produces the smallest safetensors artifact.
+- **`all_tokens` rpc is ~18× slower than disk** — `collective_rpc` serializes the full ~60 MB tensor through Python/IPC. Avoid rpc for large artifacts; use disk.
+- **`shm` is no longer competitive** post-refactor even at `last_token`. The legacy fast-path is kept for back-compat but disk-st-async beats it on every measured cell.
