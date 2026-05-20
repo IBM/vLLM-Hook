@@ -119,6 +119,45 @@ class ProbeHiddenStatesWorker:
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
+        # Per-batch resolved request decisions, keyed by id(attn_metadata).
+        # Each forward step produces a fresh attn_metadata, so the id is a
+        # cheap fingerprint for "are we still in the same batch?" The previous
+        # entry is dropped when a new batch arrives so the dict stays bounded.
+        self._batch_cache_key = None
+        self._batch_cache_entries = None  # list[dict] of resolved per-request info
+
+        def _resolve_batch(req_ids, bs):
+            """Build the per-batch list of capturing requests. Called once per
+            forward step (on the first hook fire that gets here)."""
+            entries = []
+            for i in range(bs):
+                req_id = req_ids[i]
+                req_state = self.model_runner.requests.get(req_id)
+                if req_state is None or req_state.sampling_params is None:
+                    continue
+                extra = req_state.sampling_params.extra_args
+                if not extra or extra.get("output_hidden_states") is None:
+                    continue
+                output_layers = extra.get("output_hidden_states")
+                # Resolve hooks_on once. is_prefill check only matters when
+                # hooks_on != "both"; output_token_ids state is stable for
+                # the duration of one forward step.
+                hooks_on = extra.get("hooks_on", self._default_hooks_on)
+                if hooks_on != "both":
+                    is_prefill = len(req_state.output_token_ids) == 0
+                    if hooks_on == "prefill" and not is_prefill:
+                        continue
+                    if hooks_on == "decode" and is_prefill:
+                        continue
+                entries.append({
+                    "i": i,
+                    "req_id": req_id,
+                    "output_layers": output_layers,  # list or None ("all layers")
+                    "hs_mode": extra.get("hs_mode", self.hs_mode),
+                    "save_to_disk": bool(extra.get("save_to_disk")),
+                })
+            return entries
+
         def hs_hook(output, module_name, layer_num):
             # Fast-path: only rank 0 captures (RPC and disk paths both need it).
             if not self._should_capture:
@@ -133,12 +172,38 @@ class ProbeHiddenStatesWorker:
             if torch.cuda.is_current_stream_capturing():
                 return None
 
-            query_start_loc, seq_lens = get_query_metadata(metadata)
-            if query_start_loc is None:
+            # Reuse the resolved-request list across all hook fires within
+            # the same forward step. id(metadata) is a stable fingerprint
+            # because vLLM allocates fresh attn_metadata per step.
+            cache_key = id(metadata)
+            if self._batch_cache_key != cache_key:
+                query_start_loc, _seq_lens = get_query_metadata(metadata)
+                if query_start_loc is None:
+                    return
+                try:
+                    req_ids = self.model_runner.input_batch.req_ids
+                except Exception:
+                    return
+                bs = len(query_start_loc) - 1
+                self._batch_cache_key = cache_key
+                self._batch_cache_entries = _resolve_batch(req_ids, bs)
+                self._batch_cache_qsl = query_start_loc
+
+            entries = self._batch_cache_entries
+            if not entries:
                 return
 
-            bs = len(query_start_loc) - 1
-            last_indices = query_start_loc
+            # Layer filter: any request want THIS layer?
+            wanted = []
+            for e in entries:
+                ol = e["output_layers"]
+                if isinstance(ol, list) and (layer_num not in ol):
+                    continue
+                wanted.append(e)
+            if not wanted:
+                return
+
+            last_indices = self._batch_cache_qsl
 
             # vLLM uses a fused residual pattern: transformer blocks return
             # (hidden_states, residual) where the residual has not yet been added. 
@@ -149,41 +214,10 @@ class ProbeHiddenStatesWorker:
             else:
                 hidden = output
 
-            # Per-request capture. Each request in the batch may route to
-            # either _captured_states (RPC path) or _disk_states (disk path)
-            # based on its extra_args.
-            try:
-                req_ids = self.model_runner.input_batch.req_ids
-            except Exception:
-                return
-
-            for i in range(bs):
-                req_id = req_ids[i]
-                req_state = self.model_runner.requests.get(req_id)
-                if req_state is None or req_state.sampling_params is None:
-                    continue
-                extra = req_state.sampling_params.extra_args
-                if not extra or extra.get("output_hidden_states") is None:
-                    continue
-
-                output_layers = extra.get("output_hidden_states")
-                if isinstance(output_layers, list) and (layer_num not in output_layers):
-                    continue
-
-                # hooks_on: "prefill" (default) | "decode" | "both"
-                # Uses output_token_ids == [] on the worker-side CachedRequestState
-                # to detect the first (prefill) pass. This is robust to prefix
-                # caching where query_len < seq_len even on the first pass.
-                hooks_on = extra.get("hooks_on", self._default_hooks_on)
-                if hooks_on != "both":
-                    is_prefill = len(req_state.output_token_ids) == 0
-                    if hooks_on == "prefill" and not is_prefill:
-                        continue
-                    if hooks_on == "decode" and is_prefill:
-                        continue
-
-                # Per-request mode: extra_args["hs_mode"] overrides the worker default.
-                req_mode = extra.get("hs_mode", self.hs_mode)
+            for e in wanted:
+                i = e["i"]
+                req_id = e["req_id"]
+                req_mode = e["hs_mode"]
 
                 start = int(last_indices[i].item())
                 end = int(last_indices[i + 1].item())
@@ -196,7 +230,7 @@ class ProbeHiddenStatesWorker:
                     activation = hidden[start:end].detach().clone()
 
                 # Route to disk or RPC bucket based on save_to_disk flag.
-                bucket = self._disk_states if extra.get("save_to_disk") else self._captured_states
+                bucket = self._disk_states if e["save_to_disk"] else self._captured_states
                 if req_id not in bucket:
                     bucket[req_id] = {}
                 layer_states = bucket[req_id]
