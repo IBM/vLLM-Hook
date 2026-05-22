@@ -37,32 +37,36 @@ def extract(rows, prompt_len, system, token_mode):
             continue
         if r["gen_lat_mean"] in ("", "None", None):
             continue
+        full_mean = r.get("total_lat_full_mean")
+        full_std  = r.get("total_lat_full_std")
         points.append({
-            "n_layers":       len(eval(r["layers"])),
-            "gen_lat":        _float(r["gen_lat_mean"]) * 1000,
-            "gen_lat_std":    (_float(r["gen_lat_std"]) or 0.0) * 1000,
-            "total_lat":      _float(r["total_lat_mean"]) * 1000,
-            "total_lat_std":  (_float(r["total_lat_std"]) or 0.0) * 1000,
-            "peak_mem":       _float(r["peak_mem_mean"]),
-            "peak_mem_std":   _float(r["peak_mem_mean"]) and 0.0,  # no std column for mem
-            "art_kb":         _float(r["art_kb_mean"]),
-            "art_kb_std":     0.0,
+            "n_layers":           len(eval(r["layers"])),
+            "gen_lat":            _float(r["gen_lat_mean"]) * 1000,
+            "gen_lat_std":        (_float(r["gen_lat_std"]) or 0.0) * 1000,
+            "total_lat":          _float(r["total_lat_mean"]) * 1000,
+            "total_lat_std":      (_float(r["total_lat_std"]) or 0.0) * 1000,
+            "total_lat_full":     (_float(full_mean) * 1000) if full_mean else None,
+            "total_lat_full_std": ((_float(full_std) or 0.0) * 1000) if full_std else 0.0,
+            "peak_mem":           _float(r["peak_mem_mean"]),
+            "peak_mem_std":       0.0,
+            "art_kb":             _float(r["art_kb_mean"]),
+            "art_kb_std":         0.0,
         })
     points.sort(key=lambda x: x["n_layers"])
     return points
 
 
 METRICS = [
-    ("gen_lat",   "gen_lat_std",  "Generation latency (ms)"),
-    ("total_lat", "total_lat_std","Total latency incl. read (ms)"),
-    ("peak_mem",  None,           "GPU memory in use (MB)"),
-    ("art_kb",    None,           "Artifact size (KB)"),
+    ("gen_lat",        "gen_lat_std",        "Generation latency (ms)"),
+    ("total_lat_full", "total_lat_full_std", "Total latency incl. analyze (ms)"),
+    ("peak_mem",       None,                 "GPU memory in use (MB)"),
+    ("art_kb",         None,                 "Artifact size (KB)"),
 ]
 
 SERIES = [
-    ("hook",   "last_token", "vLLM-Hook (last_token)", "#1f77b4", "-",  "o"),
-    ("hook",   "all_tokens", "vLLM-Hook (all_tokens)", "#ff7f0e", "--", "s"),
-    ("native", "last_token", "vLLM Eagle (native)",    "#2ca02c", "-.", "^"),
+    ("hook",   "last_token", "vLLM-Hook (last_token)",    "#1f77b4", "-",  "o"),
+    ("hook",   "all_tokens", "vLLM-Hook (all_tokens)",    "#ff7f0e", "--", "s"),
+    ("native", "all_tokens", "vLLM Eagle (native)",       "#2ca02c", "-.", "^"),
 ]
 
 

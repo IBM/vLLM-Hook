@@ -10,63 +10,51 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
 os.environ.setdefault("VLLM_HOOK_ASYNC_SAVE", "1")
 
+from vllm import SamplingParams
 from vllm_hook_plugins import HookLLM
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, documents: List[str]):
-    # setup prompts
-    off_set = 0
-    if 'granite' in model_name.lower():
-        prompt_prefix = '<|start_of_role|>user<|end_of_role|>'
-        prompt_suffix = '<|end_of_text|><|start_of_role|>assistant<|end_of_role|>'
-    elif 'llama' in model_name.lower():
-        prompt_prefix = '<|start_header_id|>user<|end_header_id|>'
-        prompt_suffix = '<|eot_id|><|start_header_id|>assistant<|end_header_id|>'
-    elif 'mistral' in model_name.lower():
-        prompt_prefix = '[INST]'
-        prompt_suffix = '[/INST]'
-        off_set = 1
-    elif 'phi' in model_name.lower():
-        prompt_prefix = '<|im_start|>user<|im_sep|>'
-        prompt_suffix = '<|im_end|><|im_start|>assistant<|im_sep|>'
     retrieval_instruction = ' Here are some paragraphs:\n\n'
     retrieval_instruction_late = 'Please find information that are relevant to the following query in the paragraphs above.\n\nQuery: '
-    
-    doc_span = []
-    query_start_idx = None
-    query_end_idx = None
 
-    llm_prompt = prompt_prefix + retrieval_instruction
-
+    # Build user content incrementally, tracking character positions for each doc/query
+    content = retrieval_instruction
+    doc_char_spans = []
     for i, doc in enumerate(documents):
+        content += f'[document {i+1}]'
+        start_char = len(content)
+        content += ' ' + " ".join(doc)
+        doc_char_spans.append((start_char, len(content)))
+        content += '\n\n'
 
-        llm_prompt += f'[document {i+1}]'
-        start_len = len(tokenizer(llm_prompt).input_ids)
+    query_start_char = len(content)
+    content += retrieval_instruction_late
+    after_instruct_char = len(content)
+    content += query.strip()
+    query_end_char = len(content)
 
-        llm_prompt += ' ' + " ".join(doc)
-        end_len = len(tokenizer(llm_prompt).input_ids) - off_set
+    messages = [{"role": "user", "content": content}]
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-        doc_span.append((start_len, end_len))
-        llm_prompt += '\n\n'
+    # Find where the user content starts in the full text, then map char offsets to token indices
+    content_start = full_text.index(content)
 
-    start_len = len(tokenizer(llm_prompt).input_ids)
+    def char_to_tok(char_pos):
+        return len(tokenizer(full_text[:content_start + char_pos], add_special_tokens=False).input_ids)
 
-    llm_prompt += retrieval_instruction_late
-    after_retrieval_instruction_late = len(tokenizer(llm_prompt).input_ids) - off_set
+    doc_span = [(char_to_tok(s), char_to_tok(e)) for s, e in doc_char_spans]
+    query_start_idx = char_to_tok(query_start_char)
+    after_retrieval_instruction_late = char_to_tok(after_instruct_char)
+    query_end_idx = char_to_tok(query_end_char)
 
-    llm_prompt += f'{query.strip()}'
-    end_len = len(tokenizer(llm_prompt).input_ids) - off_set
-    llm_prompt += prompt_suffix
-
-    query_start_idx = start_len
-    query_end_idx = end_len
-
-    return llm_prompt, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
+    # Return full_text for offline (HookLLM) use and messages for serve (HookClient) use
+    return full_text, messages, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
 
 if __name__ == "__main__":
 
     cache_dir = "./cache/"
     hook_dir  = "/dev/shm/vllm_hook" # None # 
-    model = 'mistralai/Mistral-7B-Instruct-v0.3' # 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' #
+    model = 'ibm-granite/granite-3.1-8b-instruct'  # 'mistralai/Mistral-7B-Instruct-v0.3' # 'Qwen/Qwen2-1.5B-Instruct' #
     
     dtype_map = {
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
@@ -211,13 +199,16 @@ if __name__ == "__main__":
         documents = case["documents"]
         
         # Apply chat template and get ranges
-        text, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
-        llm.generate(text, temperature=0.1, max_tokens=1)
-        
-        text, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
-        llm.generate(text, cleanup=False, temperature=0.1, max_tokens=1)
-        
-        stats = llm.analyze(analyzer_spec={'query_spec': query_spec, 'na_spec': na_spec})
+        text, _, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
+        llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
+                     save_to_disk=True, run_id="corer-doc")
+
+        text, _, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
+        llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
+                     save_to_disk=True, run_id="corer-na")
+
+        stats = llm.analyze(run_ids=["corer-doc", "corer-na"],
+                            analyzer_spec={'query_spec': query_spec, 'na_spec': na_spec})
         print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
 
         llm.llm_engine.reset_prefix_cache()
@@ -238,17 +229,20 @@ if __name__ == "__main__":
         documents = case["documents"]
         
         # Apply chat template and get ranges
-        text_query, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
-        text_na, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
+        text_query, _, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
+        text_na, _, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
 
         text_querys.append(text_query)
         query_specs.append(query_spec)        
         text_nas.append(text_na)
         na_specs.append(na_spec)
     
-    llm.generate(text_querys, temperature=0.1, max_tokens=1)
-    llm.generate(text_nas, cleanup=False, temperature=0.1, max_tokens=1)
-    
-    stats = llm.analyze(analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
+    llm.generate(text_querys, SamplingParams(temperature=0.1, max_tokens=1),
+                 save_to_disk=True, run_id="corer-batch-doc")
+    llm.generate(text_nas, SamplingParams(temperature=0.1, max_tokens=1),
+                 save_to_disk=True, run_id="corer-batch-na")
+
+    stats = llm.analyze(run_ids=["corer-batch-doc", "corer-batch-na"],
+                        analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
     print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
     llm.llm_engine.reset_prefix_cache()

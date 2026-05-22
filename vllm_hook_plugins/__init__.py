@@ -1,6 +1,7 @@
 from .vllm_hook_plugins import (
     PluginRegistry,
     HookLLM,
+    HookClient,
     ProbeHookQKWorker,
     SteerHookActWorker,
     AttntrackerAnalyzer,
@@ -11,7 +12,8 @@ from .vllm_hook_plugins import (
 __all__ = [
     "PluginRegistry",
     "HookLLM",
-    "ProbeHookQKWorker", 
+    "HookClient",
+    "ProbeHookQKWorker",
     "SteerHookActWorker",
     "AttntrackerAnalyzer",
     "CorerAnalyzer",
