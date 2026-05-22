@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=float(env_value("GPU_MEMORY_UTILIZATION", "0.5")),
+        default=float(env_value("GPU_MEMORY_UTILIZATION", "0.8")),
     )
     parser.add_argument("--max-model-len", type=int, default=int(env_value("MAX_MODEL_LEN", "2048")))
     parser.add_argument("--dtype", default=env_value("DTYPE", "float16"))
