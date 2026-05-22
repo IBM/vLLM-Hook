@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+wandb/
+
+tests/experiment_runs/
+tests/scratch/
+tests/parity_tests/local_wandb_config.py
