@@ -99,9 +99,11 @@ class HookLLM:
             self._hs_mode = hs_cfg.get("mode", "last_token")
             self._output_layers = layers if layers else True
 
-    def _build_extra_args(self, save_to_disk: bool, run_id: str) -> dict:
+    def _build_extra_args(self, save_to_disk: bool, run_id: str,
+                            request_extra_args: Optional[dict] = None) -> dict:
         """Build extra_args for the probe worker based on worker_name and config."""
         extra = {}
+        request_extra_args = request_extra_args or {}
         if self.worker_name == "probe_hidden_states":
             extra["output_hidden_states"] = self._output_layers if self._output_layers else True
             extra["hs_mode"] = self._hs_mode
@@ -110,16 +112,17 @@ class HookLLM:
             extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
             extra["hookq_mode"] = self._hookq_mode
         elif self.worker_name == "steer_hook_act":
-            # Inject the full steering config (method, coefficient, optimal_layer,
-            # vector_path, apply_at_all_positions). The worker reads these per-request,
-            # so different requests in the same batch can use different configs.
-            extra["steer"] = self._steering_config or True
-
+            # Start from the instance-default steer config (loaded from config_file),
+            # then apply any per-request overrides from extra_args["steer"].
+            base = dict(self._steering_config) if self._steering_config else {}
+            override = request_extra_args.get("steer")
+            if isinstance(override, dict):
+                base.update(override)
+            extra["steer"] = base or True
         if save_to_disk:
             extra["save_to_disk"] = True
             extra["run_id"] = run_id
             extra["hook_dir"] = self._hook_dir
-
         return extra
 
     def generate(
@@ -144,7 +147,7 @@ class HookLLM:
                 run_id = str(uuid.uuid4())
             sampling_params = copy.copy(sampling_params)
             extra = dict(sampling_params.extra_args or {})
-            extra.update(self._build_extra_args(save_to_disk, run_id))
+            extra.update(self._build_extra_args(save_to_disk, run_id, request_extra_args=extra))
             sampling_params.extra_args = extra
             # Store last run_id so analyze() can find the artifact without
             # the caller needing to track it.
