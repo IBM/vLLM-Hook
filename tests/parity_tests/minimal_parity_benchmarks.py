@@ -112,8 +112,6 @@ def model_for(args: argparse.Namespace) -> str:
 
 
 def config_kind(args: argparse.Namespace) -> str:
-    if args.experiment == "hidden-states" and args.backend == "metal":
-        return "attention_tracker"
     return {
         "hidden-states": "hidden_states",
         "attn-tracker": "attention_tracker",
@@ -184,8 +182,6 @@ def dtype_for(name: str) -> Any:
 
 def worker_analyzer(args: argparse.Namespace) -> tuple[str, str | None]:
     if args.experiment == "hidden-states":
-        if args.backend == "metal":
-            return "probe_hook_qk", None
         return "probe_hidden_states", "hidden_states"
     if args.experiment == "attn-tracker":
         return "probe_hook_qk", "attn_tracker"
@@ -210,10 +206,6 @@ def make_llm(args: argparse.Namespace, out_dir: Path):
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
-
-    from vllm_hook_plugins import register_plugins
-
-    register_plugins()
 
     config_file = ensure_config(args, out_dir)
     args._resolved_config_file = str(config_file)
@@ -240,9 +232,12 @@ def make_llm(args: argparse.Namespace, out_dir: Path):
     if args.backend == "metal":
         os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "0")
         os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "auto")
-        from vllm_hook_plugins.metal import HookLLMMetal
+        from vllm_hook_plugins.metal.hook_llm_metal import HookLLMMetal
 
         return HookLLMMetal(**kwargs)
+
+    from vllm_hook_plugins import register_plugins
+    register_plugins()
 
     from vllm_hook_plugins import HookLLM
 
@@ -428,11 +423,6 @@ def run_attn_tracker(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str,
 
 
 def run_hidden_states(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if args.backend == "metal":
-        raise SystemExit(
-            "hidden-states is muted for --backend metal: no native Metal "
-            "hidden-state example/worker exists yet."
-        )
     llm = make_llm(args, out_dir)
     comparison_key = set_comparison_identity(
         args,
@@ -446,32 +436,17 @@ def run_hidden_states(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str
         ),
     )
     _ = llm.generate(HIDDEN_PROMPTS, temperature=0.0, max_tokens=1, use_hook=True)
-    if args.backend == "metal":
-        run_id = read_run_ids(llm)[-1]
-        qk_metrics = qk_l2_from_artifacts(qk_artifact_paths(llm, run_id))
-        hidden_by_layer = {
-            layer: values["hidden_state_l2_mean"]
-            for layer, values in qk_metrics["l2_by_layer"].items()
-            if "hidden_state_l2_mean" in values
-        }
-        metrics = {
-            **comparison_fields(args),
-            "hidden_state_l2_mean": qk_metrics["hidden_state_l2_mean_from_qkv_x"],
-            "hidden_state_l2_by_layer": hidden_by_layer,
-            "hidden_state_source": "metal_qkv_x",
-        }
-    else:
-        stats = llm.analyze(analyzer_spec={"reduce": "norm"})
-        hidden_by_layer = {
-            layer: flatten_mean([float(v) for v in values])
-            for layer, values in stats["hidden_states"].items()
-        }
-        metrics = {
-            **comparison_fields(args),
-            "hidden_state_l2_mean": flatten_mean(list(hidden_by_layer.values())),
-            "hidden_state_l2_by_layer": hidden_by_layer,
-            "hidden_state_source": "probe_hidden_states",
-        }
+    stats = llm.analyze(analyzer_spec={"reduce": "norm"})
+    hidden_by_layer = {
+        layer: flatten_mean([float(v) for v in values])
+        for layer, values in stats["hidden_states"].items()
+    }
+    metrics = {
+        **comparison_fields(args),
+        "hidden_state_l2_mean": flatten_mean(list(hidden_by_layer.values())),
+        "hidden_state_l2_by_layer": hidden_by_layer,
+        "hidden_state_source": "probe_hidden_states",
+    }
     records = [
         {
             "backend": args.backend,

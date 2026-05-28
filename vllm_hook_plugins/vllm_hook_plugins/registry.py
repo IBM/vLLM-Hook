@@ -1,10 +1,8 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 class Worker:
-    def __init__(self, worker_class, hooks_on: Tuple[bool, bool] = (False, False)):
-        # self.cls = worker_class
+    def __init__(self, worker_class):
         self.path = f"{worker_class.__module__}.{worker_class.__name__}"
-        self.hooks_on = hooks_on  # (hooks_on_prefill, hooks_on_generate)
 
 class Analyzer:
     def __init__(self, analyzer_class):
@@ -18,8 +16,8 @@ class PluginRegistry:
     
     ## workers
     @classmethod
-    def register_worker(cls, name: str, worker_class, hooks_on: Tuple[bool, bool] = (False, False)):
-        cls._workers[name] = Worker(worker_class, hooks_on)
+    def register_worker(cls, name: str, worker_class):
+        cls._workers[name] = Worker(worker_class)
     
     @classmethod
     def get_worker(cls, name: str) -> Optional[Worker]:

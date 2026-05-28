@@ -5,12 +5,16 @@ import torch
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
+os.environ.setdefault("VLLM_HOOK_ASYNC_SAVE", "1")
 
+from vllm import SamplingParams
 from vllm_hook_plugins import HookLLM
 
 if __name__ == "__main__":
 
     cache_dir = "./cache/"
+    hook_dir  = "/dev/shm/vllm_hook" # None
     model = "Qwen/Qwen2.5-3B-Instruct"
 
     llm = HookLLM(
@@ -19,6 +23,7 @@ if __name__ == "__main__":
         analyzer_name="hidden_states",
         config_file=f"model_configs/hidden_states/{model.split('/')[-1]}.json",
         download_dir=cache_dir,
+        hook_dir=hook_dir,
         gpu_memory_utilization=0.7,
         max_model_len=2048,
         trust_remote_code=True,
@@ -35,7 +40,7 @@ if __name__ == "__main__":
 
     print("=" * 50)
     for case in test_cases:
-        output = llm.generate(case, temperature=0.0, max_tokens=10)
+        output = llm.generate(case, SamplingParams(temperature=0.0, max_tokens=10), save_to_disk=True)
         stats = llm.analyze(analyzer_spec={"reduce": "none"})
 
         print(f"\nPrompt: '{case}'")
@@ -48,7 +53,7 @@ if __name__ == "__main__":
 
     print("=" * 50)
     print("Batch processing examples...")
-    output = llm.generate(test_cases, temperature=0.0, max_tokens=10)
+    output = llm.generate(test_cases, SamplingParams(temperature=0.0, max_tokens=10), save_to_disk=True)
     stats = llm.analyze(analyzer_spec={"reduce": "norm"})
 
     for i, prompt in enumerate(test_cases):

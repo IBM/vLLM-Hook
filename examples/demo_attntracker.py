@@ -6,7 +6,10 @@ import time
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
+os.environ.setdefault("VLLM_HOOK_ASYNC_SAVE", "1")
 
+from vllm import SamplingParams
 from vllm_hook_plugins import HookLLM
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: str, data: str):
@@ -41,6 +44,7 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, instruction: 
 if __name__ == "__main__":
 
     cache_dir = "./cache/"
+    hook_dir  = "/dev/shm/vllm_hook" # None # 
     model = 'ibm-granite/granite-3.1-8b-instruct'  # 'Qwen/Qwen2-1.5B-Instruct' # 'mistralai/Mistral-7B-Instruct-v0.3' # 
     
     dtype_map = {
@@ -55,13 +59,13 @@ if __name__ == "__main__":
         analyzer_name="attn_tracker",
         config_file=f'model_configs/attention_tracker/{model.split("/")[-1]}.json',
         download_dir=cache_dir,
+        hook_dir=hook_dir,
         gpu_memory_utilization=0.7,
         max_model_len=2048,
         trust_remote_code=True,
         dtype=dtype_map[model],
         enforce_eager=True,
-        # ensure enable_prefix_caching=False when using batch processing
-        enable_prefix_caching=False,
+        enable_prefix_caching=True,
         enable_hook=True, 
         tensor_parallel_size=1  # the number of gpus
     )
@@ -90,10 +94,10 @@ if __name__ == "__main__":
         text, input_range = apply_chat_template_and_get_ranges(llm.tokenizer, model, instruction, data)
 
         t0 = time.time()
-        output = llm.generate(text, temperature=0.1, max_tokens=50)
+        output = llm.generate(text, SamplingParams(temperature=0.1, max_tokens=50), save_to_disk=True)
         t1 = time.time()
         print(f"hook llm generation runtime: {(t1-t0):.3f}s")
-        stats = llm.analyze(analyzer_spec={'input_range': input_range, 'attn_func':"sum_normalize"})
+        stats = llm.analyze(probes=getattr(output[0], "probes", None), analyzer_spec={'input_range': input_range, 'attn_func':"sum_normalize"})
         t2 = time.time()
         print(f"hook llm analysis runtime: {(t2-t1):.3f}s")
 
@@ -133,8 +137,8 @@ if __name__ == "__main__":
         texts.append(text)
         input_ranges.append(input_range)
     
-    output = llm.generate(texts, temperature=0.1, max_tokens=50)
-    stats = llm.analyze(analyzer_spec={'input_range': input_ranges, 'attn_func':"sum_normalize"})
+    output = llm.generate(texts, SamplingParams(temperature=0.1, max_tokens=50), save_to_disk=True)
+    stats = llm.analyze(probes=getattr(output[0], "probes", None), analyzer_spec={'input_range': input_ranges, 'attn_func':"sum_normalize"})
     
     score = stats['score']
 

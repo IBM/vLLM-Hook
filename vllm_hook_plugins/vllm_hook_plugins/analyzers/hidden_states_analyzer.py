@@ -2,7 +2,7 @@ import os
 import torch
 from typing import Dict, List, Optional
 
-from vllm_hook_plugins.run_utils import latest_run_id, load_and_merge_hs_cache
+from vllm_hook_plugins.run_utils import load_and_merge_hs_cache
 from vllm_hook_plugins.shm_utils import load_from_shm
 
 
@@ -11,13 +11,15 @@ class HiddenStatesAnalyzer:
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
         self.hook_dir = hook_dir
 
-    def analyze(self, analyzer_spec: Optional[Dict] = None) -> Dict:
+    def analyze(self, analyzer_spec: Optional[Dict] = None, run_id: Optional[str] = None, probes: Optional[Dict] = None) -> Dict:
         peak_gpu_mb = None
-        if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
-            hs_cache, peak_gpu_mb = load_from_shm(self.hook_dir, os.environ.get("VLLM_RUN_ID"))
+        if probes is not None:
+            hs_cache = probes["hs_cache"]
+        elif os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
+            hs_cache, peak_gpu_mb = load_from_shm(self.hook_dir, run_id)
         else:
-            run_id_file = os.environ.get("VLLM_RUN_ID")
-            run_id = latest_run_id(run_id_file)
+            if run_id is None:
+                raise ValueError("HiddenStatesAnalyzer.analyze: pass either probes= or run_id=.")
             cache = load_and_merge_hs_cache(self.hook_dir, run_id)
             hs_cache = cache["hs_cache"]
 

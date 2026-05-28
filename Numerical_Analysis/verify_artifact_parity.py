@@ -18,7 +18,7 @@ LAYERS = list(range(1, 21))  # 1-based: layer N = output after Nth transformer b
 TARGET_PROMPT_LEN = 64
 N_PROMPTS = 8
 
-sys.path.insert(0, str(PROJECT_ROOT / "benchmarks"))
+sys.path.insert(0, str(PROJECT_ROOT / "Numerical_Analysis"))
 from benchmark_hidden_states import _prompts_for_length
 
 def _build_prompts():
@@ -65,9 +65,11 @@ def run_hook(hook_dir, prompts):
         )
         params = SamplingParams(temperature=0.0, max_tokens=1)
 
-        # llm.generate() handles hook setup/cleanup and records output req order.
-        # analyze() then reorders tensors to match input order automatically.
-        outputs = llm.generate(prompts, params)
+        # llm.generate(save_to_disk=True) writes the artifact under hook_dir/run_id;
+        # analyze() reloads it and aligns the per-prompt order.
+        import uuid as _uuid
+        run_id = str(_uuid.uuid4())
+        outputs = llm.generate(prompts, params, save_to_disk=True, run_id=run_id)
         stats = llm.analyze(analyzer_spec={"reduce": "none"})
 
         hs = stats.get("hidden_states", {})
@@ -76,10 +78,8 @@ def run_hook(hook_dir, prompts):
             idx = int(layer_name.split(".layers.")[1].split(".")[0])
             result[idx + 1] = [t.cpu().float() for t in tensors]
 
-        run_id_file = llm._run_id_file
-        run_id = open(run_id_file).read().strip().split("\n")[-1] if os.path.exists(run_id_file) else None
-        art_path = os.path.join(hook_dir, run_id, "tp_rank_0", "hidden_states.safetensors") if run_id else ""
-        art_kb = os.path.getsize(art_path) / 1024 if art_path and os.path.exists(art_path) else 0.0
+        art_path = os.path.join(hook_dir, run_id, "tp_rank_0", "hidden_states.safetensors")
+        art_kb = os.path.getsize(art_path) / 1024 if os.path.exists(art_path) else 0.0
 
         del llm
         import gc; gc.collect(); torch.cuda.empty_cache()

@@ -7,3 +7,14 @@ wandb/
 tests/experiment_runs/
 tests/scratch/
 tests/parity_tests/local_wandb_config.py
+
+# Cache and runtime artifacts
+cache/
+**/__pycache__/
+*.egg-info/
+
+# debug output
+output*.txt
+
+# random test configs
+model_configs/**/*.RANDOM_TEST.json

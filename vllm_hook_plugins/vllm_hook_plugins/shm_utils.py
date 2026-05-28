@@ -38,7 +38,17 @@ def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
         os.environ["VLLM_HOOK_USE_SHM"] = "0"
         return None
 
-    hs_mode = os.environ.get("VLLM_HOOK_HS_MODE", "last_token")
+    hidden_size = 0
+    target_layers: list = []
+    hs_mode = "last_token"
+    if config_file and os.path.exists(config_file):
+        with open(config_file) as f:
+            cfg = json.load(f)
+        hs_cfg = cfg.get("hidden_states", {})
+        target_layers = hs_cfg.get("layers", [])
+        hidden_size = cfg.get("hidden_size", 0)
+        hs_mode = hs_cfg.get("mode", "last_token")
+
     if hs_mode != "last_token":
         warnings.warn(
             f"VLLM_HOOK_USE_SHM=1 is only supported for 'last_token' mode, "
@@ -47,15 +57,6 @@ def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
         )
         os.environ["VLLM_HOOK_USE_SHM"] = "0"
         return None
-
-    hidden_size = 0
-    target_layers: list = []
-    if config_file and os.path.exists(config_file):
-        with open(config_file) as f:
-            cfg = json.load(f)
-        hs_cfg = cfg.get("hidden_states", {})
-        target_layers = hs_cfg.get("layers", [])
-        hidden_size = cfg.get("hidden_size", 0)
 
     if hidden_size <= 0 or not target_layers:
         print("VLLM_HOOK_USE_SHM=1 but could not read hidden_size / layers "
@@ -97,14 +98,15 @@ def teardown_shm(shm: Optional[Any]) -> None:
         pass
 
 
-def load_from_shm(hook_dir: str, run_id_file: str) -> Dict:
+def load_from_shm(hook_dir: str, run_id: Optional[str] = None) -> Dict:
     """Read tensors directly from the shared memory block.
 
     Polls for the ready flag written by the worker, then reads the buffer
     using the layout: [0:4] uint32 num_layers, [4:8] uint32 batch_size,
     [8:] float16 data row-major (layer_slot, batch_item, hidden_dim).
 
-    Optionally persists the artifact to disk when VLLM_HOOK_SHM_PERSIST=1.
+    Optionally persists the artifact to disk when VLLM_HOOK_SHM_PERSIST=1
+    (requires ``run_id`` to be provided).
     """
     import torch
     from multiprocessing.shared_memory import SharedMemory
@@ -148,8 +150,8 @@ def load_from_shm(hook_dir: str, run_id_file: str) -> Dict:
     shm.close()
 
     if os.environ.get("VLLM_HOOK_SHM_PERSIST", "0") == "1":
-        from vllm_hook_plugins.run_utils import latest_run_id
-        run_id = latest_run_id(run_id_file)
+        if not run_id:
+            raise ValueError("VLLM_HOOK_SHM_PERSIST=1 requires a run_id passed to load_from_shm.")
         run_dir = os.path.join(hook_dir, run_id, "tp_rank_0")
         os.makedirs(run_dir, exist_ok=True)
         out_path = os.path.join(run_dir, "hidden_states.pt")

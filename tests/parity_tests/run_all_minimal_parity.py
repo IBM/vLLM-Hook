@@ -20,8 +20,9 @@ import sys
 from pathlib import Path
 
 
-EXPERIMENTS = ("attn-tracker", "core-reranker", "steer-activation")
+EXPERIMENTS = ("hidden-states", "attn-tracker", "core-reranker", "steer-activation")
 DEFAULT_MODELS = {
+    "hidden-states": "Qwen/Qwen2-1.5B-Instruct",
     "attn-tracker": "Qwen/Qwen2-1.5B-Instruct",
     "core-reranker": "mistralai/Mistral-7B-Instruct-v0.3",
     "steer-activation": "microsoft/Phi-3-mini-4k-instruct",
@@ -174,6 +175,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local-hardware-label", default=os.environ.get("LOCAL_HARDWARE_LABEL", "apple-metal"))
     parser.add_argument("--local-hardware-kind", default=os.environ.get("LOCAL_HARDWARE_KIND", "metal"))
+    parser.add_argument("--hidden-model", default=os.environ.get("HIDDEN_STATES_MODEL", DEFAULT_MODELS["hidden-states"]))
     parser.add_argument("--attn-model", default=os.environ.get("ATTN_TRACKER_MODEL", DEFAULT_MODELS["attn-tracker"]))
     parser.add_argument("--core-model", default=os.environ.get("CORE_RERANKER_MODEL", DEFAULT_MODELS["core-reranker"]))
     parser.add_argument("--steer-model", default=os.environ.get("STEER_ACTIVATION_MODEL", DEFAULT_MODELS["steer-activation"]))
@@ -204,6 +206,7 @@ def parse_args() -> argparse.Namespace:
 
 def model_for(args: argparse.Namespace, experiment: str) -> str:
     return {
+        "hidden-states": args.hidden_model,
         "attn-tracker": args.attn_model,
         "core-reranker": args.core_model,
         "steer-activation": args.steer_model,
@@ -387,6 +390,8 @@ def run_colab(args: argparse.Namespace) -> None:
             args.repo_branch,
             "--benchmark-prefix",
             args.benchmark_prefix,
+            "--hidden-model",
+            args.hidden_model,
             "--attn-model",
             args.attn_model,
             "--core-model",
