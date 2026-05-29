@@ -17,9 +17,10 @@ from pathlib import Path
 
 
 EXPERIMENTS = ("hidden-states", "attn-tracker", "core-reranker", "steer-activation")
+DEFAULT_GRANITE_QUANTIZED_MODEL = "RedHatAI/granite-3.1-2b-instruct-quantized.w4a16"
 DEFAULT_MODELS = {
-    "hidden-states": "Qwen/Qwen2-1.5B-Instruct",
-    "attn-tracker": "Qwen/Qwen2-1.5B-Instruct",
+    "hidden-states": DEFAULT_GRANITE_QUANTIZED_MODEL,
+    "attn-tracker": DEFAULT_GRANITE_QUANTIZED_MODEL,
     "core-reranker": "mistralai/Mistral-7B-Instruct-v0.3",
     "steer-activation": "microsoft/Phi-3-mini-4k-instruct",
 }
