@@ -437,7 +437,13 @@ def run_hidden_states(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str
             max_tokens=1,
         ),
     )
-    _ = llm.generate(HIDDEN_PROMPTS, temperature=0.0, max_tokens=1, use_hook=True)
+    _ = llm.generate(
+        HIDDEN_PROMPTS,
+        temperature=0.0,
+        max_tokens=1,
+        use_hook=True,
+        save_to_disk=True,
+    )
     stats = llm.analyze(analyzer_spec={"reduce": "norm"})
     hidden_by_layer = {
         layer: flatten_mean([float(v) for v in values])
