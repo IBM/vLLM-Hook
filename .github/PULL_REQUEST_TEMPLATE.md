@@ -8,14 +8,17 @@
 - [ ] Other (describe below)
 
 ## Files modified
-<!-- List the files changed. Note: hook_llm.py should not be modified. -->
+<!-- List the files changed. -->
 
-- [ ] I have NOT modified `hook_llm.py`
+The following files are **core infrastructure**. Please discuss with maintainers before modifying:
+`hook_llm.py`, `_hook_plugin.py`, `registry.py`, `hook_client.py`, `run_utils.py`, `shm_utils.py`, `workers/_common.py`
+
+- [ ] I have NOT modified core files, OR I have discussed the change with maintainers
+- [ ] If I added a new worker/analyzer, I registered it in `__init__.py`
 
 ## Plugin architecture checklist
 - [ ] New workers/analyzers are registered via `PluginRegistry` in `__init__.py`
-- [ ] New workers extend `V1Worker` (not `HookLLM`)
-- [ ] `hooks_on=(prefill, generate)` flag is set correctly for any new worker registration
+- [ ] New workers are implemented as `worker_extension_cls`  (for in-band artifact retrieval and concurrent request support)
 - [ ] Examples or notebooks are included for new features
 
 ## Testing
