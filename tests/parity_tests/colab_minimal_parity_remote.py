@@ -210,6 +210,7 @@ def main() -> int:
 
     plugin_dir = workdir / "vllm_hook_plugins"
     req = workdir / "requirement.txt"
+    filtered_req = Path("/tmp/vllm_hook_colab_requirements.txt")
     if not plugin_dir.exists():
         raise FileNotFoundError(f"Plugin directory not found: {plugin_dir}")
 
@@ -219,7 +220,21 @@ def main() -> int:
     # Heavy installs can otherwise appear idle and trigger connection loss.
     run_shell(f"{sys.executable} -m pip install -U pip")
     if req.exists():
-        run_shell(f"{sys.executable} -m pip install -r {req}")
+        keep = []
+        for line in req.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            package = (
+                stripped.split("==", 1)[0]
+                .split(">=", 1)[0]
+                .split("<", 1)[0]
+                .strip()
+                .lower()
+            )
+            if package in {"vllm", "torch", "torchvision", "torchaudio"}:
+                continue
+            keep.append(line)
+        filtered_req.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        run_shell(f"{sys.executable} -m pip install -r {filtered_req}")
     else:
         print("Warning: requirement.txt not found; skipping dependency install.", flush=True)
     run_shell(f"{sys.executable} -m pip install --force-reinstall 'protobuf>=5.29.6,<6.30'")
@@ -232,9 +247,17 @@ def main() -> int:
         run_shell(f"{sys.executable} -m pip uninstall -y vllm")
         run_shell(f"{sys.executable} -m pip install -U uv")
         run_shell(
-            f"uv pip install --system --no-cache vllm "
-            f"--torch-backend={args.vllm_torch_backend}"
+            f"uv pip install --system --reinstall --no-cache vllm "
+            f"--torch-backend={args.vllm_torch_backend} "
+            f"--index-strategy unsafe-best-match"
         )
+    run_shell(
+        f"{sys.executable} -c "
+        f"'import torch, vllm; "
+        f'print("torch", torch.__version__); '
+        f'print("vllm", getattr(vllm, "__version__", "unknown"))'
+        f"'"
+    )
     run_shell(f"{sys.executable} -m pip install -e {plugin_dir}")
     plugin_src = str(plugin_dir.resolve())
     if plugin_src not in sys.path:
