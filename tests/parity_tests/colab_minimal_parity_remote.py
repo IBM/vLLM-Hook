@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
             "By default requirement.txt installs vLLM."
         ),
     )
+    parser.add_argument(
+        "--vllm-torch-backend",
+        default=env_value("VLLM_TORCH_BACKEND", "cu129"),
+        help="vLLM uv torch backend for Colab GPU installs, e.g. cu129 or cu130.",
+    )
     args = parser.parse_args()
     args.temperature = 0.0
     return args
@@ -223,6 +228,13 @@ def main() -> int:
         run_shell(f"{sys.executable} -m pip install google-cloud-secret-manager")
     if args.colab_install_vllm:
         run_shell(f"{sys.executable} -m pip install {args.colab_install_vllm}")
+    else:
+        run_shell(f"{sys.executable} -m pip uninstall -y vllm")
+        run_shell(f"{sys.executable} -m pip install -U uv")
+        run_shell(
+            f"uv pip install --system --no-cache vllm "
+            f"--torch-backend={args.vllm_torch_backend}"
+        )
     run_shell(f"{sys.executable} -m pip install -e {plugin_dir}")
     plugin_src = str(plugin_dir.resolve())
     if plugin_src not in sys.path:
