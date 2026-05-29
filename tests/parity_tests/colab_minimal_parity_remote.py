@@ -90,9 +90,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--vllm-torch-backend",
-        default=env_value("VLLM_TORCH_BACKEND", "cu129"),
-        help="vLLM uv torch backend for Colab GPU installs, e.g. cu129 or cu130.",
+        "--vllm-cuda-tag",
+        default=env_value("VLLM_CUDA_TAG", "cu121"),
+        help="CUDA wheel tag for Colab GPU installs, e.g. cu121 or cu122.",
+    )
+    parser.add_argument(
+        "--vllm-version",
+        default=env_value("VLLM_VERSION", "0.19.0"),
+        help="vLLM version used to select the matching CUDA wheel index.",
     )
     args = parser.parse_args()
     args.temperature = 0.0
@@ -246,9 +251,17 @@ def main() -> int:
     else:
         run_shell(f"{sys.executable} -m pip uninstall -y vllm")
         run_shell(f"{sys.executable} -m pip install -U uv")
+        torch_index = f"https://download.pytorch.org/whl/{args.vllm_cuda_tag}"
+        vllm_index = f"https://wheels.vllm.ai/{args.vllm_version}/{args.vllm_cuda_tag}"
         run_shell(
-            f"uv pip install --system --reinstall --no-cache vllm "
-            f"--torch-backend={args.vllm_torch_backend} "
+            f"uv pip install --system --reinstall --no-cache "
+            f"torch torchvision torchaudio --index-url {torch_index}"
+        )
+        run_shell(
+            f"uv pip install --system --reinstall --no-cache "
+            f"vllm=={args.vllm_version} "
+            f"--extra-index-url {vllm_index} "
+            f"--extra-index-url {torch_index} "
             f"--index-strategy unsafe-best-match"
         )
     run_shell(
