@@ -1,7 +1,6 @@
 import os
 import math
 import pickle
-import re
 import torch
 from typing import TYPE_CHECKING, Any, Dict, List
 import zstandard as zstd
@@ -15,6 +14,7 @@ from vllm_hook_plugins.workers._common import (
     init_async_save_thread,
     iter_matched_modules,
     iter_matching_req_ids,
+    match_attn,
     save_pt_atomic,
     save_safetensors_atomic,
 )
@@ -23,24 +23,6 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
 
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
-
-ATTN_PATTERNS = [
-    # GPT-2: transformer.h.<i>.attn
-    re.compile(r"^transformer\.h\.(\d+)\.attn.attn$"),
-
-    # OPT: model.decoder.layers.<i>.self_attn
-    re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn.attn$"),
-
-    # Qwen/LLaMA: model.layers.<i>.self_attn
-    re.compile(r"^model\.layers\.(\d+)\.self_attn.attn$"),
-]
-
-def match_attn(name: str):
-    for pat in ATTN_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 def _read_cached_keys(
