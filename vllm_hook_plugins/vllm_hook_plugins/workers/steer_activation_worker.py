@@ -30,7 +30,6 @@ class SteerHookActWorker:
 
     if TYPE_CHECKING:
         model_runner: Any
-    _default_hooks_on: str = "decode"
     _hooks_installed: bool = False
 
     def install_hooks(self):
@@ -62,7 +61,6 @@ class SteerHookActWorker:
             """Return the steered residual slice for one request."""
             method = cfg.get("method", "adjust_rs")
             coefficient = float(cfg.get("coefficient", 0))
-            apply_at_all_positions = bool(cfg.get("apply_at_all_positions", True))
 
             # Cache the loaded vector data per path.
             vector_path = cfg["vector_path"]
@@ -75,19 +73,22 @@ class SteerHookActWorker:
                 self._vector_cache[vector_path] = data
 
             steering_vec = data["dir"].to(slice_view.device, dtype=slice_view.dtype)
+            target = slice_view[-1:]  # (1, hidden)
 
-            if not apply_at_all_positions:
-                raise NotImplementedError("Only supports apply_at_all_positions=True for now.")
             if method == "add_vector":
-                return slice_view + coefficient * steering_vec.view(1, -1)
+                steered = target + coefficient * steering_vec.view(1, -1)
             elif method == "adjust_rs":
                 unit_vec = steering_vec  # use dir as unit vector (matches old behavior)
-                avg_proj = data["avg_proj"].to(slice_view.device, dtype=slice_view.dtype)
-                current_projections = torch.matmul(slice_view, unit_vec)
+                avg_proj = data["avg_proj"].to(target.device, dtype=target.dtype)
+                current_projections = torch.matmul(target, unit_vec)
                 coeff = (avg_proj - current_projections).unsqueeze(-1)
-                return slice_view + coeff * unit_vec.view(1, -1)
+                steered = target + coeff * unit_vec.view(1, -1)
             else:
                 raise ValueError(f"Unknown steering method: {method}")
+            # stitch the steered last row back
+            out = slice_view.clone()
+            out[-1:] = steered
+            return out
 
         def steering_hook(input, output, layer_num: int):
             ctx = get_forward_context()
@@ -135,6 +136,12 @@ class SteerHookActWorker:
                     continue
                 if int(cfg.get("optimal_layer", -1)) != layer_num:
                     continue
+
+                # if no apply_at_all_positions, then no-ops for decode phase
+                if not bool(cfg.get("apply_at_all_positions", True)):
+                    is_prefill = len(req_state.output_token_ids) == 0
+                    if not is_prefill:
+                        continue
 
                 start = int(last_indices[i].item())
                 end = int(last_indices[i + 1].item())
