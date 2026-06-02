@@ -111,7 +111,7 @@ class HookLLM:
             extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
             extra["hookq_mode"] = self._hookq_mode
         elif self.worker_name == "steer_hook_act":
-            extra["steer"] = self._steering_config or True
+            extra["steer"] = self._steering_config
         if save_to_disk:
             extra["save_to_disk"] = True
             extra["run_id"] = run_id
