@@ -230,5 +230,13 @@ class HookLLM:
         return dispatch_disk_analyze(self.analyzer, analyzer_spec,
                                      run_id=effective_run_id, run_ids=run_ids)
 
-    def __del__(self):
+    def close(self):
+        """Release resources owned by this wrapper."""
         teardown_shm(getattr(self, "_hook_shm", None))
+        self._hook_shm = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
