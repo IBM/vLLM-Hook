@@ -15,10 +15,55 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 from typing import Any, Iterator
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# Pattern matching
+# ---------------------------------------------------------------------------
+
+
+LAYER_PATTERNS = [
+    # LLaMA / Qwen2.x / Granite: model.layers.<i>
+    re.compile(r"^model\.layers\.(\d+)$"),
+    # Qwen3.5 multimodal (Qwen3_5ForConditionalGeneration): language_model.model.layers.<i>
+    re.compile(r"^language_model\.model\.layers\.(\d+)$"),
+    # GPT-2: transformer.h.<i>
+    re.compile(r"^transformer\.h\.(\d+)$"),
+    # OPT: model.decoder.layers.<i>
+    re.compile(r"^model\.decoder\.layers\.(\d+)$"),
+]
+
+
+def match_layer(name: str):
+    for pat in LAYER_PATTERNS:
+        m = pat.match(name)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+ATTN_PATTERNS = [
+    # GPT-2: transformer.h.<i>.attn
+    re.compile(r"^transformer\.h\.(\d+)\.attn.attn$"),
+
+    # OPT: model.decoder.layers.<i>.self_attn
+    re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn.attn$"),
+
+    # Qwen/LLaMA: model.layers.<i>.self_attn
+    re.compile(r"^model\.layers\.(\d+)\.self_attn.attn$"),
+]
+
+def match_attn(name: str):
+    for pat in ATTN_PATTERNS:
+        m = pat.match(name)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 # ---------------------------------------------------------------------------

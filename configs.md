@@ -125,9 +125,8 @@ VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_HOOK_WORKER=qk \
   vllm serve ibm-granite/granite-3.1-8b-instruct \
     --enforce-eager --max-model-len 2048 --port 8770
 
-# activation steering: also set VLLM_ACTSTEER_CONFIG
+# activation steering:
 VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_HOOK_WORKER=steer \
-  VLLM_ACTSTEER_CONFIG=model_configs/activation_steer/Phi-3-mini-4k-instruct.json \
   vllm serve microsoft/Phi-3-mini-4k-instruct \
     --enforce-eager --max-model-len 2048 --port 8770
 ```
@@ -150,18 +149,22 @@ hook.generate(model=MODEL, messages=msgs, save_to_disk=True, run_id="run-2", max
 stats = hook.analyze(analyzer_spec={...})
 ```
 
-For activation steering there's no artifact to analyze, so a plain openai client suffices:
+For activation steering there's no artifact to analyze, so a plain openai client suffices. Each request carries its own steer config as a JSON-encoded string under `vllm_xargs["steer"]` (vllm_xargs only allows scalar values; the plugin decodes the string back to a dict before the worker reads it). Different requests can use different configs:
 
 ```python
 import openai, json
+
+with open("model_configs/activation_steer/Phi-3-mini-4k-instruct.json") as f:
+    base = json.load(f)["steering"]
+
 client = openai.OpenAI(base_url="http://localhost:8770/v1", api_key="EMPTY")
 resp = client.chat.completions.create(
     model="microsoft/Phi-3-mini-4k-instruct",
     messages=[...], max_tokens=200, temperature=0.0,
-    extra_body={"vllm_xargs": {"steer": True}},                # use server-side default
-    # extra_body={"vllm_xargs": {"steer": json.dumps({...})}}, # or pass a full per-request config
+    extra_body={"vllm_xargs": {"steer": json.dumps({**base, "coefficient": 5})}},
 )
 ```
+See [`examples/demo_actsteer_serve.py`](examples/demo_actsteer_serve.py) for a runnable example with requests using different steer configs.
 
 `VLLM_HOOK_USE_SAFETENSORS` / `VLLM_HOOK_ASYNC_SAVE` are set when launching `vllm serve` (the server's worker process reads them at hook-fire time).
 

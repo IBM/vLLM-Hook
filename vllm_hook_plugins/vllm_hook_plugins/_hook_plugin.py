@@ -133,7 +133,7 @@ async def _patched_generate(
 
     wants_hs = extra.get("output_hidden_states") is not None
     wants_qk = extra.get("output_qk") is not None
-    wants_steer = bool(extra.get("steer"))
+    wants_steer = isinstance(extra.get("steer"), dict)
     needs_hooks = wants_hs or wants_qk or wants_steer
     save_to_disk = bool(extra.get("save_to_disk"))
 

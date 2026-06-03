@@ -1,4 +1,5 @@
 import os
+import json
 import multiprocessing as mp
 import torch
 
@@ -40,17 +41,31 @@ if __name__ == "__main__":
         "Write a dialogue between two people, one is dressed up in a ball gown and the other is dressed down in sweats. The two are going to a nightly event. Your answer must contain exactly 3 bullet points in the markdown format (use \"* \" to indicate each bullet) such as:\n* This is the first point.\n* This is the second point.",
         "What is the difference between the 13 colonies and the other British colonies in North America? Your answer must contain exactly 6 bullet point in Markdown using the following format:\n* Bullet point one.\n* Bullet point two.\n...\n* Bullet point fix."
     ]
-    
-    for case in test_cases:
+
+    # Per-request steering: uses the JSON config as-is vs. overrides method+coefficient
+    config_path = f'model_configs/activation_steer/{model.split("/")[-1]}.json'
+    with open(config_path) as f:
+        config = json.load(f)
+    default_config   = config["steering"]
+    sampling_params_list = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=2048,
+            stop_token_ids=[llm.tokenizer.eos_token_id, 32007],
+        ),
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=2048,
+            stop_token_ids=[llm.tokenizer.eos_token_id, 32007],
+            extra_args={"steer": {**default_config  , "method": "add_vector", "coefficient": 10}},
+        ),
+    ]
+
+    for case, sampling_params in zip(test_cases, sampling_params_list):
         print("=" * 50)
         prompt = case
         messages = [{"role": "user", "content": prompt}]
         example = llm.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        sampling_params = SamplingParams(
-            temperature=0.0,                       
-            max_tokens=2048,
-            stop_token_ids=[llm.tokenizer.eos_token_id, 32007],  
-        )
 
         output = llm.generate(example, sampling_params)
         print("With activation steering:")
@@ -61,4 +76,27 @@ if __name__ == "__main__":
         print("Without activation steering:")
         print(output[0].outputs[0].text)
         llm.llm_engine.reset_prefix_cache()
-            
+
+
+    ### batch processing 
+    print("=" * 50)
+    print("Batch processing examples...")
+    examples = [
+        llm.tokenizer.apply_chat_template(
+            [{"role": "user", "content": case}], add_generation_prompt=True, tokenize=False
+        )
+        for case in test_cases
+    ]
+
+    outputs = llm.generate(examples, sampling_params_list)
+    llm.llm_engine.reset_prefix_cache()
+    outputs_original = llm.generate(examples, sampling_params_list, use_hook=False)
+    llm.llm_engine.reset_prefix_cache()
+
+    for steered, original in zip(outputs, outputs_original):
+        print("=" * 50)
+        print("With activation steering:")
+        print(steered.outputs[0].text)
+        print("Without activation steering:")
+        print(original.outputs[0].text)
+

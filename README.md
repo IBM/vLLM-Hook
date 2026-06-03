@@ -49,13 +49,13 @@ Each use case (e.g. attention tracker, activation steering, hidden states extrac
 
 ```bash
 git clone https://github.com/IBM/vLLM-Hook.git
-cd vLLm.hook
+cd vLLM-Hook
 ```
 
 ### 2. (Optional) Create an environment 
 
 ```bash
-conda create -n vllm_hook_env
+conda create -n vllm_hook_env python=3.12 pip
 conda activate vllm_hook_env
 ```
 
@@ -102,7 +102,7 @@ python examples/demo_attntracker.py
 Notebook 📓: `notebooks/demo_corer.ipynb` <br />
 CLI 🧰 : 
 ```bash
-python examples/demo_actsteer.py
+python examples/demo_corer.py
 ```
 
 ### 3. Activation Steering (Enhanced instruction following via activation steering)
@@ -110,7 +110,7 @@ python examples/demo_actsteer.py
 Notebook 📓: `notebooks/demo_actsteer.ipynb` <br />
 CLI 🧰 : 
 ```bash
-python examples/demo_corer.py
+python examples/demo_actsteer.py
 ```
 
 You can customize model configurations in the `model_configs/` folder, e.g.:

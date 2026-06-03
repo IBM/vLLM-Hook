@@ -122,7 +122,7 @@ if __name__ == "__main__":
     print(f"Difference: {abs(scores[0] - scores[1]):.3f}")
 
 
-    ### batch processing, keep enable_prefix_caching=False
+    ### batch processing
     print("=" * 50)
     print("Batch processing examples...")
     texts = []
