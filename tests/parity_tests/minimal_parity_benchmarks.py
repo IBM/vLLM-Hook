@@ -46,6 +46,7 @@ HIDDEN_PROMPTS = [
 ]
 
 DEFAULT_GRANITE_QUANTIZED_MODEL = "RedHatAI/granite-3.1-2b-instruct-quantized.w4a16"
+DEFAULT_HIDDEN_STATES_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 
 CORE_QUERY = "Which city is older: Rome or New York?"
 CORE_DOCUMENTS = [
@@ -106,7 +107,7 @@ def model_for(args: argparse.Namespace) -> str:
     if args.model:
         return args.model
     return {
-        "hidden-states": DEFAULT_GRANITE_QUANTIZED_MODEL,
+        "hidden-states": DEFAULT_HIDDEN_STATES_MODEL,
         "attn-tracker": DEFAULT_GRANITE_QUANTIZED_MODEL,
         "core-reranker": "mistralai/Mistral-7B-Instruct-v0.3",
         "steer-activation": "microsoft/Phi-3-mini-4k-instruct",

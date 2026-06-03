@@ -18,6 +18,8 @@ python tests/parity_tests/minimal_parity_benchmarks.py hidden-states \
 ```
 
 Use the same `--benchmark-id` when running the matching non-Metal/GPU side.
+The hidden-states parity flow defaults to `Qwen/Qwen2.5-3B-Instruct` so the
+same model can run on both MLX/Metal and non-Metal backends.
 
 ## Run All Command Sequence
 
