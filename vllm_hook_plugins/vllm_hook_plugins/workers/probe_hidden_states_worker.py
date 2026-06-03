@@ -1,6 +1,5 @@
 import os
 import pickle
-import re
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -15,6 +14,7 @@ from vllm_hook_plugins.workers._common import (
     init_async_save_thread,
     iter_matched_modules,
     iter_matching_req_ids,
+    match_layer,
     save_pt_atomic,
     save_safetensors_atomic,
 )
@@ -23,25 +23,6 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
 
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
-
-LAYER_PATTERNS = [
-    # LLaMA / Qwen2.x / Granite: model.layers.<i>
-    re.compile(r"^model\.layers\.(\d+)$"),
-    # Qwen3.5 multimodal (Qwen3_5ForConditionalGeneration): language_model.model.layers.<i>
-    re.compile(r"^language_model\.model\.layers\.(\d+)$"),
-    # GPT-2: transformer.h.<i>
-    re.compile(r"^transformer\.h\.(\d+)$"),
-    # OPT: model.decoder.layers.<i>
-    re.compile(r"^model\.decoder\.layers\.(\d+)$"),
-]
-
-
-def match_layer(name: str):
-    for pat in LAYER_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 class ProbeHiddenStatesWorker:
