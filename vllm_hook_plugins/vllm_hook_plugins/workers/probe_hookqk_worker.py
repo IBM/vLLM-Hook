@@ -161,6 +161,14 @@ class ProbeHookQKWorker:
             except Exception:
                 return
 
+            try:
+                num_computed = self.model_runner.input_batch.num_computed_tokens_cpu
+                num_prompt   = self.model_runner.input_batch.num_prompt_tokens
+            except Exception:
+                # fall back to the old behavior and capture every chunk if these attributes aren't available on the running vLLM version
+                num_computed = None
+                num_prompt = None
+
             for i in range(bs):
                 req_id = req_ids[i]
                 req_state = self.model_runner.requests.get(req_id)
@@ -190,8 +198,8 @@ class ProbeHookQKWorker:
                 # to detect the first (prefill) pass. This is robust to prefix
                 # caching where query_len < seq_len even on the first pass.
                 hooks_on = extra.get("hooks_on", self._default_hooks_on)
+                is_prefill = len(req_state.output_token_ids) == 0
                 if hooks_on != "both":
-                    is_prefill = len(req_state.output_token_ids) == 0
                     if hooks_on == "prefill" and not is_prefill:
                         continue
                     if hooks_on == "decode" and is_prefill:
@@ -202,6 +210,14 @@ class ProbeHookQKWorker:
 
                 start = int(last_indices[i].item())
                 end = int(last_indices[i + 1].item())
+
+                # With chunked-prefill, in last_token mode, only capture on the final chunk of the prefill
+                # i.e., when computed-after-step reaches num_prompt_tokens
+                if (is_prefill and req_mode == "last_token" and num_computed is not None and num_prompt is not None):
+                    chunk_len = end - start
+                    if int(num_computed[i]) + chunk_len < int(num_prompt[i]):
+                        # Mid-prefill chunk doesn't need capture
+                        continue
 
                 # Accumulate GPU tensors — clone() copies data immediately so we
                 # own the buffer; .cpu() is deferred to retrieval/flush.
