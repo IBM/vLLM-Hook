@@ -260,10 +260,18 @@ def flatten_mean(values: list[float]) -> float:
 
 
 def read_run_ids(llm: Any) -> list[str]:
-    path = Path(getattr(llm, "_run_id_file", ""))
-    if not path.exists():
-        return []
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    run_id_file = getattr(llm, "_run_id_file", None)
+    if run_id_file:
+        path = Path(run_id_file)
+        if path.is_file():
+            return [
+                line.strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+    last_run_id = getattr(llm, "_last_run_id", None)
+    return [last_run_id] if last_run_id else []
 
 
 def qk_artifact_paths(llm: Any, run_id: str) -> list[Path]:
