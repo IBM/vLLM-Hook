@@ -192,8 +192,8 @@ class HookLLM:
                 merged[cache_key] = {}
                 for layer in all_probes[0][cache_key]:
                     first = all_probes[0][cache_key][layer]
-                    entry = {k: v for k, v in first.items() if k not in ("q", "k_all", "hs")}
-                    for tensor_key in ("q", "k_all", "hs"):
+                    entry = {k: v for k, v in first.items() if k not in ("q", "k_all", "hidden_states")}
+                    for tensor_key in ("q", "k_all", "hidden_states"):
                         if tensor_key not in first:
                             continue
                         entry[tensor_key] = [p[cache_key][layer][tensor_key][0] for p in all_probes]
