@@ -8,6 +8,7 @@ os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 from vllm import LLM, SamplingParams
 from vllm_hook_plugins.registry import PluginRegistry
 from vllm_hook_plugins.run_utils import dispatch_disk_analyze
+from vllm_hook_plugins.shm_utils import teardown_shm
 
 class HookLLM:
     def __init__(
@@ -99,11 +100,9 @@ class HookLLM:
             self._hs_mode = hs_cfg.get("mode", "last_token")
             self._output_layers = layers if layers else True
 
-    def _build_extra_args(self, save_to_disk: bool, run_id: str,
-                            request_extra_args: Optional[dict] = None) -> dict:
+    def _build_extra_args(self, save_to_disk: bool, run_id: str) -> dict:
         """Build extra_args for the probe worker based on worker_name and config."""
         extra = {}
-        request_extra_args = request_extra_args or {}
         if self.worker_name == "probe_hidden_states":
             extra["output_hidden_states"] = self._output_layers if self._output_layers else True
             extra["hs_mode"] = self._hs_mode
@@ -112,13 +111,7 @@ class HookLLM:
             extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
             extra["hookq_mode"] = self._hookq_mode
         elif self.worker_name == "steer_hook_act":
-            # Start from the instance-default steer config (loaded from config_file),
-            # then apply any per-request overrides from extra_args["steer"].
-            base = dict(self._steering_config) if self._steering_config else {}
-            override = request_extra_args.get("steer")
-            if isinstance(override, dict):
-                base.update(override)
-            extra["steer"] = base or True
+            extra["steer"] = self._steering_config
         if save_to_disk:
             extra["save_to_disk"] = True
             extra["run_id"] = run_id
@@ -128,7 +121,7 @@ class HookLLM:
     def generate(
         self,
         prompts: List[str],
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params=None,
         use_hook: Optional[bool] = None,
         save_to_disk: bool = False,
         run_id: Optional[str] = None,
@@ -142,18 +135,49 @@ class HookLLM:
         if sampling_params is None:
             sampling_params = SamplingParams(**kwargs)
 
+        if isinstance(sampling_params, list):
+            # list[SamplingParams] allows different hook params within requests
+            if len(sampling_params) != len(prompts):
+                raise ValueError(
+                    f"sampling_params list length ({len(sampling_params)}) "
+                    f"must match prompts length ({len(prompts)})"
+                )
+            sp_list = list(sampling_params)
+        else:
+            sp_list = [sampling_params] * len(prompts)
+
         if hook and self.worker_name:
             if run_id is None:
                 run_id = str(uuid.uuid4())
-            sampling_params = copy.copy(sampling_params)
-            extra = dict(sampling_params.extra_args or {})
-            extra.update(self._build_extra_args(save_to_disk, run_id, request_extra_args=extra))
-            sampling_params.extra_args = extra
+            defaults = self._build_extra_args(save_to_disk, run_id)
+            new_sp_list = []
+            for sp in sp_list:
+                sp = copy.copy(sp)
+                extra = dict(sp.extra_args or {})
+
+                for k, v in defaults.items():
+                    extra.setdefault(k, v)  # insert-only-if-missing
+                sp.extra_args = extra
+                new_sp_list.append(sp)
+            sp_list = new_sp_list
             # Store last run_id so analyze() can find the artifact without
             # the caller needing to track it.
             self._last_run_id = run_id
+        else:
+            # clear extra_args when use_hook=False
+            new_sp_list = []
+            for sp in sp_list:
+                if sp.extra_args:
+                    sp = copy.copy(sp)
+                    sp.extra_args = None
+                new_sp_list.append(sp)
+            sp_list = new_sp_list
 
-        outputs = self.llm.generate(prompts, sampling_params)
+        if all(sp is sp_list[0] for sp in sp_list):
+            # collapse to a single sp if they are all the same
+            outputs = self.llm.generate(prompts, sp_list[0])
+        else:
+            outputs = self.llm.generate(prompts, sp_list)
 
         if hook and self.worker_name and not save_to_disk and len(outputs) > 1 and getattr(outputs[0], "probes", None) is not None:
             # Merge per-request probes onto outputs[0] so callers always use
@@ -168,8 +192,8 @@ class HookLLM:
                 merged[cache_key] = {}
                 for layer in all_probes[0][cache_key]:
                     first = all_probes[0][cache_key][layer]
-                    entry = {k: v for k, v in first.items() if k not in ("q", "k_all", "hs")}
-                    for tensor_key in ("q", "k_all", "hs"):
+                    entry = {k: v for k, v in first.items() if k not in ("q", "k_all", "hidden_states")}
+                    for tensor_key in ("q", "k_all", "hidden_states"):
                         if tensor_key not in first:
                             continue
                         entry[tensor_key] = [p[cache_key][layer][tensor_key][0] for p in all_probes]
@@ -206,6 +230,13 @@ class HookLLM:
         return dispatch_disk_analyze(self.analyzer, analyzer_spec,
                                      run_id=effective_run_id, run_ids=run_ids)
 
-    def __del__(self):
-        from vllm_hook_plugins.shm_utils import teardown_shm
+    def close(self):
+        """Release resources owned by this wrapper."""
         teardown_shm(getattr(self, "_hook_shm", None))
+        self._hook_shm = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

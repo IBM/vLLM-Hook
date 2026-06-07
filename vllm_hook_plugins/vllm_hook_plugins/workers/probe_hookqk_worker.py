@@ -1,7 +1,6 @@
 import os
 import math
 import pickle
-import re
 import torch
 from typing import TYPE_CHECKING, Any, Dict, List
 import zstandard as zstd
@@ -15,6 +14,7 @@ from vllm_hook_plugins.workers._common import (
     init_async_save_thread,
     iter_matched_modules,
     iter_matching_req_ids,
+    match_attn,
     save_pt_atomic,
     save_safetensors_atomic,
 )
@@ -23,24 +23,6 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
 
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
-
-ATTN_PATTERNS = [
-    # GPT-2: transformer.h.<i>.attn
-    re.compile(r"^transformer\.h\.(\d+)\.attn.attn$"),
-
-    # OPT: model.decoder.layers.<i>.self_attn
-    re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn.attn$"),
-
-    # Qwen/LLaMA: model.layers.<i>.self_attn
-    re.compile(r"^model\.layers\.(\d+)\.self_attn.attn$"),
-]
-
-def match_attn(name: str):
-    for pat in ATTN_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 def _read_cached_keys(
@@ -179,6 +161,14 @@ class ProbeHookQKWorker:
             except Exception:
                 return
 
+            try:
+                num_computed = self.model_runner.input_batch.num_computed_tokens_cpu
+                num_prompt   = self.model_runner.input_batch.num_prompt_tokens
+            except Exception:
+                # fall back to the old behavior and capture every chunk if these attributes aren't available on the running vLLM version
+                num_computed = None
+                num_prompt = None
+
             for i in range(bs):
                 req_id = req_ids[i]
                 req_state = self.model_runner.requests.get(req_id)
@@ -208,8 +198,8 @@ class ProbeHookQKWorker:
                 # to detect the first (prefill) pass. This is robust to prefix
                 # caching where query_len < seq_len even on the first pass.
                 hooks_on = extra.get("hooks_on", self._default_hooks_on)
+                is_prefill = len(req_state.output_token_ids) == 0
                 if hooks_on != "both":
-                    is_prefill = len(req_state.output_token_ids) == 0
                     if hooks_on == "prefill" and not is_prefill:
                         continue
                     if hooks_on == "decode" and is_prefill:
@@ -220,6 +210,14 @@ class ProbeHookQKWorker:
 
                 start = int(last_indices[i].item())
                 end = int(last_indices[i + 1].item())
+
+                # With chunked-prefill, in last_token mode, only capture on the final chunk of the prefill
+                # i.e., when computed-after-step reaches num_prompt_tokens
+                if (is_prefill and req_mode == "last_token" and num_computed is not None and num_prompt is not None):
+                    chunk_len = end - start
+                    if int(num_computed[i]) + chunk_len < int(num_prompt[i]):
+                        # Mid-prefill chunk doesn't need capture
+                        continue
 
                 # Accumulate GPU tensors — clone() copies data immediately so we
                 # own the buffer; .cpu() is deferred to retrieval/flush.

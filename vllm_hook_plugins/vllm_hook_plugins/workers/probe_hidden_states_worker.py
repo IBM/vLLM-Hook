@@ -1,6 +1,5 @@
 import os
 import pickle
-import re
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -15,6 +14,7 @@ from vllm_hook_plugins.workers._common import (
     init_async_save_thread,
     iter_matched_modules,
     iter_matching_req_ids,
+    match_layer,
     save_pt_atomic,
     save_safetensors_atomic,
 )
@@ -23,25 +23,6 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
 
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
-
-LAYER_PATTERNS = [
-    # LLaMA / Qwen2.x / Granite: model.layers.<i>
-    re.compile(r"^model\.layers\.(\d+)$"),
-    # Qwen3.5 multimodal (Qwen3_5ForConditionalGeneration): language_model.model.layers.<i>
-    re.compile(r"^language_model\.model\.layers\.(\d+)$"),
-    # GPT-2: transformer.h.<i>
-    re.compile(r"^transformer\.h\.(\d+)$"),
-    # OPT: model.decoder.layers.<i>
-    re.compile(r"^model\.decoder\.layers\.(\d+)$"),
-]
-
-
-def match_layer(name: str):
-    for pat in LAYER_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 class ProbeHiddenStatesWorker:
@@ -126,9 +107,18 @@ class ProbeHiddenStatesWorker:
         self._batch_cache_key = None
         self._batch_cache_entries = None  # list[dict] of resolved per-request info
 
-        def _resolve_batch(req_ids, bs):
+        def _resolve_batch(req_ids, bs, query_start_loc):
             """Build the per-batch list of capturing requests. Called once per
             forward step (on the first hook fire that gets here)."""
+            try:
+                input_batch = self.model_runner.input_batch
+                num_computed = input_batch.num_computed_tokens_cpu
+                num_prompt   = input_batch.num_prompt_tokens
+            except Exception:
+                # fall back to the old behavior and capture every chunk if these attributes aren't available on the running vLLM version
+                num_computed = None
+                num_prompt = None
+
             entries = []
             for i in range(bs):
                 req_id = req_ids[i]
@@ -143,17 +133,27 @@ class ProbeHiddenStatesWorker:
                 # hooks_on != "both"; output_token_ids state is stable for
                 # the duration of one forward step.
                 hooks_on = extra.get("hooks_on", self._default_hooks_on)
+                is_prefill = len(req_state.output_token_ids) == 0
                 if hooks_on != "both":
-                    is_prefill = len(req_state.output_token_ids) == 0
                     if hooks_on == "prefill" and not is_prefill:
                         continue
                     if hooks_on == "decode" and is_prefill:
                         continue
+
+                # With chunked-prefill, in last_token mode, only capture on the final chunk of the prefill
+                # i.e., when computed-after-step reaches num_prompt_tokens
+                req_mode = extra.get("hs_mode", self.hs_mode)
+                if (is_prefill and req_mode == "last_token" and num_computed is not None and num_prompt is not None):
+                    chunk_len = int(query_start_loc[i + 1].item() - query_start_loc[i].item())
+                    if int(num_computed[i]) + chunk_len < int(num_prompt[i]):
+                        # Mid-prefill chunk doesn't need capture
+                        continue
+
                 entries.append({
                     "i": i,
                     "req_id": req_id,
                     "output_layers": output_layers,  # list or None ("all layers")
-                    "hs_mode": extra.get("hs_mode", self.hs_mode),
+                    "hs_mode": req_mode,
                     "save_to_disk": bool(extra.get("save_to_disk")),
                 })
             return entries
@@ -186,7 +186,7 @@ class ProbeHiddenStatesWorker:
                     return
                 bs = len(query_start_loc) - 1
                 self._batch_cache_key = cache_key
-                self._batch_cache_entries = _resolve_batch(req_ids, bs)
+                self._batch_cache_entries = _resolve_batch(req_ids, bs, query_start_loc)
                 self._batch_cache_qsl = query_start_loc
 
             entries = self._batch_cache_entries
