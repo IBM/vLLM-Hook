@@ -14,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import json
 import math
@@ -346,6 +347,20 @@ def metric_label(key: str) -> str:
     return labels.get(key, key.replace("_", " ").strip().title())
 
 
+def display_backend_label(run: RunSnapshot) -> str:
+    backend = str(metric_value(run, "backend") or run.config.get("backend", "")).strip().lower()
+    if backend in {"metal", "mlx", "apple-metal"}:
+        return "Metal"
+    if backend in {"non-metal", "gpu", "cuda", "colab", "t4"}:
+        return "GPU"
+    key = platform_key(run)
+    if key == "metal":
+        return "Metal"
+    if key == "gpu":
+        return "GPU"
+    return "Run"
+
+
 def metric_keys(runs: list[RunSnapshot]) -> list[str]:
     keys = set()
     for run in runs:
@@ -355,14 +370,13 @@ def metric_keys(runs: list[RunSnapshot]) -> list[str]:
     return ordered
 
 
-def attention_note(project: str, runs: list[RunSnapshot]) -> str:
-    if not runs:
-        return ""
-    keys = set(metric_keys(runs))
-    attention_like = any(hint in project.lower() for hint in ATTENTION_PROJECT_HINTS) or "attn_score_mean" in keys
-    if not attention_like:
-        return ""
-    return "Attention parity should be validated across repeated seeds/prompts."
+def run_display_label(run: RunSnapshot, index: int | None = None) -> str:
+    backend = display_backend_label(run)
+    if backend != "Run":
+        return backend
+    if index is not None:
+        return f"Run {index + 1}"
+    return "Run"
 
 
 def format_number(value: Any) -> str:
@@ -374,35 +388,85 @@ def format_number(value: Any) -> str:
     return str(value)
 
 
-def project_summary_markdown(project: str, runs: list[RunSnapshot]) -> str:
-    keys = metric_keys(runs)
-    heading = f"## {project}"
-    if not runs:
-        return f"{heading}\n\nNo recent runs were found.\n"
-
-    header = ["Run", "Backend", "Created", "Group", *[metric_label(key) for key in keys]]
-    rows = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
-    for run in runs:
-        backend = clean_scalar(metric_value(run, "backend") or run.config.get("backend", ""))
-        run_label = f"[{run.name}]({run.url})" if run.url else run.name
-        values = [
-            run_label,
-            str(backend),
-            run.created_at,
-            run.group,
-            *[format_number(metric_value(run, key)) for key in keys],
-        ]
-        rows.append("| " + " | ".join(escape_table_cell(value) for value in values) + " |")
-    note = attention_note(project, runs)
-    body = [heading, "", "### Run Summary", "", "\n".join(rows)]
-    if note:
-        body.extend(["", f"*{note}*"])
-    return "\n".join(body) + "\n"
-
-
 def escape_table_cell(value: Any) -> str:
     text = str(value)
     return text.replace("|", "\\|").replace("\n", "<br>")
+
+
+def render_card(text: str) -> str:
+    return (
+        '<div style="margin: 18px 0; padding: 18px 20px; border: 1px solid #e5e7eb; '
+        'border-radius: 16px; background: #ffffff;">\n'
+        f"{text}\n"
+        "</div>"
+    )
+
+
+def render_title_block(title: str, subtitle: str, generated_at: str) -> str:
+    content = (
+        '<div style="text-align:center; margin: 18px 0 28px; padding: 22px 20px;">\n'
+        f'<h1 style="margin: 0 0 8px;">{html.escape(title)}</h1>\n'
+        f'<div style="margin: 0 0 6px; font-size: 1.05em; color: #4b5563;">{html.escape(subtitle)}</div>\n'
+        f'<div style="font-size: 0.9em; color: #6b7280;">Generated: {html.escape(generated_at)}</div>\n'
+        "</div>"
+    )
+    return content
+
+
+def render_section_header(project: str) -> str:
+    return render_card(
+        f'<h2 style="margin: 0 0 6px;">{html.escape(project)}</h2>\n'
+        '<div style="height: 1px; background: #e5e7eb; margin: 12px 0 0;"></div>'
+    )
+
+
+def render_metric_table(title: str, headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    head_cells = "".join(
+        f'<th style="text-align: {("left" if idx == 0 else "right")}; padding: 8px 10px; border-bottom: 1px solid #d1d5db; white-space: nowrap;">{html.escape(header)}</th>'
+        for idx, header in enumerate(headers)
+    )
+    body_rows = []
+    for row in rows:
+        row_cells = "".join(
+            f'<td style="text-align: {("left" if idx == 0 else "right")}; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; white-space: nowrap;">{html.escape(value)}</td>'
+            for idx, value in enumerate(row)
+        )
+        body_rows.append(f"<tr>{row_cells}</tr>")
+    table = (
+        '<table style="display: inline-table; width: auto; max-width: 100%; border-collapse: collapse; font-size: 0.95em;">'
+        f"<thead><tr>{head_cells}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+    )
+    return render_card(
+        f'<h3 style="margin: 0 0 12px;">{html.escape(title)}</h3>\n'
+        f"{table}"
+    )
+
+
+def render_chart_container(title: str) -> str:
+    return render_card(
+        f'<h3 style="text-align:center; margin: 0 0 12px;">{html.escape(title)}</h3>'
+    )
+
+
+def project_summary_markdown(project: str, runs: list[RunSnapshot]) -> str:
+    keys = metric_keys(runs)
+    if not runs:
+        return render_card(
+            f'<h3 style="margin: 0 0 12px;">Run Summary</h3>\n'
+            '<div style="color: #6b7280;">No recent runs were found.</div>'
+        )
+
+    headers = ["Backend", *[metric_label(key) for key in keys]]
+    rows: list[list[str]] = []
+    for index, run in enumerate(runs):
+        backend = run_display_label(run, index)
+        row = [backend, *[format_number(metric_value(run, key)) for key in keys]]
+        rows.append(row)
+    return render_metric_table("Run Summary", headers, rows)
 
 
 def project_delta_markdown(project: str, runs: list[RunSnapshot]) -> str:
@@ -410,12 +474,8 @@ def project_delta_markdown(project: str, runs: list[RunSnapshot]) -> str:
         return ""
     left, right = runs[0], runs[1]
     keys = metric_keys(runs)
-    left_label = str(
-        metric_value(left, "backend") or left.config.get("backend", left.name)
-    )
-    right_label = str(
-        metric_value(right, "backend") or right.config.get("backend", right.name)
-    )
+    left_label = display_backend_label(left)
+    right_label = display_backend_label(right)
     rows = []
     for key in keys:
         left_value = numeric(metric_value(left, key))
@@ -435,52 +495,30 @@ def project_delta_markdown(project: str, runs: list[RunSnapshot]) -> str:
         )
     if not rows:
         return ""
-    body = [
-        f"### {project} Delta Summary",
-        "",
-        f"| Metric | {escape_table_cell(left_label)} | {escape_table_cell(right_label)} | Abs Delta | Relative Delta |",
-        "| --- | ---: | ---: | ---: | ---: |",
-    ]
-    for parts in rows:
-        body.append("| " + " | ".join(escape_table_cell(part) for part in parts) + " |")
-    return "\n".join(body) + "\n"
-
-
-def validation_notes(project_runs: dict[str, list[RunSnapshot]]) -> str:
-    notes = [
-        "## Validation Notes",
-        "",
-        "- [ ] Check run provenance and backend labels before reading parity claims.",
-        "- [ ] For attention metrics, validate across repeated seeds/prompts before claiming statistical parity.",
-    ]
-    return "\n".join(notes) + "\n"
+    return render_metric_table(
+        "Metrics",
+        ["Metric", left_label, right_label, "Abs Delta", "Relative Delta"],
+        rows,
+    )
 
 
 def executive_summary_markdown(project_runs: dict[str, list[RunSnapshot]]) -> str:
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     project_list = ", ".join(project_runs)
-    return "\n".join(
-        [
-            f"# vLLM-Hook Platform Parity Findings",
-            "",
-            f"Generated: {created}",
-            "",
-            f"Projects included: {project_list}",
-            "",
-            "This report uses a block layout: a short overview, one section per project, compact per-run summaries, scalar charts, delta badges, and a concise validation checklist at the bottom.",
-            "",
-        ]
-    )
+    subtitle = f"Projects included: {project_list}"
+    return render_title_block("vLLM-Hook Platform Parity Findings", subtitle, created)
 
 
 def markdown_report(project_runs: dict[str, list[RunSnapshot]]) -> str:
     sections = [executive_summary_markdown(project_runs)]
     for project, runs in project_runs.items():
+        sections.append(render_section_header(project))
         sections.append(project_summary_markdown(project, runs))
         delta = project_delta_markdown(project, runs)
         if delta:
             sections.append(delta)
-    sections.append(validation_notes(project_runs))
+            sections.append(render_chart_container("Visualizations"))
+        sections.append('<div style="margin: 18px 0;"><hr style="border: 0; border-top: 1px solid #e5e7eb;" /></div>')
     return "\n".join(sections)
 
 
@@ -512,16 +550,23 @@ def project_delta_block(wr: Any, project: str, runs: list[RunSnapshot]) -> Any:
     return wr.MarkdownBlock(text=text)
 
 
-def project_summary_block(wr: Any, project: str, runs: list[RunSnapshot]) -> Any:
-    return wr.MarkdownBlock(text=project_summary_markdown(project, runs))
-
-
 def executive_summary_block(wr: Any, project_runs: dict[str, list[RunSnapshot]]) -> Any:
     return wr.MarkdownBlock(text=executive_summary_markdown(project_runs))
 
 
-def validation_notes_block(wr: Any, project_runs: dict[str, list[RunSnapshot]]) -> Any:
-    return wr.MarkdownBlock(text=validation_notes(project_runs))
+def render_project_card(wr: Any, project: str, runs: list[RunSnapshot], entity: str) -> list[Any]:
+    blocks: list[Any] = []
+    blocks.append(wr.MarkdownBlock(text=render_section_header(project)))
+    blocks.append(wr.MarkdownBlock(text=project_summary_markdown(project, runs)))
+    delta_block = project_delta_block(wr, project, runs)
+    if delta_block is not None:
+        blocks.append(delta_block)
+    panel_grid = project_panel_grid(wr, project, runs, entity)
+    if panel_grid is not None:
+        blocks.append(wr.MarkdownBlock(text=render_chart_container("Visualizations")))
+        blocks.append(panel_grid)
+    blocks.append(wr.MarkdownBlock(text='<div style="margin: 18px 0;"><hr style="border: 0; border-top: 1px solid #e5e7eb;" /></div>'))
+    return blocks
 
 
 def report_blocks(
@@ -531,16 +576,7 @@ def report_blocks(
 ) -> list[Any]:
     blocks = [executive_summary_block(wr, project_runs)]
     for project, runs in project_runs.items():
-        blocks.append(project_summary_block(wr, project, runs))
-        if not runs:
-            continue
-        panel_grid = project_panel_grid(wr, project, runs, entity)
-        if panel_grid is not None:
-            blocks.append(panel_grid)
-        delta_block = project_delta_block(wr, project, runs)
-        if delta_block is not None:
-            blocks.append(delta_block)
-    blocks.append(validation_notes_block(wr, project_runs))
+        blocks.extend(render_project_card(wr, project, runs, entity))
     return blocks
 
 
