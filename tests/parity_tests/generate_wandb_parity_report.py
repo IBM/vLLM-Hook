@@ -31,7 +31,6 @@ L2_KEYS = (
     "q_l2_mean",
     "k_l2_mean",
     "hidden_state_l2_mean",
-    "hidden_state_l2_mean_from_qkv_x",
     "score_l2",
     "steering_vector_l2",
 )
@@ -98,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs-per-project",
         type=int,
-        default=50,
+        default=500,
         help=(
             "Number of recent runs to scan per project when selecting the "
             "latest Metal/MLX and GPU/non-Metal run."
@@ -210,31 +209,66 @@ def platform_key(run: RunSnapshot) -> str:
     return "unknown"
 
 
+PLATFORM_FILTERS = {
+    "metal": (
+        {"config.backend": "metal"},
+        {"config.hardware_kind": {"$in": ["metal", "mlx"]}},
+        {"tags": {"$in": ["metal", "mlx", "apple-metal"]}},
+    ),
+    "gpu": (
+        {"config.backend": "non-metal"},
+        {"config.hardware_kind": {"$in": ["gpu", "cuda"]}},
+        {"tags": {"$in": ["non-metal", "gpu", "cuda", "colab", "t4"]}},
+    ),
+}
+
+
+def fetch_latest_filtered_platform_run(
+    api: Any, path: str, project: str, platform: str
+) -> RunSnapshot | None:
+    candidates: list[RunSnapshot] = []
+    for filters in PLATFORM_FILTERS[platform]:
+        try:
+            runs = api.runs(path, filters=filters, order="-created_at", per_page=1)
+            for run in runs:
+                snap = snapshot(project, run)
+                if platform_key(snap) == platform:
+                    return snap
+                candidates.append(snap)
+                break
+        except Exception:
+            continue
+    return candidates[0] if candidates else None
+
+
 def fetch_latest_platform_runs(
     api: Any, entity: str, project: str, scan_limit: int
 ) -> list[RunSnapshot]:
     path = f"{entity}/{project}" if entity else project
+    latest: dict[str, RunSnapshot] = {}
+    unknown: list[RunSnapshot] = []
+    for key in ("metal", "gpu"):
+        run = fetch_latest_filtered_platform_run(api, path, project, key)
+        if run is not None:
+            latest[key] = run
+    if "metal" in latest and "gpu" in latest:
+        return [latest["metal"], latest["gpu"]]
+
     try:
-        runs = [
-            snapshot(project, run)
-            for run in list(
-                api.runs(path, order="-created_at", per_page=scan_limit)
-            )[:scan_limit]
-        ]
+        for index, run in enumerate(api.runs(path, order="-created_at", per_page=100)):
+            if index >= scan_limit:
+                break
+            snap = snapshot(project, run)
+            key = platform_key(snap)
+            if key in {"metal", "gpu"} and key not in latest:
+                latest[key] = snap
+            elif key == "unknown":
+                unknown.append(snap)
+            if "metal" in latest and "gpu" in latest:
+                break
     except Exception as exc:
         print(f"Skipping {project}: {type(exc).__name__}: {exc}", flush=True)
         return []
-
-    latest: dict[str, RunSnapshot] = {}
-    unknown: list[RunSnapshot] = []
-    for run in runs:
-        key = platform_key(run)
-        if key in {"metal", "gpu"} and key not in latest:
-            latest[key] = run
-        elif key == "unknown":
-            unknown.append(run)
-        if "metal" in latest and "gpu" in latest:
-            break
 
     selected = []
     for key in ("metal", "gpu"):
@@ -298,6 +332,20 @@ def metric_value(run: RunSnapshot, key: str) -> Any:
     return run.config.get(key)
 
 
+def metric_label(key: str) -> str:
+    labels = {
+        "q_l2_mean": "Q L2 mean",
+        "k_l2_mean": "K L2 mean",
+        "hidden_state_l2_mean": "Hidden-state L2 mean",
+        "score_l2": "Score L2",
+        "steering_vector_l2": "Steering-vector L2",
+        "attn_score_mean": "Attention score mean",
+        "score_margin_top1_top2": "Top-1 / top-2 score margin",
+        "text_changed_by_steering": "Text changed by steering",
+    }
+    return labels.get(key, key.replace("_", " ").strip().title())
+
+
 def metric_keys(runs: list[RunSnapshot]) -> list[str]:
     keys = set()
     for run in runs:
@@ -307,24 +355,49 @@ def metric_keys(runs: list[RunSnapshot]) -> list[str]:
     return ordered
 
 
-def project_table(project: str, runs: list[RunSnapshot]) -> str:
-    keys = metric_keys(runs)
+def attention_note(project: str, runs: list[RunSnapshot]) -> str:
     if not runs:
-        return f"### {project}\n\nNo recent runs were found.\n"
-    header = ["Run", "Created", "Backend", "Group", *keys]
+        return ""
+    keys = set(metric_keys(runs))
+    attention_like = any(hint in project.lower() for hint in ATTENTION_PROJECT_HINTS) or "attn_score_mean" in keys
+    if not attention_like:
+        return ""
+    return "Attention parity should be validated across repeated seeds/prompts."
+
+
+def format_number(value: Any) -> str:
+    value = clean_scalar(value)
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def project_summary_markdown(project: str, runs: list[RunSnapshot]) -> str:
+    keys = metric_keys(runs)
+    heading = f"## {project}"
+    if not runs:
+        return f"{heading}\n\nNo recent runs were found.\n"
+
+    header = ["Run", "Backend", "Created", "Group", *[metric_label(key) for key in keys]]
     rows = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
     for run in runs:
         backend = clean_scalar(metric_value(run, "backend") or run.config.get("backend", ""))
         run_label = f"[{run.name}]({run.url})" if run.url else run.name
         values = [
             run_label,
-            run.created_at,
             str(backend),
+            run.created_at,
             run.group,
-            *[format_value(metric_value(run, key)) for key in keys],
+            *[format_number(metric_value(run, key)) for key in keys],
         ]
         rows.append("| " + " | ".join(escape_table_cell(value) for value in values) + " |")
-    return f"### {project}\n\n" + "\n".join(rows) + "\n"
+    note = attention_note(project, runs)
+    body = [heading, "", "### Run Summary", "", "\n".join(rows)]
+    if note:
+        body.extend(["", f"*{note}*"])
+    return "\n".join(body) + "\n"
 
 
 def escape_table_cell(value: Any) -> str:
@@ -332,14 +405,7 @@ def escape_table_cell(value: Any) -> str:
     return text.replace("|", "\\|").replace("\n", "<br>")
 
 
-def format_value(value: Any) -> str:
-    value = clean_scalar(value)
-    if isinstance(value, float):
-        return f"{value:.6g}"
-    return "" if value is None else str(value)
-
-
-def delta_table(project: str, runs: list[RunSnapshot]) -> str:
+def project_delta_markdown(project: str, runs: list[RunSnapshot]) -> str:
     if len(runs) < 2:
         return ""
     left, right = runs[0], runs[1]
@@ -350,11 +416,7 @@ def delta_table(project: str, runs: list[RunSnapshot]) -> str:
     right_label = str(
         metric_value(right, "backend") or right.config.get("backend", right.name)
     )
-    rows = [
-        f"| Metric | {escape_table_cell(left_label)} | "
-        f"{escape_table_cell(right_label)} | Abs Delta | Relative Delta |",
-        "| --- | ---: | ---: | ---: | ---: |",
-    ]
+    rows = []
     for key in keys:
         left_value = numeric(metric_value(left, key))
         right_value = numeric(metric_value(right, key))
@@ -363,132 +425,137 @@ def delta_table(project: str, runs: list[RunSnapshot]) -> str:
         absolute = abs(left_value - right_value)
         relative = absolute / max(abs(right_value), NUMERIC_TOLERANCE)
         rows.append(
-            "| "
-            + " | ".join(
-                [
-                    key,
-                    f"{left_value:.6g}",
-                    f"{right_value:.6g}",
-                    f"{absolute:.6g}",
-                    f"{relative:.6g}",
-                ]
-            )
-            + " |"
+            [
+                metric_label(key),
+                format_number(left_value),
+                format_number(right_value),
+                format_number(absolute),
+                format_number(relative),
+            ]
         )
-    if len(rows) == 2:
+    if not rows:
         return ""
-    return f"#### {project} Deltas\n\n" + "\n".join(rows) + "\n"
+    body = [
+        f"### {project} Delta Summary",
+        "",
+        f"| Metric | {escape_table_cell(left_label)} | {escape_table_cell(right_label)} | Abs Delta | Relative Delta |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for parts in rows:
+        body.append("| " + " | ".join(escape_table_cell(part) for part in parts) + " |")
+    return "\n".join(body) + "\n"
 
 
 def validation_notes(project_runs: dict[str, list[RunSnapshot]]) -> str:
     notes = [
-        "## Statistical Invariance Checks",
+        "## Validation Notes",
         "",
-        "The report intentionally separates raw L2 magnitudes from invariance claims. A small raw L2 delta is evidence for parity, but attention calculations can vary across Metal/CUDA kernels, precision modes, and softmax implementations. Treat attention score changes as requiring statistical invariance validation when both backends are present.",
-        "",
-        "| Project | Attention-like | Backends Observed | Recommendation |",
-        "| --- | --- | --- | --- |",
+        "- [ ] Check run provenance and backend labels before reading parity claims.",
+        "- [ ] For attention metrics, validate across repeated seeds/prompts before claiming statistical parity.",
     ]
-    for project, runs in project_runs.items():
-        backends = sorted(
-            {
-                str(metric_value(run, "backend") or run.config.get("backend", ""))
-                for run in runs
-                if metric_value(run, "backend") or run.config.get("backend", "")
-            }
-        )
-        keys = set(metric_keys(runs))
-        attention_like = any(hint in project.lower() for hint in ATTENTION_PROJECT_HINTS) or "attn_score_mean" in keys
-        if attention_like and len(backends) >= 2:
-            recommendation = "Validate distributional invariance across repeated seeds/prompts before claiming parity."
-        elif attention_like:
-            recommendation = "Add the missing backend or repeated runs before making a statistical claim."
-        else:
-            recommendation = "Use L2 and task-output deltas as primary parity evidence."
-        notes.append(
-            "| "
-            + " | ".join(
-                [
-                    escape_table_cell(project),
-                    "yes" if attention_like else "no",
-                    escape_table_cell(", ".join(backends) or "unknown"),
-                    escape_table_cell(recommendation),
-                ]
-            )
-            + " |"
-        )
     return "\n".join(notes) + "\n"
 
 
-def markdown_report(project_runs: dict[str, list[RunSnapshot]]) -> str:
+def executive_summary_markdown(project_runs: dict[str, list[RunSnapshot]]) -> str:
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     project_list = ", ".join(project_runs)
-    sections = [
-        f"# vLLM-Hook Platform Parity Findings",
-        "",
-        f"Generated: {created}",
-        "",
-        f"Projects included: {project_list}",
-        "",
-        "This report captures the latest Metal/MLX run and the latest GPU/non-Metal run per project by default. It prioritizes tensor/list L2 magnitudes, task score deltas, and attention calculations that require invariance validation because backend math can differ across platforms.",
-        "",
-        "## Recent Runs",
-        "",
-    ]
+    return "\n".join(
+        [
+            f"# vLLM-Hook Platform Parity Findings",
+            "",
+            f"Generated: {created}",
+            "",
+            f"Projects included: {project_list}",
+            "",
+            "This report uses a block layout: a short overview, one section per project, compact per-run summaries, scalar charts, delta badges, and a concise validation checklist at the bottom.",
+            "",
+        ]
+    )
+
+
+def markdown_report(project_runs: dict[str, list[RunSnapshot]]) -> str:
+    sections = [executive_summary_markdown(project_runs)]
     for project, runs in project_runs.items():
-        sections.append(project_table(project, runs))
-        delta = delta_table(project, runs)
+        sections.append(project_summary_markdown(project, runs))
+        delta = project_delta_markdown(project, runs)
         if delta:
             sections.append(delta)
     sections.append(validation_notes(project_runs))
     return "\n".join(sections)
 
 
+def project_panel_grid(wr: Any, project: str, runs: list[RunSnapshot], entity: str) -> Any | None:
+    runset_cls = getattr(wr, "Runset", getattr(wr, "RunSet", None))
+    if runset_cls is None or not hasattr(wr, "PanelGrid"):
+        return None
+    names = [run.name for run in runs if run.name]
+    if not names:
+        return None
+    line_plot_cls = getattr(wr, "LinePlot", None)
+    if line_plot_cls is None:
+        return None
+    keys = [key for key in metric_keys(runs) if key in L2_KEYS or key in PARITY_KEYS]
+    panels = [line_plot_cls(title=metric_label(key), x="Step", y=[key]) for key in keys[:6]]
+    if not panels:
+        return None
+    filters = f"Metric('displayName') in {json.dumps(names)}"
+    return wr.PanelGrid(
+        runsets=[runset_cls(project=project, entity=entity or None, filters=filters)],
+        panels=panels,
+    )
+
+
+def project_delta_block(wr: Any, project: str, runs: list[RunSnapshot]) -> Any:
+    text = project_delta_markdown(project, runs)
+    if not text:
+        return None
+    return wr.MarkdownBlock(text=text)
+
+
+def project_summary_block(wr: Any, project: str, runs: list[RunSnapshot]) -> Any:
+    return wr.MarkdownBlock(text=project_summary_markdown(project, runs))
+
+
+def executive_summary_block(wr: Any, project_runs: dict[str, list[RunSnapshot]]) -> Any:
+    return wr.MarkdownBlock(text=executive_summary_markdown(project_runs))
+
+
+def validation_notes_block(wr: Any, project_runs: dict[str, list[RunSnapshot]]) -> Any:
+    return wr.MarkdownBlock(text=validation_notes(project_runs))
+
+
 def report_blocks(
     wr: Any,
-    markdown: str,
     project_runs: dict[str, list[RunSnapshot]],
     entity: str,
 ) -> list[Any]:
-    blocks = [wr.MarkdownBlock(text=markdown)]
-    runset_cls = getattr(wr, "Runset", getattr(wr, "RunSet", None))
-    if runset_cls is None or not hasattr(wr, "PanelGrid"):
-        return blocks
-
-    line_plot_cls = getattr(wr, "LinePlot", None)
+    blocks = [executive_summary_block(wr, project_runs)]
     for project, runs in project_runs.items():
+        blocks.append(project_summary_block(wr, project, runs))
         if not runs:
             continue
-        names = [run.name for run in runs if run.name]
-        if not names:
-            continue
-        filters = f"Metric('displayName') in {json.dumps(names)}"
-        panels = []
-        if line_plot_cls is not None:
-            keys = [key for key in metric_keys(runs) if key in L2_KEYS or key in PARITY_KEYS]
-            for key in keys[:6]:
-                panels.append(line_plot_cls(title=key, x="Step", y=[key]))
-        blocks.append(
-            wr.PanelGrid(
-                runsets=[runset_cls(project=project, entity=entity or None, filters=filters)],
-                panels=panels,
-            )
-        )
+        panel_grid = project_panel_grid(wr, project, runs, entity)
+        if panel_grid is not None:
+            blocks.append(panel_grid)
+        delta_block = project_delta_block(wr, project, runs)
+        if delta_block is not None:
+            blocks.append(delta_block)
+    blocks.append(validation_notes_block(wr, project_runs))
     return blocks
 
 
-def create_report(args: argparse.Namespace, markdown: str, project_runs: dict[str, list[RunSnapshot]]) -> str:
+def create_report(args: argparse.Namespace, project_runs: dict[str, list[RunSnapshot]]) -> str:
     wr = require_reports_api()
     kwargs: dict[str, Any] = {
         "project": args.report_project,
         "title": args.report_title,
         "description": "Automated parity summary for recent vLLM-Hook runs.",
-        "width": args.report_width,
+        "width": "fluid",
     }
     if args.wandb_entity:
         kwargs["entity"] = args.wandb_entity
     report = wr.Report(**kwargs)
-    report.blocks = report_blocks(wr, markdown, project_runs, args.wandb_entity)
+    report.blocks = report_blocks(wr, project_runs, args.wandb_entity)
     saved = report.save()
     url = str(getattr(report, "url", "") or getattr(saved, "url", "") or "")
     return url
@@ -523,7 +590,7 @@ def main() -> int:
     if args.dry_run:
         print(markdown)
         return 0
-    url = create_report(args, markdown, project_runs)
+    url = create_report(args, project_runs)
     if url:
         print(f"Created W&B report: {url}")
     else:
