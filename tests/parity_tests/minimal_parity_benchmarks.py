@@ -386,7 +386,14 @@ def attention_ranges(llm: Any, prompts: list[str]) -> list[list[tuple[int, int]]
 def run_attn_tracker(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     llm = make_llm(args, out_dir)
     start = time.perf_counter()
-    _ = llm.generate(ATTN_PROMPTS, temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens, use_hook=True)
+    _ = llm.generate(
+        ATTN_PROMPTS,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        use_hook=True,
+        save_to_disk=True,
+    )
     generation_ms = (time.perf_counter() - start) * 1000
     ranges = attention_ranges(llm, ATTN_PROMPTS)
     comparison_key = set_comparison_identity(
