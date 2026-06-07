@@ -21,11 +21,11 @@ from pathlib import Path
 
 
 EXPERIMENTS = ("hidden-states", "attn-tracker", "core-reranker", "steer-activation")
-DEFAULT_GRANITE_QUANTIZED_MODEL = "RedHatAI/granite-3.1-2b-instruct-quantized.w4a16"
+DEFAULT_GRANITE_MODEL = "ibm-granite/granite-3.1-8b-instruct"
 DEFAULT_HIDDEN_STATES_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 DEFAULT_MODELS = {
     "hidden-states": DEFAULT_HIDDEN_STATES_MODEL,
-    "attn-tracker": DEFAULT_GRANITE_QUANTIZED_MODEL,
+    "attn-tracker": DEFAULT_GRANITE_MODEL,
     "core-reranker": "mistralai/Mistral-7B-Instruct-v0.3",
     "steer-activation": "microsoft/Phi-3-mini-4k-instruct",
 }
@@ -35,7 +35,7 @@ REMOTE_TEMPLATE = PARITY_DIR / "colab_minimal_parity_remote.py"
 LOCAL_RUNNER = PARITY_DIR / "minimal_parity_benchmarks.py"
 LOCAL_WANDB_CONFIG = PARITY_DIR / "local_wandb_config.py"
 DEFAULT_LOCAL_PYTHON = (
-    Path("/Users/timothyburley/opensource/vllm-metal/.venv-vllm-metal/bin/python")
+    Path.home() / ".venv-vllm-metal" / "bin" / "python"
 )
 LOCAL_COLAB_CLI = Path("/Users/timothyburley/opensource/google-colab-cli")
 
