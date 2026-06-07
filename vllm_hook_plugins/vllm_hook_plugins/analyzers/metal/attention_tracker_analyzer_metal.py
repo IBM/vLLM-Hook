@@ -6,11 +6,14 @@ from vllm_hook_plugins.metal.run_utils_metal import load_and_merge_qk_cache
 
 
 class AttntrackerAnalyzerMetal(AttntrackerAnalyzer):
-    def compute_attention_from_qk(self, run_id_file: str):
+    def compute_attention_from_qk(self, run_id: str = None, probes=None):
+        if probes is not None:
+            return super().compute_attention_from_qk(run_id, probes=probes)
+
         original_loader = attn_module.load_and_merge_qk_cache
         attn_module.load_and_merge_qk_cache = load_and_merge_qk_cache
         try:
-            return super().compute_attention_from_qk(run_id_file)
+            return super().compute_attention_from_qk(run_id)
         finally:
             attn_module.load_and_merge_qk_cache = original_loader
 

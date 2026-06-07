@@ -10,7 +10,6 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.utils import set_wired_limit
-from vllm_metal.v1.worker import MetalWorker
 
 ATTN_PATTERNS = [
     re.compile(r"^model\.layers\.(\d+)\.self_attn$"),
@@ -83,7 +82,18 @@ class MLXHookWrapper(nn.Module):
         return output
 
 
-class ProbeHookQKWorkerMetal(MetalWorker):
+class ProbeHookQKWorkerMetal:
+    def _ensure_extension_state(self) -> None:
+        if getattr(self, "_metal_qk_extension_ready", False):
+            return
+        self._execute_logged = False
+        self._capture_active = False
+        self._hooks_installed = False
+        self._debug_hook = os.environ.get(
+            "HOOK_DEBUG", os.environ.get("VLLM_HOOK_DEBUG", "")
+        ) == "1"
+        self._metal_qk_extension_ready = True
+
     def _stage(self, message: str) -> None:
         """
         Emit a standardized debug trace when hook debugging is enabled.
@@ -94,6 +104,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         Returns:
             None: The message is printed only when debug mode is enabled.
         """
+        self._ensure_extension_state()
         if not getattr(self, "_debug_hook", False):
             return
         pid = os.getpid()
@@ -115,104 +126,29 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         Returns:
             None: Worker state is initialized in-place.
         """
-        self._execute_logged = False
-        self._capture_active = False
-        self._debug_hook = os.environ.get("VLLM_HOOK_DEBUG", "") == "1"
-        super().__init__(*args, **kwargs)
+        self._ensure_extension_state()
         self._stage("worker __init__ complete")
 
-    def init_device(self) -> None:
+    def install_hooks(self):
         """
-        Use a fast single-process path while preserving distributed init.
-
-        Args:
-            None.
+        Install temporary self-attention wrappers for Metal capture.
 
         Returns:
-            None: Device state is initialized in-place.
+            None: Wrappers are installed in-place.
         """
-        self._stage(
-            "init_device start "
-            f"distributed_init_method={self.distributed_init_method}"
-        )
+        self._ensure_extension_state()
+        if getattr(self, "_hooks_installed", False):
+            return
+        self._hooks_installed = True
+        self._capture_active = True
+        self._stage("install_hooks start")
         try:
-            world_size = self.parallel_config.world_size
-            if world_size == 1:
-                # This branch remains because the Metal worker can bypass the
-                # distributed setup used by the non-Metal worker when only one
-                # process is active.
-                self._stage("init_device using single-process fast path")
-                self._init_device_single_process()
-            else:
-                super().init_device()
-        except Exception as exc:
-            self._stage(f"init_device failed: {type(exc).__name__}: {exc}")
-            raise
-        self._stage("init_device complete")
-
-    def _init_device_single_process(self) -> None:
-        """
-        Initialize MLX and the Metal model runner for world size one.
-
-        Args:
-            None.
-
-        Returns:
-            None: MLX and model-runner state are initialized in-place.
-        """
-        if self.metal_config.use_mlx:
-            import mlx.core as mx
-
-            device_type = (
-                mx.DeviceType.gpu
-                if self.metal_config.mlx_device == "gpu"
-                else mx.DeviceType.cpu
-            )
-            mx.set_default_device(mx.Device(device_type))
-            self._stage(f"MLX device set to: {mx.default_device()}")
-            set_wired_limit()
-
-        self.device = MetalPlatform.get_torch_device(0)
-        self._stage(f"PyTorch device set to: {self.device}")
-
-        set_random_seed(self.model_config.seed)
-
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
-        self.model_runner = MetalModelRunner(
-            vllm_config=self.vllm_config,
-            device=self.device,
-        )
-
-    def load_model(self, *args, **kwargs):
-        """
-        Load the model and install temporary self-attention wrappers.
-
-        Args:
-            *args: Positional arguments forwarded to the base worker.
-            **kwargs: Keyword arguments forwarded to the base worker.
-
-        Returns:
-            Any: Result returned by the base worker ``load_model`` call.
-        """
-        self._stage("load_model start")
-        try:
-            result = super().load_model(*args, **kwargs)
-        except Exception as exc:
-            self._stage(f"load_model failed: {type(exc).__name__}: {exc}")
-            raise
-
-        try:
-            self._stage("install_hooks start")
             self._install_hooks()
             self._stage("install_hooks complete")
             print("Hooks installed successfully", flush=True)
         except Exception as exc:
             self._stage(f"install_hooks failed: {type(exc).__name__}: {exc}")
             print(f"Hook installation failed: {exc}", flush=True)
-
-        self._stage("load_model complete")
-        return result
 
     def _current_run_id(self) -> str | None:
         """
@@ -225,7 +161,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             str | None: Active run identifier, or ``None`` when capture is
             disabled for the current execution.
         """
-        if not self._capture_active or not os.path.exists(self.hook_flag):
+        if not getattr(self, "_capture_active", False) or not os.path.exists(self.hook_flag):
             return None
         if not os.path.exists(self.run_id_file):
             raise RuntimeError("run_id not found")
@@ -438,7 +374,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         self._append_proj_token_list(run_id, layer_num, "k", k_torch)
         self._append_proj_token_list(run_id, layer_num, "v", v_torch)
 
-        if self._debug_hook:
+        if getattr(self, "_debug_hook", False):
             print(
                 f"[qkv_boundary] module=model.layers.{layer_num}.self_attn.attn "
                 f"x_shape={tuple(x_torch.shape)} q_shape={tuple(q_torch.shape)} "
@@ -502,7 +438,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         Returns:
             Dict[int, List[int]]: Mapping from layer index to sorted head indices.
         """
-        layer_heads = os.environ.get("VLLM_HOOK_LAYER_HEADS", "")
+        layer_heads = os.environ.get("HOOK_LAYER_HEADS", os.environ.get("VLLM_HOOK_LAYER_HEADS", ""))
         result = {}
         for part in layer_heads.split(";"):
             part = part.strip()
@@ -529,13 +465,13 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             print("no model; skip hooks")
             return
 
-        self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
-        self.hook_dir = os.environ.get("VLLM_HOOK_DIR")
-        self.run_id_file = os.environ.get("VLLM_RUN_ID")
-        self.hookq_mode = os.environ.get("VLLM_HOOKQ_MODE", "all_tokens")
+        self.hook_flag = os.environ.get("HOOK_FLAG", os.environ.get("VLLM_HOOK_FLAG"))
+        self.hook_dir = os.environ.get("HOOK_DIR", os.environ.get("VLLM_HOOK_DIR"))
+        self.run_id_file = os.environ.get("HOOK_RUN_ID", os.environ.get("VLLM_RUN_ID"))
+        self.hookq_mode = os.environ.get("HOOKQ_MODE", os.environ.get("VLLM_HOOKQ_MODE", "all_tokens"))
         # This remains configurable because the Metal wrapper can observe both
         # pre- and post-call boundaries, unlike the non-Metal forward hook.
-        self.capture_phase = os.environ.get("VLLM_HOOK_CAPTURE_PHASE", "pre")
+        self.capture_phase = os.environ.get("HOOK_CAPTURE_PHASE", os.environ.get("VLLM_HOOK_CAPTURE_PHASE", "pre"))
 
         if not all([self.hook_dir, self.hook_flag, self.run_id_file]):
             print("Missing hook environment variables")
@@ -704,7 +640,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             f"{self._matched_hook_modules}",
             flush=True,
         )
-        if self._debug_hook:
+        if getattr(self, "_debug_hook", False):
             print(
                 "Selected Metal hook layers: "
                 f"{sorted(self.important_layers)} "
@@ -723,11 +659,61 @@ class ProbeHookQKWorkerMetal(MetalWorker):
         Returns:
             None: Wrapped modules are restored in-place.
         """
+        self._ensure_extension_state()
+        self._capture_active = False
+        self._flush_run_cache()
         for entry in reversed(self._hooks):
             setattr(entry["parent"], entry["target_name"], entry["original_module"])
         self._hooks.clear()
 
-    def _flush_run_cache(self) -> None:
+    def get_captured_states(self, external_req_id: str) -> bytes | None:
+        """
+        Compatibility RPC for vLLM's post-generate artifact collection path.
+
+        Metal Q/K capture is keyed by the run-id flag file rather than vLLM's
+        request id, so there is no per-request in-memory payload to return.
+        Flushing here makes the shared plugin path produce the disk artifact the
+        Metal analyzer expects without keeping the captured tensors resident.
+        """
+        self._ensure_extension_state()
+        self._stage(
+            "get_captured_states compatibility flush "
+            f"for request_id={external_req_id}"
+        )
+        self._flush_run_cache()
+        return None
+
+    def clear_captured_states(self, external_req_id: str) -> None:
+        """
+        Compatibility RPC for aborted in-memory collection requests.
+
+        Metal captures are run-scoped. If vLLM asks to clear request-scoped
+        states, drop the current run cache to avoid retaining tensors.
+        """
+        self._ensure_extension_state()
+        self._stage(
+            "clear_captured_states compatibility clear "
+            f"for request_id={external_req_id}"
+        )
+        if getattr(self, "_run_cache", None):
+            self._run_cache.clear()
+
+    def flush_disk(self, external_req_ids: list, run_id: str, hook_dir: str) -> bool:
+        """
+        Compatibility RPC for save_to_disk collection.
+
+        The Metal worker already writes to the hook directory configured through
+        HOOK_DIR/RUN_ID. The request ids and hook_dir arguments are accepted so
+        the shared vLLM hook plugin can call the same RPC on all backends.
+        """
+        self._ensure_extension_state()
+        self._stage(
+            "flush_disk compatibility flush "
+            f"for run_id={run_id} request_ids={external_req_ids}"
+        )
+        return self._flush_run_cache()
+
+    def _flush_run_cache(self) -> bool:
         """
         Persist any captured run cache entries to disk.
 
@@ -735,10 +721,10 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             None.
 
         Returns:
-            None: Run cache artifacts are serialized under the hook directory.
+            bool: True when at least one run cache artifact was serialized.
         """
-        if not self._run_cache:
-            return
+        if not getattr(self, "_run_cache", None):
+            return False
 
         tp_rank = int(self.rank)
         for run_id, cache in self._run_cache.items():
@@ -750,7 +736,7 @@ class ProbeHookQKWorkerMetal(MetalWorker):
             # per layer, making immediate writes much more expensive than in the
             # non-Metal forward-hook path.
             torch.save(cache, cache_path)
-            if self._debug_hook:
+            if getattr(self, "_debug_hook", False):
                 sample_counts = {
                     module_name: len(module_cache.get("tokens", []))
                     for module_name, module_cache in cache["qkv_cache"].items()
@@ -761,31 +747,5 @@ class ProbeHookQKWorkerMetal(MetalWorker):
                     f"sample_counts={sample_counts}",
                     flush=True,
                 )
-
-    def execute_model(self, *args, **kwargs):
-        """
-        Run the model with capture enabled only for the active execution.
-
-        Args:
-            *args: Positional arguments forwarded to the base worker.
-            **kwargs: Keyword arguments forwarded to the base worker.
-
-        Returns:
-            Any: Result returned by the base worker ``execute_model`` call.
-        """
-        if not self._execute_logged:
-            self._stage("execute_model first entry")
-            self._execute_logged = True
-        # This extra gate remains because the Metal runtime may invoke wrapped
-        # modules during setup paths where capture should stay disabled.
-        self._capture_active = True
-        try:
-            result = super().execute_model(*args, **kwargs)
-        finally:
-            self._capture_active = False
-        try:
-            self._flush_run_cache()
-        except Exception as exc:
-            self._stage(f"flush_run_cache failed: {type(exc).__name__}: {exc}")
-            raise
-        return result
+        self._run_cache.clear()
+        return True

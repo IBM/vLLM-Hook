@@ -34,13 +34,20 @@ From the repository root:
 cd <path-to-directory>/vLLM-Hook
 python -m pip install -r requirement.txt
 python -m pip install -e vllm_hook_plugins
-python -m pip install jupyter ipykernel
 ```
 
 Register a Jupyter kernel backed by the same environment:
 
 ```bash
+python -m pip install jupyter ipykernel
 python -m ipykernel install --user --name vllm-metal-local --display-name "Python (vllm-metal)"
+```
+
+Or run the helper script from this repo, which activates `~/.venv-vllm-metal`
+and registers the kernel in one step:
+
+```bash
+./scripts/register_vllm_metal_kernel.sh
 ```
 
 ## Launch Jupyter
@@ -57,7 +64,41 @@ Open one of the Metal notebooks:
 - `notebooks/metal/demo_corer_metal.ipynb`
 - `notebooks/metal/demo_actsteer_metal.ipynb`
 
+The act-steer notebook defaults to the official Microsoft GGUF repo
+(`microsoft/Phi-3-mini-4k-instruct-gguf`) to reduce memory pressure on Apple
+Silicon. The notebook also points `hf_config_path` at the original
+`microsoft/Phi-3-mini-4k-instruct` Hugging Face repo so vLLM has a canonical
+config source during GGUF loading, and reuses that same repo for the tokenizer
+so the GGUF weights do not need tokenizer files in the quantized repo. The
+model is passed in vLLM's remote GGUF form (`repo_id/filename.gguf`) so the
+loader can fetch the exact `Phi-3-mini-4k-instruct-q4.gguf` file directly from
+the Microsoft GGUF repo.
+
+The attention-tracker and core-reranker Metal notebooks also pin
+`max_model_len=2048` and disable prefix caching. Their base models advertise
+very large context windows, and leaving the default max length enabled can make
+vLLM reserve far more KV-cache memory than Apple Silicon can spare.
+
+The Metal wrapper defaults to `VLLM_METAL_USE_PAGED_ATTENTION=0` and
+`VLLM_METAL_MEMORY_FRACTION=auto` unless those variables are already set. For
+Q/K capture runs it also releases the base engine before building the hooked
+engine, which keeps peak unified-memory usage lower on Apple Silicon.
+
 Select the `Python (vllm-metal)` kernel before running cells.
+
+## Using VS Code
+
+VS Code can use the same environment without any repo-specific editor config:
+
+1. Open the repository folder in VS Code.
+2. Run `Python: Select Interpreter`.
+3. Choose `~/.venv-vllm-metal/bin/python`.
+4. Open a notebook and use `Jupyter: Select Notebook Kernel`.
+5. Pick `Python (vllm-metal)`.
+
+If the kernel does not appear, run `./scripts/register_vllm_metal_kernel.sh`
+once in a terminal after activating the env. That only registers a Jupyter
+kernel for your user account; it does not write VS Code settings.
 
 ## What Is Different From the Standard Notebooks
 

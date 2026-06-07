@@ -1,5 +1,8 @@
+import gc
 import json
 import os
+import re
+import subprocess
 from typing import Dict
 
 import mlx.core as mx
@@ -9,11 +12,18 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.utils import set_wired_limit
-from vllm_metal.v1.worker import MetalWorker
 
-TARGET_LAYER_TEMPLATES = (
-    "model.layers.{layer_num}",
-    "model.model.layers.{layer_num}",
+LAYER_PATTERNS = (
+    re.compile(r"^model\.layers\.(\d+)$"),
+    re.compile(r"^model\.model\.layers\.(\d+)$"),
+    re.compile(r"^layers\.(\d+)$"),
+)
+
+MEMORY_GUARD_MIN_AVAILABLE_MB = int(
+    float(os.environ.get("VLLM_HOOK_MIN_AVAILABLE_GB", "4")) * 1024
+)
+MEMORY_GUARD_MAX_RSS_MB = int(
+    float(os.environ.get("VLLM_HOOK_MAX_RSS_GB", "24")) * 1024
 )
 
 
@@ -56,14 +66,165 @@ class MLXSteeringWrapper(nn.Module):
         Returns:
             Any: Output produced by the wrapped module after steering.
         """
+        trace = os.environ.get(
+            "VLLM_HOOK_METAL_STEER_TRACE",
+            os.environ.get("HOOK_METAL_STEER_TRACE", "0"),
+        ) == "1"
+        if trace:
+            print(f"[metal-steer-wrapper] enter {self.name}", flush=True)
         output = self.module(*args, **kwargs)
-        return self.hook_fn(output, self.name)
+        if trace:
+            print(f"[metal-steer-wrapper] steer {self.name}", flush=True)
+        output = self.hook_fn(output, self.name)
+        if trace:
+            print(f"[metal-steer-wrapper] exit {self.name}", flush=True)
+        return output
 
 
-class SteerHookActWorkerMetal(MetalWorker):
+class SteerHookActWorkerMetal:
+    @staticmethod
+    def _match_layer(name: str) -> int | None:
+        for pattern in LAYER_PATTERNS:
+            match = pattern.match(name)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _ensure_extension_state(self) -> None:
+        if getattr(self, "_metal_steer_extension_ready", False):
+            return
+        self._capture_active = False
+        self._hooks_installed = False
+        self._debug_hook = os.environ.get(
+            "HOOK_DEBUG", os.environ.get("VLLM_HOOK_DEBUG", "")
+        ) == "1"
+        self._memory_guard_enabled = os.environ.get(
+            "VLLM_HOOK_METAL_STEER_MEMORY_GUARD",
+            os.environ.get("HOOK_METAL_STEER_MEMORY_GUARD", "0"),
+        ) == "1"
+        self._metal_steer_extension_ready = True
+
+    @staticmethod
+    def _format_mb(value_mb: float | None) -> str:
+        if value_mb is None:
+            return "n/a"
+        return f"{value_mb / 1024:.2f} GB"
+
+    def _memory_snapshot(self) -> Dict[str, float | None]:
+        rss_mb = None
+        available_mb = None
+        total_mb = None
+
+        try:
+            import psutil
+
+            proc = psutil.Process(os.getpid())
+            rss_mb = proc.memory_info().rss / (1024 * 1024)
+            vm = psutil.virtual_memory()
+            available_mb = vm.available / (1024 * 1024)
+            total_mb = vm.total / (1024 * 1024)
+        except Exception:
+            try:
+                import resource
+
+                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                rss_mb = float(rss_kb) / 1024.0
+            except Exception:
+                pass
+
+            try:
+                page_size = int(
+                    subprocess.check_output(
+                        ["sysctl", "-n", "hw.pagesize"], text=True
+                    ).strip()
+                )
+                vm_stat = subprocess.check_output(["vm_stat"], text=True)
+                page_counts = {}
+                for line in vm_stat.splitlines():
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    value = value.strip().rstrip(".")
+                    if value.endswith("pages"):
+                        value = value[:-5].strip()
+                    if value.endswith("."):
+                        value = value[:-1]
+                    try:
+                        page_counts[key.strip()] = int(value.replace(".", ""))
+                    except ValueError:
+                        continue
+                free_pages = page_counts.get("Pages free", 0)
+                inactive_pages = page_counts.get("Pages inactive", 0)
+                speculative_pages = page_counts.get("Pages speculative", 0)
+                available_mb = (
+                    (free_pages + inactive_pages + speculative_pages)
+                    * page_size
+                    / (1024 * 1024)
+                )
+                total_mb = float(
+                    int(
+                        subprocess.check_output(
+                            ["sysctl", "-n", "hw.memsize"], text=True
+                        ).strip()
+                    )
+                    / (1024 * 1024)
+                )
+            except Exception:
+                pass
+
+        return {
+            "rss_mb": rss_mb,
+            "available_mb": available_mb,
+            "total_mb": total_mb,
+        }
+
+    def _log_memory(self, stage: str, module_name: str, residuals=None) -> None:
+        snap = self._memory_snapshot()
+        residual_desc = "n/a"
+        if residuals is not None:
+            dtype = getattr(residuals, "dtype", None)
+            shape = getattr(residuals, "shape", None)
+            residual_desc = f"type={type(residuals).__name__} shape={shape} dtype={dtype}"
+        self._stage(
+            f"{stage} module={module_name} "
+            f"rss={self._format_mb(snap['rss_mb'])} "
+            f"available={self._format_mb(snap['available_mb'])} "
+            f"total={self._format_mb(snap['total_mb'])} "
+            f"residuals={residual_desc}"
+        )
+
+    def _enforce_memory_guard(self, stage: str, module_name: str) -> None:
+        snap = self._memory_snapshot()
+        rss_mb = snap["rss_mb"]
+        available_mb = snap["available_mb"]
+        if available_mb is not None and available_mb < MEMORY_GUARD_MIN_AVAILABLE_MB:
+            raise MemoryError(
+                f"Metal memory guard triggered at {stage} for {module_name}: "
+                f"available={self._format_mb(available_mb)} "
+                f"threshold={self._format_mb(MEMORY_GUARD_MIN_AVAILABLE_MB)}"
+            )
+        if rss_mb is not None and rss_mb > MEMORY_GUARD_MAX_RSS_MB:
+            raise MemoryError(
+                f"Metal memory guard triggered at {stage} for {module_name}: "
+                f"rss={self._format_mb(rss_mb)} "
+                f"threshold={self._format_mb(MEMORY_GUARD_MAX_RSS_MB)}"
+            )
+
+    def _stage(self, message: str) -> None:
+        self._ensure_extension_state()
+        if not getattr(self, "_debug_hook", False):
+            return
+        pid = os.getpid()
+        rank = getattr(self, "rank", "?")
+        local_rank = getattr(self, "local_rank", "?")
+        print(
+            f"[metal-steer-worker pid={pid} rank={rank} local_rank={local_rank}] {message}",
+            flush=True,
+        )
+
     def __init__(self, *args, **kwargs):
         """
-        Initialize steering state before Metal worker setup.
+        Initialize steering state for the Metal mixin.
 
         Args:
             *args: Positional arguments forwarded to the base Metal worker.
@@ -72,80 +233,27 @@ class SteerHookActWorkerMetal(MetalWorker):
         Returns:
             None: Worker state is initialized in-place.
         """
-        self._capture_active = False
-        super().__init__(*args, **kwargs)
+        self._ensure_extension_state()
 
-    def init_device(self) -> None:
+    def install_hooks(self):
         """
-        Initialize the Metal device, with a single-process fast path.
-
-        Args:
-            None.
+        Install the steering wrapper on the configured transformer layer.
 
         Returns:
-            None: Device state is initialized in-place.
+            None: Wrappers are installed in-place on the loaded model.
         """
-        try:
-            world_size = self.parallel_config.world_size
-            if world_size == 1:
-                # This branch remains because the Metal worker can bypass the
-                # distributed setup used by the non-Metal worker when only one
-                # process is active.
-                self._init_device_single_process()
-            else:
-                super().init_device()
-        except Exception:
-            raise
-
-    def _init_device_single_process(self) -> None:
-        """
-        Initialize MLX and the Metal model runner for world size one.
-
-        Args:
-            None.
-
-        Returns:
-            None: MLX and model-runner state are initialized in-place.
-        """
-        if self.metal_config.use_mlx:
-            device_type = (
-                mx.DeviceType.gpu
-                if self.metal_config.mlx_device == "gpu"
-                else mx.DeviceType.cpu
-            )
-            mx.set_default_device(mx.Device(device_type))
-            set_wired_limit()
-
-        self.device = MetalPlatform.get_torch_device(0)
-        set_random_seed(self.model_config.seed)
-
-        from vllm_metal.v1.model_runner import MetalModelRunner
-
-        self.model_runner = MetalModelRunner(
-            vllm_config=self.vllm_config,
-            device=self.device,
-        )
-
-    def load_model(self, *args, **kwargs):
-        """
-        Load the model and install the steering wrapper.
-
-        Args:
-            *args: Positional arguments forwarded to the base worker.
-            **kwargs: Keyword arguments forwarded to the base worker.
-
-        Returns:
-            Any: Result returned by the base worker ``load_model`` call.
-        """
-        result = super().load_model(*args, **kwargs)
-
+        self._ensure_extension_state()
+        if getattr(self, "_hooks_installed", False):
+            return
+        self._hooks_installed = True
+        self._capture_active = True
+        self._stage("install_hooks RPC start")
         try:
             self._install_hooks()
             print("Hooks installed successfully", flush=True)
         except Exception as exc:
             print(f"Hook installation failed: {exc}", flush=True)
-
-        return result
+        self._stage("install_hooks RPC complete")
 
     def _install_hooks(self):
         """
@@ -162,7 +270,7 @@ class SteerHookActWorkerMetal(MetalWorker):
             print("no model; skip hooks")
             return
 
-        self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
+        self.hook_flag = os.environ.get("HOOK_FLAG", os.environ.get("VLLM_HOOK_FLAG"))
         steering_config = self._parse_steering_config()
         self.steering_method = steering_config["method"]
         self.optimal_layer = steering_config["optimal_layer"]
@@ -191,14 +299,16 @@ class SteerHookActWorkerMetal(MetalWorker):
 
         self._hooks = []
         self._matched_hook_modules = []
-        target_layer_names = {
-            template.format(layer_num=self.optimal_layer)
-            for template in TARGET_LAYER_TEMPLATES
-        }
         named_modules = dict(model.named_modules())
+        wrap_all_layers = os.environ.get(
+            "VLLM_HOOK_METAL_STEER_ALL_LAYERS",
+            os.environ.get("HOOK_METAL_STEER_ALL_LAYERS", "0"),
+        ) == "1"
 
         def install_wrapper(name, module, parent, target_name) -> bool:
             if parent is None:
+                return False
+            if any(entry["original_module"] is module for entry in self._hooks):
                 return False
 
             # This remains a wrapper replacement instead of `register_forward_hook`
@@ -224,12 +334,14 @@ class SteerHookActWorkerMetal(MetalWorker):
             return True
 
         for name, module in named_modules.items():
-            if name not in target_layer_names:
+            layer_num = self._match_layer(name)
+            if layer_num is None:
+                continue
+            if not wrap_all_layers and layer_num != self.optimal_layer:
                 continue
             parent_name, target_name = name.rsplit(".", 1)
             parent = named_modules.get(parent_name)
-            if install_wrapper(name, module, parent, target_name):
-                break
+            install_wrapper(name, module, parent, target_name)
 
         if not self._matched_hook_modules:
             try:
@@ -239,21 +351,24 @@ class SteerHookActWorkerMetal(MetalWorker):
 
             if find_layers is not None:
                 layers = find_layers(model)
-                if 0 <= self.optimal_layer < len(layers):
-                    module = layers[self.optimal_layer]
+                for layer_num, module in enumerate(layers):
+                    if not wrap_all_layers and layer_num != self.optimal_layer:
+                        continue
+                    installed = False
                     for name, candidate in named_modules.items():
                         if candidate is not module or "." not in name:
                             continue
                         parent_name, target_name = name.rsplit(".", 1)
                         parent = named_modules.get(parent_name)
                         if install_wrapper(name, module, parent, target_name):
+                            installed = True
                             break
-                    if not self._matched_hook_modules:
+                    if not installed:
                         install_wrapper(
-                            f"layers.{self.optimal_layer}",
+                            f"layers.{layer_num}",
                             module,
                             layers,
-                            self.optimal_layer,
+                            layer_num,
                         )
 
         print(
@@ -264,7 +379,7 @@ class SteerHookActWorkerMetal(MetalWorker):
 
     def _parse_steering_config(self) -> Dict:
         """
-        Load steering settings from `VLLM_ACTSTEER_CONFIG`.
+        Load steering settings from `ACTSTEER_CONFIG`.
 
         Args:
             None.
@@ -272,7 +387,7 @@ class SteerHookActWorkerMetal(MetalWorker):
         Returns:
             Dict: Parsed steering configuration with normalized field types.
         """
-        config_path = os.environ.get("VLLM_ACTSTEER_CONFIG")
+        config_path = os.environ.get("ACTSTEER_CONFIG", os.environ.get("VLLM_ACTSTEER_CONFIG"))
 
         with open(config_path, "r") as f:
             config = json.load(f)
@@ -299,7 +414,7 @@ class SteerHookActWorkerMetal(MetalWorker):
             bool: ``True`` when the current execution should apply steering.
         """
         return bool(
-            self._capture_active
+            getattr(self, "_capture_active", False)
             and self.hook_flag
             and os.path.exists(self.hook_flag)
         )
@@ -391,6 +506,7 @@ class SteerHookActWorkerMetal(MetalWorker):
         Returns:
             Any: Original or steered output in the same structure as input.
         """
+        self._ensure_extension_state()
         if not self._steering_enabled():
             return output
 
@@ -401,10 +517,20 @@ class SteerHookActWorkerMetal(MetalWorker):
             hidden_states = None
             residuals = output
 
+        layer_num = self._match_layer(_module_name)
+        if layer_num != self.optimal_layer:
+            return output
+
+        if getattr(self, "_memory_guard_enabled", False):
+            self._log_memory("hook-entry", _module_name, residuals)
+            self._enforce_memory_guard("hook-entry", _module_name)
         if torch.is_tensor(residuals):
             residuals = self._apply_torch_steering(residuals)
         else:
             residuals = self._apply_mlx_steering(residuals)
+        if getattr(self, "_memory_guard_enabled", False):
+            self._log_memory("hook-exit", _module_name, residuals)
+            self._enforce_memory_guard("hook-exit", _module_name)
 
         if is_tuple:
             return (hidden_states, residuals)
@@ -420,29 +546,26 @@ class SteerHookActWorkerMetal(MetalWorker):
         Returns:
             None: Wrapped modules are restored in-place.
         """
-        for entry in reversed(getattr(self, "_hooks", [])):
-            if isinstance(entry["parent"], list):
-                entry["parent"][entry["target_name"]] = entry["original_module"]
-            else:
-                setattr(entry["parent"], entry["target_name"], entry["original_module"])
-        if hasattr(self, "_hooks"):
-            self._hooks.clear()
+        self._ensure_extension_state()
+        self._capture_active = False
+        hooks = getattr(self, "_hooks", None)
+        if not hooks:
+            self._hooks_installed = False
+            return
 
-    def execute_model(self, *args, **kwargs):
-        """
-        Run the model with steering enabled only during active execution.
-
-        Args:
-            *args: Positional arguments forwarded to the base worker.
-            **kwargs: Keyword arguments forwarded to the base worker.
-
-        Returns:
-            Any: Result returned by the base worker ``execute_model`` call.
-        """
-        # This extra gate remains because the Metal runtime may invoke wrapped
-        # modules during setup paths where steering should stay disabled.
-        self._capture_active = True
-        try:
-            return super().execute_model(*args, **kwargs)
-        finally:
-            self._capture_active = False
+        for entry in reversed(hooks):
+            parent = entry["parent"]
+            target_name = entry["target_name"]
+            original_module = entry["original_module"]
+            try:
+                if isinstance(parent, list):
+                    parent[target_name] = original_module
+                else:
+                    setattr(parent, target_name, original_module)
+            except Exception as exc:
+                print(
+                    f"Error restoring Metal steering hook {target_name}: {exc}",
+                    flush=True,
+                )
+        hooks.clear()
+        self._hooks_installed = False
