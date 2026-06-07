@@ -172,13 +172,13 @@ class ProbeHiddenStatesWorkerMetal:
                     and exposed_layer_num not in self.important_layers
                 ):
                     continue
-            install_wrapper(
-                f"layers.{layer_idx}",
-                layers_obj,
-                layer_idx,
-                layer_idx,
-                module,
-            )
+                install_wrapper(
+                    f"layers.{layer_idx}",
+                    layers_obj,
+                    layer_idx,
+                    layer_idx,
+                    module,
+                )
 
         if not self._matched_hook_modules:
             try:

@@ -213,6 +213,26 @@ class HookLLMMetal:
         register_metal_plugin()
 
     @staticmethod
+    def _resolve_worker_class_path(worker_name: Optional[str]) -> Optional[str]:
+        worker_env = HookLLMMetal._resolve_hook_worker_env(worker_name)
+        if worker_env == "qk":
+            return (
+                "vllm_hook_plugins.workers.metal.probe_hookqk_worker_metal."
+                "ProbeHookQKWorkerMetal"
+            )
+        if worker_env == "steer":
+            return (
+                "vllm_hook_plugins.workers.metal.steer_activation_worker_metal."
+                "SteerHookActWorkerMetal"
+            )
+        if worker_env == "hidden_states":
+            return (
+                "vllm_hook_plugins.workers.metal.probe_hidden_states_worker_metal."
+                "ProbeHiddenStatesWorkerMetal"
+            )
+        return None
+
+    @staticmethod
     def _resolve_analyzer_class(analyzer_name: str):
         if analyzer_name in {"attn_tracker", "attention_tracker"}:
             from vllm_hook_plugins.analyzers.metal import AttntrackerAnalyzerMetal
@@ -223,6 +243,11 @@ class HookLLMMetal:
             from vllm_hook_plugins.analyzers.metal import CorerAnalyzerMetal
 
             return CorerAnalyzerMetal
+
+        if analyzer_name in {"hidden_states", "hidden_states_metal"}:
+            from vllm_hook_plugins.analyzers.metal import HiddenStatesAnalyzerMetal
+
+            return HiddenStatesAnalyzerMetal
 
         from vllm_hook_plugins.registry import PluginRegistry
 
@@ -567,7 +592,7 @@ class HookLLMMetal:
 
             return load_and_merge_qk_cache(self._hook_dir, run_id)
         if self.worker_name in {"probe_hidden_states", "probe_hidden_states_metal"}:
-            from vllm_hook_plugins.run_utils import load_and_merge_hs_cache
+            from vllm_hook_plugins.metal.run_utils_metal import load_and_merge_hs_cache
 
             return load_and_merge_hs_cache(self._hook_dir, run_id)
         return None

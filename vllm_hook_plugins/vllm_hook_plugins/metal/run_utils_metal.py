@@ -4,6 +4,10 @@ import glob
 import os
 from typing import Any, Dict, List
 
+from vllm_hook_plugins.run_utils import (
+    load_and_merge_hs_cache as shared_load_and_merge_hs_cache,
+)
+
 
 def _artifact_glob(hook_dir: str, run_id: str) -> List[str]:
     patterns = [
@@ -126,3 +130,12 @@ def load_and_merge_qk_cache(hook_dir: str, run_id: str):
         }
 
     return merged
+
+
+def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
+    """Load Metal hidden-state artifacts through the Metal analyzer boundary.
+
+    Metal currently emits the shared hidden_states.pt schema, so this delegates
+    to the common loader while keeping analyzer imports backend-specific.
+    """
+    return shared_load_and_merge_hs_cache(hook_dir, run_id)
