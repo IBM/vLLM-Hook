@@ -1,0 +1,12 @@
+{
+  "model_info": {
+    "name": "meta-llama/Llama-3.1-8B-Instruct"
+  },
+  "hidden_states": {
+    "layers": [32],
+    "mode": "last_token"
+  },
+  "scihal": {
+    "clf_path": "/u/cyko1/SciHal-Challenge/rg_output_fp16/fp16_greedy_logreg.joblib"
+  }
+}
