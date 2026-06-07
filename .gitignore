@@ -6,6 +6,7 @@ wandb/
 
 tests/experiment_runs/
 tests/scratch/
+tests/system_prompts/*
 tests/parity_tests/local_wandb_config.py
 
 # Cache and runtime artifacts
