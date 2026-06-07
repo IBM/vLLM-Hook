@@ -452,6 +452,132 @@ def render_chart_container(title: str) -> str:
     )
 
 
+def _layer_sort_key(layer: str) -> tuple[int, Any]:
+    try:
+        return (0, int(layer))
+    except (TypeError, ValueError):
+        try:
+            return (0, float(layer))
+        except (TypeError, ValueError):
+            return (1, layer)
+
+
+def _nested_layer_values(run: RunSnapshot, outer_key: str, inner_key: str | None = None) -> dict[str, float]:
+    raw = run.summary.get(outer_key)
+    if raw is None:
+        raw = run.config.get(outer_key)
+    if not isinstance(raw, dict):
+        return {}
+    values: dict[str, float] = {}
+    for layer, entry in raw.items():
+        if inner_key is None:
+            value = numeric(entry)
+        elif isinstance(entry, dict):
+            value = numeric(entry.get(inner_key))
+        else:
+            value = None
+        if value is not None:
+            values[str(layer)] = value
+    return values
+
+
+def _render_bar_cell(value: float | None, color: str, scale: float) -> str:
+    if value is None:
+        return '<div style="color: #9ca3af;">&mdash;</div>'
+    width = 0.0 if scale <= 0 else max(0.0, min(100.0, (value / scale) * 100.0))
+    return (
+        '<div style="display: flex; align-items: center; gap: 8px; width: 100%;">'
+        '<div style="flex: 1; height: 14px; background: #f3f4f6; border-radius: 999px; overflow: hidden;">'
+        f'<div style="width: {width:.2f}%; height: 100%; background: {color}; border-radius: 999px;"></div>'
+        '</div>'
+        f'<div style="min-width: 72px; text-align: right; font-variant-numeric: tabular-nums; color: #374151;">{html.escape(format_number(value))}</div>'
+        '</div>'
+    )
+
+
+def render_nested_layer_bar_chart(
+    title: str,
+    project: str,
+    left_label: str,
+    right_label: str,
+    left_values: dict[str, float],
+    right_values: dict[str, float],
+    left_color: str = "#d946ef",
+    right_color: str = "#f97316",
+) -> str:
+    layers = sorted(set(left_values) | set(right_values), key=_layer_sort_key)
+    if not layers:
+        return ""
+    scale = max([*(left_values.values()), *(right_values.values())] or [0.0])
+    legend = (
+        '<div style="display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 14px; color: #4b5563; font-size: 0.92em;">'
+        f'<span style="display: inline-flex; align-items: center; gap: 6px;"><span style="width: 10px; height: 10px; border-radius: 999px; background: {left_color}; display: inline-block;"></span>{html.escape(left_label)}</span>'
+        f'<span style="display: inline-flex; align-items: center; gap: 6px;"><span style="width: 10px; height: 10px; border-radius: 999px; background: {right_color}; display: inline-block;"></span>{html.escape(right_label)}</span>'
+        "</div>"
+    )
+    header = (
+        '<div style="display: grid; grid-template-columns: 96px 1fr 1fr; gap: 10px; '
+        'padding: 0 0 8px; color: #6b7280; font-size: 0.88em; text-transform: uppercase; letter-spacing: 0.04em;">'
+        '<div>Layer</div><div>'
+        f'{html.escape(left_label)}'
+        '</div><div>'
+        f'{html.escape(right_label)}'
+        '</div></div>'
+    )
+    rows = []
+    for layer in layers:
+        rows.append(
+            '<div style="display: grid; grid-template-columns: 96px 1fr 1fr; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid #eef2f7;">'
+            f'<div style="font-variant-numeric: tabular-nums; color: #374151;">{html.escape(layer)}</div>'
+            f'{_render_bar_cell(left_values.get(layer), left_color, scale)}'
+            f'{_render_bar_cell(right_values.get(layer), right_color, scale)}'
+            '</div>'
+        )
+    return render_card(
+        f'<h3 style="margin: 0 0 10px;">{html.escape(title)}</h3>\n'
+        f'{legend}'
+        f'{header}'
+        f'{"".join(rows)}'
+    )
+
+
+def project_nested_layer_cards(project: str, runs: list[RunSnapshot]) -> list[str]:
+    if len(runs) < 2:
+        return []
+    left, right = runs[0], runs[1]
+    left_label = display_backend_label(left)
+    right_label = display_backend_label(right)
+    cards: list[str] = []
+    if project == "hiddenstates":
+        left_values = _nested_layer_values(left, "hidden_state_l2_by_layer")
+        right_values = _nested_layer_values(right, "hidden_state_l2_by_layer")
+        card = render_nested_layer_bar_chart(
+            "Hidden-state L2 mean by Layer",
+            project,
+            left_label,
+            right_label,
+            left_values,
+            right_values,
+        )
+        if card:
+            cards.append(card)
+    if project == "attntracker":
+        for inner_key in ("q_l2_mean", "k_l2_mean"):
+            left_values = _nested_layer_values(left, "l2_by_layer", inner_key=inner_key)
+            right_values = _nested_layer_values(right, "l2_by_layer", inner_key=inner_key)
+            card = render_nested_layer_bar_chart(
+                f"{metric_label(inner_key)} by Layer",
+                project,
+                left_label,
+                right_label,
+                left_values,
+                right_values,
+            )
+            if card:
+                cards.append(card)
+    return cards
+
+
 def project_summary_markdown(project: str, runs: list[RunSnapshot]) -> str:
     keys = metric_keys(runs)
     if not runs:
@@ -460,11 +586,11 @@ def project_summary_markdown(project: str, runs: list[RunSnapshot]) -> str:
             '<div style="color: #6b7280;">No recent runs were found.</div>'
         )
 
-    headers = ["Backend", *[metric_label(key) for key in keys]]
+    headers = ["Run", "Backend", *[metric_label(key) for key in keys]]
     rows: list[list[str]] = []
     for index, run in enumerate(runs):
         backend = run_display_label(run, index)
-        row = [backend, *[format_number(metric_value(run, key)) for key in keys]]
+        row = [run.name, backend, *[format_number(metric_value(run, key)) for key in keys]]
         rows.append(row)
     return render_metric_table("Run Summary", headers, rows)
 
@@ -474,8 +600,8 @@ def project_delta_markdown(project: str, runs: list[RunSnapshot]) -> str:
         return ""
     left, right = runs[0], runs[1]
     keys = metric_keys(runs)
-    left_label = display_backend_label(left)
-    right_label = display_backend_label(right)
+    left_label = f"{left.name} ({display_backend_label(left)})" if left.name else display_backend_label(left)
+    right_label = f"{right.name} ({display_backend_label(right)})" if right.name else display_backend_label(right)
     rows = []
     for key in keys:
         left_value = numeric(metric_value(left, key))
@@ -562,9 +688,13 @@ def render_project_card(wr: Any, project: str, runs: list[RunSnapshot], entity: 
     if delta_block is not None:
         blocks.append(delta_block)
     panel_grid = project_panel_grid(wr, project, runs, entity)
-    if panel_grid is not None:
+    nested_cards = project_nested_layer_cards(project, runs)
+    if panel_grid is not None or nested_cards:
         blocks.append(wr.MarkdownBlock(text=render_chart_container("Visualizations")))
-        blocks.append(panel_grid)
+        if panel_grid is not None:
+            blocks.append(panel_grid)
+        for card in nested_cards:
+            blocks.append(wr.MarkdownBlock(text=card))
     blocks.append(wr.MarkdownBlock(text='<div style="margin: 18px 0;"><hr style="border: 0; border-top: 1px solid #e5e7eb;" /></div>'))
     return blocks
 
