@@ -1,7 +1,8 @@
 """Generate a W&B Report for recent vLLM-Hook parity runs.
 
-The report focuses on the two most recent runs from each selected W&B project
-and highlights tensor/list L2 metrics plus attention invariance risks.
+The report focuses on the most recent Metal/MLX and GPU/non-Metal run from
+each selected W&B project and highlights tensor/list L2 metrics plus attention
+invariance risks.
 
 Example:
   python tests/parity_tests/generate_wandb_parity_report.py \
@@ -94,7 +95,15 @@ def parse_args() -> argparse.Namespace:
             "tagged with this value, for example minimal-parity."
         ),
     )
-    parser.add_argument("--runs-per-project", type=int, default=2)
+    parser.add_argument(
+        "--runs-per-project",
+        type=int,
+        default=50,
+        help=(
+            "Number of recent runs to scan per project when selecting the "
+            "latest Metal/MLX and GPU/non-Metal run."
+        ),
+    )
     parser.add_argument(
         "--report-project",
         default=local_config.get(
@@ -181,14 +190,59 @@ def snapshot(project: str, run: Any) -> RunSnapshot:
     )
 
 
-def fetch_recent_runs(api: Any, entity: str, project: str, limit: int) -> list[RunSnapshot]:
+def platform_key(run: RunSnapshot) -> str:
+    backend = str(metric_value(run, "backend") or run.config.get("backend", "")).lower()
+    hardware_kind = str(
+        metric_value(run, "hardware_kind") or run.config.get("hardware_kind", "")
+    ).lower()
+    hardware_label = str(
+        metric_value(run, "hardware_label") or run.config.get("hardware_label", "")
+    ).lower()
+    tags = {tag.lower() for tag in run.tags}
+    name = run.name.lower()
+
+    values = {backend, hardware_kind, hardware_label, *tags, name}
+    joined = " ".join(value for value in values if value)
+    if any(token in joined for token in ("metal", "mlx", "apple-metal")):
+        return "metal"
+    if any(token in joined for token in ("gpu", "cuda", "non-metal", "colab", "t4")):
+        return "gpu"
+    return "unknown"
+
+
+def fetch_latest_platform_runs(
+    api: Any, entity: str, project: str, scan_limit: int
+) -> list[RunSnapshot]:
     path = f"{entity}/{project}" if entity else project
     try:
-        runs = api.runs(path, order="-created_at", per_page=limit)
-        return [snapshot(project, run) for run in list(runs)[:limit]]
+        runs = [
+            snapshot(project, run)
+            for run in list(
+                api.runs(path, order="-created_at", per_page=scan_limit)
+            )[:scan_limit]
+        ]
     except Exception as exc:
         print(f"Skipping {project}: {type(exc).__name__}: {exc}", flush=True)
         return []
+
+    latest: dict[str, RunSnapshot] = {}
+    unknown: list[RunSnapshot] = []
+    for run in runs:
+        key = platform_key(run)
+        if key in {"metal", "gpu"} and key not in latest:
+            latest[key] = run
+        elif key == "unknown":
+            unknown.append(run)
+        if "metal" in latest and "gpu" in latest:
+            break
+
+    selected = []
+    for key in ("metal", "gpu"):
+        if key in latest:
+            selected.append(latest[key])
+    if not selected and unknown:
+        selected.append(unknown[0])
+    return selected
 
 
 def discover_projects(api: Any, entity: str, tag: str) -> list[str]:
@@ -290,8 +344,15 @@ def delta_table(project: str, runs: list[RunSnapshot]) -> str:
         return ""
     left, right = runs[0], runs[1]
     keys = metric_keys(runs)
+    left_label = str(
+        metric_value(left, "backend") or left.config.get("backend", left.name)
+    )
+    right_label = str(
+        metric_value(right, "backend") or right.config.get("backend", right.name)
+    )
     rows = [
-        "| Metric | Newest | Previous | Abs Delta | Relative Delta |",
+        f"| Metric | {escape_table_cell(left_label)} | "
+        f"{escape_table_cell(right_label)} | Abs Delta | Relative Delta |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
     for key in keys:
@@ -369,7 +430,7 @@ def markdown_report(project_runs: dict[str, list[RunSnapshot]]) -> str:
         "",
         f"Projects included: {project_list}",
         "",
-        "This report captures the two most recent runs per project by default. It prioritizes tensor/list L2 magnitudes, task score deltas, and attention calculations that require invariance validation because backend math can differ across platforms.",
+        "This report captures the latest Metal/MLX run and the latest GPU/non-Metal run per project by default. It prioritizes tensor/list L2 magnitudes, task score deltas, and attention calculations that require invariance validation because backend math can differ across platforms.",
         "",
         "## Recent Runs",
         "",
@@ -453,7 +514,9 @@ def main() -> int:
     api = wandb.Api()
     projects = selected_projects(args, api)
     project_runs = {
-        project: fetch_recent_runs(api, args.wandb_entity, project, args.runs_per_project)
+        project: fetch_latest_platform_runs(
+            api, args.wandb_entity, project, args.runs_per_project
+        )
         for project in projects
     }
     markdown = markdown_report(project_runs)
