@@ -90,7 +90,8 @@ register_plugins()
 llm = HookLLM(
     model="Qwen/Qwen2-1.5B-Instruct",
     worker_name="probe_spotlight",
-    enforce_eager=True,  # Required — disables fused attention
+    enforce_eager=True,           # Required — disables fused attention
+    enable_chunked_prefill=False, # Required — Spotlight needs full prefill
 )
 
 # Baseline (no steering)
@@ -110,4 +111,4 @@ spotlight = generate_with_spotlight(
 )
 ```
 
-> **Note**: `enforce_eager=True` is required. Flash Attention fuses Q/K/V into a single kernel, preventing hook access to the intermediate tensors needed for attention steering.
+> **Note**: `enforce_eager=True` and `enable_chunked_prefill=False` are required. Flash Attention fuses Q/K/V into a single kernel, preventing hook access to the intermediate tensors needed for attention steering. Chunked prefill splits long prompts across multiple forward passes, which prevents Spotlight from computing full-sequence attention.

@@ -14,7 +14,7 @@ if __name__ == "__main__":
     register_plugins()
 
     MODEL = "Qwen/Qwen2-1.5B-Instruct"
-    cache_dir = os.path.expanduser("~/.cache")
+    cache_dir = os.environ.get("HF_HUB_CACHE", os.path.expanduser("~/.cache"))
 
     print(f"Loading {MODEL}...")
 
@@ -27,6 +27,7 @@ if __name__ == "__main__":
         enable_hook=True,
         enforce_eager=True,  # Required for Spotlight (disables Flash Attention)
         enable_prefix_caching=False,
+        enable_chunked_prefill=False,
     )
 
     print(f"Model loaded: {MODEL}")

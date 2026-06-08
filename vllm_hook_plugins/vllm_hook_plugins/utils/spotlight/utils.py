@@ -7,11 +7,14 @@ Extracted from agent-lifecycle-toolkit for reuse in vLLM Hook.
 Implementation: Q/K capture with logit-direct bias application.
 """
 import os
+import logging
 import json
 from typing import List, Optional, Sequence, Tuple, Union
 import math
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 from vllm import SamplingParams
 
@@ -220,7 +223,7 @@ def compute_spotlight_bias(
             modified_weights[batch_idx] * union_mask
         ).sum() / modified_weights[batch_idx].sum()
 
-        print(f"[BIAS] current={current_proportion:.4f}, target={target_proportion:.4f}, steer={current_proportion < target_proportion}")
+        logger.debug(f"current={current_proportion:.4f}, target={target_proportion:.4f}, steer={current_proportion < target_proportion}")
 
         # Only steer upward (matching reference implementation)
         if current_proportion < target_proportion:
@@ -240,11 +243,11 @@ def compute_spotlight_bias(
                 attn_logits, dim=-1, dtype=torch.float32
             ).to(modified_weights.dtype)
 
-            # Diagnostic: verify new proportion
-            new_proportion = (
-                modified_weights[batch_idx] * union_mask
-            ).sum() / modified_weights[batch_idx].sum()
-            print(f"[BIAS] after steering: {new_proportion:.4f}")
+            if logger.isEnabledFor(logging.DEBUG):
+                new_proportion = (
+                    modified_weights[batch_idx] * union_mask
+                ).sum() / modified_weights[batch_idx].sum()
+                logger.debug(f"after steering: {new_proportion:.4f}")
 
     return modified_weights
 

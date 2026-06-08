@@ -7,6 +7,7 @@ Based on agent-lifecycle-toolkit's Spotlight component.
 Implementation: Q/K capture at .attn submodule level with logit-direct bias.
 """
 import os
+import logging
 import torch
 import torch.nn.functional as F
 import math
@@ -16,6 +17,7 @@ from vllm.forward_context import get_forward_context
 import re
 from vllm.distributed import parallel_state as ps
 
+logger = logging.getLogger(__name__)
 
 from vllm_hook_plugins.utils.spotlight.utils import (
     compute_spotlight_bias,
@@ -104,26 +106,37 @@ class SpotlightWorker(V1Worker):
         r = super().load_model(*args, **kwargs)
         try:
             self._install_hooks()
-            print("Spotlight hooks installed successfully")
+            logger.info("Spotlight hooks installed successfully")
         except Exception as e:
-            print(f"Spotlight hook installation failed: {e}")
+            logger.error(f"Spotlight hook installation failed: {e}")
         return r
 
     def _install_hooks(self):
         """Install Spotlight hooks on .attn modules with proper Q/K/V access."""
         model = getattr(self.model_runner, "model", None)
         if model is None:
-            print("no model; skip spotlight hooks")
+            logger.warning("No model found; skipping Spotlight hook installation")
             return
 
         self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
         if not self.hook_flag:
-            print("Missing VLLM_HOOK_FLAG environment variable")
+            logger.warning("Missing VLLM_HOOK_FLAG environment variable")
             return
+        self._hook_active = False
 
         # Path to spotlight params file
         hook_dir = os.environ.get("VLLM_HOOK_DIR")
         self.spotlight_params_file = os.path.join(hook_dir, "spotlight_params.json") if hook_dir else None
+
+        # Fail fast if chunked prefill would silently skip steering
+        max_num_batched_tokens = getattr(self.model_runner, "max_num_batched_tokens", None)
+        max_model_len = getattr(self.model_runner.model_config, "max_model_len", None)
+        if max_num_batched_tokens and max_model_len and max_num_batched_tokens < max_model_len:
+            raise RuntimeError(
+                "Spotlight requires chunked prefill to be disabled. "
+                "Set max_num_batched_tokens >= max_model_len or pass "
+                "enable_chunked_prefill=False to HookLLM."
+            )
 
         cfg = model.config
         num_h = int(getattr(cfg, "num_attention_heads", 32))
@@ -148,7 +161,7 @@ class SpotlightWorker(V1Worker):
             input_tuple[1] = K [total_tokens, kv_dim]
             input_tuple[2] = V [total_tokens, kv_dim]
             """
-            if not os.path.exists(self.hook_flag):
+            if not self._hook_active:
                 return None
 
             params = get_spotlight_params_from_file(self.spotlight_params_file)
@@ -195,9 +208,13 @@ class SpotlightWorker(V1Worker):
                 # without KV cache access
                 is_initial_prefill = torch.all(query_lens == seq_lens).item()
                 if not is_initial_prefill:
+                    is_chunked = torch.any(query_lens > 1).item()
+                    if is_chunked and not getattr(self, '_warned_chunked', False):
+                        logger.warning("Spotlight steering skipped: chunked prefill detected")
+                        self._warned_chunked = True
                     return None
 
-                print(f"[HOOK] Prefill: alpha={alpha}, Q={Q.shape}, query_lens={query_lens}")
+                logger.debug(f"Prefill: alpha={alpha}, Q={Q.shape}, query_lens={query_lens}")
 
                 # Process each batch item separately
                 all_outputs = []
@@ -250,14 +267,13 @@ class SpotlightWorker(V1Worker):
                     all_outputs.append(attn_out.to(orig_dtype))
 
                 output_tensor = torch.cat(all_outputs, dim=0)
-                diff = (output_tensor.float() - output.float()).abs()
-                print(f"[HOOK] output diff: mean={diff.mean():.6f}, max={diff.max():.6f}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    diff = (output_tensor.float() - output.float()).abs()
+                    logger.debug(f"output diff: mean={diff.mean():.6f}, max={diff.max():.6f}")
                 return output_tensor
 
             except Exception as e:
-                print(f"[HOOK] Error: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"Spotlight hook error: {e}", exc_info=True)
                 return None
 
         # Install hooks on .attn modules
@@ -274,7 +290,8 @@ class SpotlightWorker(V1Worker):
             self._hooks.append(hook)
             matched.append(name)
 
-        print(f"[INSTALL] Installed {len(self._hooks)} Spotlight hooks: {matched[:3]}...")
+        logger.info(f"Installed {len(self._hooks)} Spotlight hooks on: {matched[:3]}...")
 
     def execute_model(self, *args, **kwargs):
+        self._hook_active = os.path.exists(self.hook_flag)
         return super().execute_model(*args, **kwargs)
