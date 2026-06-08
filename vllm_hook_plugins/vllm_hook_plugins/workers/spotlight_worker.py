@@ -85,6 +85,13 @@ class SpotlightWorker:
             # Only apply during initial prefill (query_len == seq_len for all)
             is_initial_prefill = torch.all(query_lens == seq_lens).item()
             if not is_initial_prefill:
+                if not getattr(self, '_spotlight_chunked_warned', False):
+                    if torch.any(query_lens > 1).item():
+                        logger.warning(
+                            "Spotlight steering disabled: chunked prefill detected. "
+                            "Set enable_chunked_prefill=False for Spotlight to work."
+                        )
+                        self._spotlight_chunked_warned = True
                 return []
 
             entries = []
