@@ -6,9 +6,7 @@ Extracted from agent-lifecycle-toolkit for reuse in vLLM Hook.
 
 Implementation: Q/K capture with logit-direct bias application.
 """
-import os
 import logging
-import json
 from typing import List, Optional, Sequence, Tuple, Union
 import math
 import torch
@@ -304,6 +302,8 @@ def generate_with_spotlight(
     Returns:
         vLLM RequestOutput objects
     """
+    import copy
+
     # Normalize inputs
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -324,41 +324,33 @@ def generate_with_spotlight(
             templated_prompts.append(templated)
         prompts = templated_prompts
 
-    params_file = None
-    try:
-        # Tokenize prompts with offset mappings
-        tokenized = llm.tokenizer(
-            prompts,
-            return_tensors="pt",
-            return_offsets_mapping=True,
-            padding=True,
-        )
-        offset_mappings = tokenized.pop("offset_mapping")
+    # Tokenize prompts with offset mappings
+    tokenized = llm.tokenizer(
+        prompts,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        padding=True,
+    )
+    offset_mappings = tokenized.pop("offset_mapping")
 
-        # Convert text spans to token ranges
-        span_ranges = get_span_ranges(prompts, emph_strings, offset_mappings)
+    # Convert text spans to token ranges
+    span_ranges = get_span_ranges(prompts, emph_strings, offset_mappings)
 
-        # Write parameters to file for worker to read (cross-process safe)
-        params_file = os.path.join(llm._hook_dir, "spotlight_params.json")
-        with open(params_file, 'w') as f:
-            json.dump({
-                "span_ranges": span_ranges,
-                "alpha": alpha,
-            }, f)
+    # Build per-request SamplingParams with spotlight config in extra_args
+    base_params = sampling_params or SamplingParams(**kwargs)
+    sp_list = []
+    for i in range(len(prompts)):
+        sp = copy.copy(base_params)
+        extra = dict(sp.extra_args or {})
+        extra["spotlight"] = {
+            "span_ranges": span_ranges[i],
+            "alpha": alpha,
+        }
+        sp.extra_args = extra
+        sp_list.append(sp)
 
-        # Generate with hooks enabled
-        result = llm.generate(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            use_hook=True,
-            **kwargs
-        )
-        return result
-
-    finally:
-        # Clean up parameters file after generation
-        try:
-            if params_file and os.path.exists(params_file):
-                os.remove(params_file)
-        except (OSError, NameError, TypeError):
-            pass
+    return llm.generate(
+        prompts=prompts,
+        sampling_params=sp_list,
+        use_hook=True,
+    )

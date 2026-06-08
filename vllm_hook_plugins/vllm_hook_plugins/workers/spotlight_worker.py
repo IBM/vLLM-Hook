@@ -1,151 +1,72 @@
-"""
-Spotlight Worker for vLLM Hook - implements attention steering via token span highlighting.
-Based on agent-lifecycle-toolkit's Spotlight component.
+"""Spotlight Worker Mixin — attention steering via token span highlighting.
 
-**Paper**: [Venakteswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)
+Injected into vLLM's GPU Worker at runtime via worker_extension_cls.
+Hook installation is triggered by collective_rpc("install_hooks") after model load.
+Per-request activation is controlled via SamplingParams.extra_args["spotlight"].
 
-Implementation: Q/K capture at .attn submodule level with logit-direct bias.
+Paper: Venakteswaran and Contractor, EACL 2026
+       https://aclanthology.org/2026.eacl-long.174/
 """
-import os
 import logging
+import math
+from typing import TYPE_CHECKING, Any
+
 import torch
 import torch.nn.functional as F
-import math
-from typing import Dict, List, Optional, Tuple
-from vllm.v1.worker.gpu_worker import Worker as V1Worker
 from vllm.forward_context import get_forward_context
-import re
-from vllm.distributed import parallel_state as ps
 
-logger = logging.getLogger(__name__)
-
+from vllm_hook_plugins.workers._common import (
+    get_query_metadata,
+    iter_matched_modules,
+    match_attn,
+)
 from vllm_hook_plugins.utils.spotlight.utils import (
     compute_spotlight_bias,
-    compute_attention_scores,
-    apply_attention_weights,
-    reshape_attn_output,
     repeat_kv,
 )
 
-# ============================================================================
-# Parameter Access (File-Based, Cross-Process Safe)
-# ============================================================================
-# Main process writes params to a file in the hook directory before prefill.
-# Worker reads from file at hook-fire time (filesystem is shared across processes).
+if TYPE_CHECKING:
+    pass
 
-def get_spotlight_params_from_file(params_file: str) -> Optional[Dict]:
-    """
-    Read spotlight parameters from shared file (cross-process safe).
-
-    Called by the hook at fire time. Main process writes this file before prefill.
-
-    Args:
-        params_file: Path to spotlight_params.json in VLLM_HOOK_DIR
-
-    Returns:
-        Dict with "span_ranges" and "alpha", or None if file doesn't exist
-    """
-    import json
-    try:
-        if os.path.exists(params_file):
-            with open(params_file, 'r') as f:
-                return json.load(f)
-    except (IOError, json.JSONDecodeError):
-        pass
-    return None
-
-# ============================================================================
-# Attention Pattern Matching
-# ============================================================================
-
-ATTN_PATTERNS = [
-    # GPT-2: transformer.h.<i>.attn.attn
-    re.compile(r"^transformer\.h\.(\d+)\.attn\.attn$"),
-    # OPT: model.decoder.layers.<i>.self_attn.attn
-    re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn\.attn$"),
-    # Qwen/LLaMA: model.layers.<i>.self_attn.attn
-    re.compile(r"^model\.layers\.(\d+)\.self_attn\.attn$"),
-]
+logger = logging.getLogger(__name__)
 
 
-def match_attn(name: str):
-    """Match attention module name and extract layer index."""
-    for pat in ATTN_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return int(m.group(1))
-    return None
+class SpotlightWorker:
+    """Mixin injected into vLLM's GPU Worker via worker_extension_cls.
 
-
-# ============================================================================
-# Spotlight Worker Implementation
-# ============================================================================
-
-class SpotlightWorker(V1Worker):
-    """
-    vLLM Worker that implements Spotlight's attention steering during inference.
-
-    For each emphasized span in the prompt, steers attention weights toward that span
-    by applying a log-ratio bias directly to attention logits.
-
-    Usage:
-        from vllm_hook_plugins.workers.spotlight_worker import set_spotlight_params
-
-        llm = HookLLM(model="...", worker_name="probe_spotlight")
-
-        # Before generate(), set spotlight parameters
-        set_spotlight_params(
-            span_ranges=[[[0, 4]]],  # Emphasize tokens 0-4 in first prompt
-            alpha=0.3                # Target 30% attention on span
-        )
-
-        outputs = llm.generate(["Answer in JSON. What is 2+2?"])
+    vLLM does Worker.__bases__ += (SpotlightWorker,) at runtime,
+    so `self` is the Worker instance. Methods are callable via collective_rpc.
     """
 
-    def load_model(self, *args, **kwargs):
-        r = super().load_model(*args, **kwargs)
-        try:
-            self._install_hooks()
-            logger.info("Spotlight hooks installed successfully")
-        except Exception as e:
-            logger.error(f"Spotlight hook installation failed: {e}")
-        return r
+    if TYPE_CHECKING:
+        model_runner: Any
 
-    def _install_hooks(self):
-        """Install Spotlight hooks on .attn modules with proper Q/K/V access."""
+    _default_hooks_on: str = "prefill"
+    _spotlight_hooks_installed: bool = False
+
+    def install_hooks(self):
+        """Install Spotlight forward hooks on .attn modules. Idempotent.
+
+        Called via collective_rpc("install_hooks") after model load.
+        """
+        if self._spotlight_hooks_installed:
+            return
+        self._spotlight_hooks_installed = True
+
         model = getattr(self.model_runner, "model", None)
         if model is None:
             logger.warning("No model found; skipping Spotlight hook installation")
             return
 
-        self.hook_flag = os.environ.get("VLLM_HOOK_FLAG")
-        if not self.hook_flag:
-            logger.warning("Missing VLLM_HOOK_FLAG environment variable")
-            return
-        self._hook_active = False
-
-        # Path to spotlight params file
-        hook_dir = os.environ.get("VLLM_HOOK_DIR")
-        self.spotlight_params_file = os.path.join(hook_dir, "spotlight_params.json") if hook_dir else None
-
-        # Fail fast if chunked prefill would silently skip steering
-        max_num_batched_tokens = getattr(self.model_runner, "max_num_batched_tokens", None)
-        max_model_len = getattr(self.model_runner.model_config, "max_model_len", None)
-        if max_num_batched_tokens and max_model_len and max_num_batched_tokens < max_model_len:
-            raise RuntimeError(
-                "Spotlight requires chunked prefill to be disabled. "
-                "Set max_num_batched_tokens >= max_model_len or pass "
-                "enable_chunked_prefill=False to HookLLM."
-            )
-
         cfg = model.config
-        num_h = int(getattr(cfg, "num_attention_heads", 32))
-        num_kv = int(getattr(cfg, "num_key_value_heads", num_h))
-        hidden = int(getattr(cfg, "hidden_size", 4096))
+        text_cfg = getattr(cfg, "text_config", cfg)
+        num_h = int(getattr(text_cfg, "num_attention_heads", 32))
+        num_kv = int(getattr(text_cfg, "num_key_value_heads", num_h))
+        hidden = int(getattr(text_cfg, "hidden_size", 4096))
         head_dim = hidden // num_h
         attn_scale = 1.0 / math.sqrt(head_dim)
 
-        self._conf = dict(
+        self._spotlight_conf = dict(
             num_attention_heads=num_h,
             num_key_value_heads=num_kv,
             hidden_size=hidden,
@@ -153,85 +74,104 @@ class SpotlightWorker(V1Worker):
             attn_scale=attn_scale,
         )
 
+        # Per-batch cache to avoid re-resolving requests on every hook fire
+        self._spotlight_batch_cache_key = None
+        self._spotlight_batch_entries = None
+
+        def _resolve_batch(req_ids, bs, query_start_loc, seq_lens):
+            """Resolve which requests in this batch have spotlight params."""
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+
+            # Only apply during initial prefill (query_len == seq_len for all)
+            is_initial_prefill = torch.all(query_lens == seq_lens).item()
+            if not is_initial_prefill:
+                return []
+
+            entries = []
+            for i in range(bs):
+                req_id = req_ids[i]
+                req_state = self.model_runner.requests.get(req_id)
+                if req_state is None or req_state.sampling_params is None:
+                    entries.append(None)
+                    continue
+                extra = req_state.sampling_params.extra_args
+                if not extra or "spotlight" not in extra:
+                    entries.append(None)
+                    continue
+                spotlight_cfg = extra["spotlight"]
+                span_ranges = spotlight_cfg.get("span_ranges", [])
+                alpha = spotlight_cfg.get("alpha", 0.2)
+                if not span_ranges:
+                    entries.append(None)
+                    continue
+                entries.append({"span_ranges": span_ranges, "alpha": alpha})
+            return entries
+
         def spotlight_attention_hook(module, input_tuple, output, *, module_name=None):
-            """
-            Spotlight hook on attention modules with proper tensor reshaping.
+            """Forward hook that applies Spotlight bias during initial prefill.
 
             input_tuple[0] = Q [total_tokens, hidden_size]
             input_tuple[1] = K [total_tokens, kv_dim]
             input_tuple[2] = V [total_tokens, kv_dim]
             """
-            if not self._hook_active:
+            if torch.cuda.is_current_stream_capturing():
                 return None
 
-            params = get_spotlight_params_from_file(self.spotlight_params_file)
-            if not params:
+            ctx = get_forward_context()
+            metadata = getattr(ctx, "attn_metadata", None)
+            if metadata is None:
                 return None
 
-            span_ranges = params.get("span_ranges", [])
-            alpha = params.get("alpha", 0.2)
 
-            if not span_ranges or not any(span_ranges):
+            # Reuse resolved-request list within the same forward step
+            cache_key = id(metadata)
+            if self._spotlight_batch_cache_key != cache_key:
+                query_start_loc, seq_lens = get_query_metadata(metadata)
+                if query_start_loc is None or seq_lens is None:
+                    return None
+                try:
+                    req_ids = self.model_runner.input_batch.req_ids
+                except Exception:
+                    return None
+                bs = len(query_start_loc) - 1
+                self._spotlight_batch_cache_key = cache_key
+                self._spotlight_batch_entries = _resolve_batch(
+                    req_ids, bs, query_start_loc, seq_lens
+                )
+                self._spotlight_batch_qsl = query_start_loc
+
+            entries = self._spotlight_batch_entries
+            if not entries or not any(entries):
                 return None
 
             try:
-                Q = input_tuple[0]  # [total_tokens, hidden_size]
-                K = input_tuple[1]  # [total_tokens, kv_dim]
-                V = input_tuple[2]  # [total_tokens, kv_dim]
+                Q = input_tuple[0]
+                K = input_tuple[1]
+                V = input_tuple[2]
+                query_start_loc = self._spotlight_batch_qsl
+                batch_size = len(entries)
 
-                # Get attention metadata — it's a dict keyed by layer name
-                ctx = get_forward_context()
-                metadata = getattr(ctx, "attn_metadata", None)
-                if metadata is None:
-                    return None
-
-                # metadata is a dict: metadata[layer_name].seq_lens
-                layer_meta = metadata.get(module_name) if isinstance(metadata, dict) else metadata
-                if layer_meta is None:
-                    return None
-
-                # seq_lens = total sequence length (including KV cache)
-                # query_start_loc = cumulative query token offsets
-                # Q/K/V only contain query_len tokens (new tokens), not seq_len
-                seq_lens = getattr(layer_meta, "seq_lens", None)
-                query_start_loc = getattr(layer_meta, "query_start_loc", None)
-                if seq_lens is None or query_start_loc is None:
-                    return None
-
-                # Compute query lengths per request
-                query_lens = query_start_loc[1:] - query_start_loc[:-1]
-                batch_size = len(seq_lens)
-
-                # Only apply during initial prefill where all tokens are new
-                # (query_len == seq_len means no cached tokens, full prompt available)
-                # During decode or partial prefill we can't recompute attention
-                # without KV cache access
-                is_initial_prefill = torch.all(query_lens == seq_lens).item()
-                if not is_initial_prefill:
-                    is_chunked = torch.any(query_lens > 1).item()
-                    if is_chunked and not getattr(self, '_warned_chunked', False):
-                        logger.warning("Spotlight steering skipped: chunked prefill detected")
-                        self._warned_chunked = True
-                    return None
-
-                logger.debug(f"Prefill: alpha={alpha}, Q={Q.shape}, query_lens={query_lens}")
-
-                # Process each batch item separately
                 all_outputs = []
                 for batch_idx in range(batch_size):
                     q_start = int(query_start_loc[batch_idx])
                     q_end = int(query_start_loc[batch_idx + 1])
                     qlen = q_end - q_start
 
-                    # Extract this batch's Q, K, V (only query tokens)
-                    Q_batch = Q[q_start:q_end]  # [qlen, hidden_size]
-                    K_batch = K[q_start:q_end]  # [qlen, kv_dim]
-                    V_batch = V[q_start:q_end]  # [qlen, kv_dim]
+                    params = entries[batch_idx]
+                    if params is None:
+                        all_outputs.append(output[q_start:q_end])
+                        continue
+
+                    span_ranges = params["span_ranges"]
+                    alpha = params["alpha"]
+
+                    Q_batch = Q[q_start:q_end]
+                    K_batch = K[q_start:q_end]
+                    V_batch = V[q_start:q_end]
 
                     orig_dtype = Q_batch.dtype
 
                     # Reshape to [num_heads, qlen, head_dim] and upcast to float32
-                    # (float16 overflows in Q @ K^T; fused kernels handle this internally)
                     Q_batch = Q_batch.reshape(qlen, num_h, head_dim).transpose(0, 1).float()
                     K_batch = K_batch.reshape(qlen, num_kv, head_dim).transpose(0, 1).float()
                     V_batch = V_batch.reshape(qlen, num_kv, head_dim).transpose(0, 1).float()
@@ -242,56 +182,42 @@ class SpotlightWorker(V1Worker):
                         K_batch = repeat_kv(K_batch.unsqueeze(0), n_rep).squeeze(0)
                         V_batch = repeat_kv(V_batch.unsqueeze(0), n_rep).squeeze(0)
 
-                    # Compute attention logits: Q @ K^T * scale
                     logits = torch.matmul(Q_batch, K_batch.transpose(-1, -2)) * attn_scale
 
                     # Apply causal mask
                     causal_mask = torch.triu(
-                        torch.full((qlen, qlen), float('-inf'), device=logits.device, dtype=torch.float32),
+                        torch.full((qlen, qlen), float('-inf'),
+                                   device=logits.device, dtype=torch.float32),
                         diagonal=1
                     )
                     logits = logits + causal_mask.unsqueeze(0)
 
                     # Apply Spotlight bias
-                    if batch_idx < len(span_ranges):
-                        batch_spans = [span_ranges[batch_idx]]
-                        logits_4d = logits.unsqueeze(0)  # [1, heads, qlen, qlen]
-                        modified_weights = compute_spotlight_bias(logits_4d, batch_spans, target_proportion=alpha)
-                        modified_weights = modified_weights.squeeze(0)
-                    else:
-                        modified_weights = F.softmax(logits, dim=-1)
+                    logits_4d = logits.unsqueeze(0)  # [1, heads, qlen, qlen]
+                    modified_weights = compute_spotlight_bias(
+                        logits_4d, [span_ranges], target_proportion=alpha
+                    )
+                    modified_weights = modified_weights.squeeze(0)
 
                     # Compute attention output: weights @ V
-                    attn_out = torch.matmul(modified_weights, V_batch)  # [heads, qlen, head_dim]
-                    attn_out = attn_out.transpose(0, 1).reshape(qlen, -1)  # [qlen, hidden_size]
+                    attn_out = torch.matmul(modified_weights, V_batch)
+                    attn_out = attn_out.transpose(0, 1).reshape(qlen, -1)
                     all_outputs.append(attn_out.to(orig_dtype))
 
-                output_tensor = torch.cat(all_outputs, dim=0)
-                if logger.isEnabledFor(logging.DEBUG):
-                    diff = (output_tensor.float() - output.float()).abs()
-                    logger.debug(f"output diff: mean={diff.mean():.6f}, max={diff.max():.6f}")
-                return output_tensor
+                return torch.cat(all_outputs, dim=0)
 
             except Exception as e:
                 logger.error(f"Spotlight hook error: {e}", exc_info=True)
                 return None
 
         # Install hooks on .attn modules
-        self._hooks = []
+        self._spotlight_hooks = []
         matched = []
-
-        for name, module in model.named_modules():
-            if match_attn(name) is None:
-                continue
-
+        for name, module, _layer_num in iter_matched_modules(model, match_attn):
             hook = module.register_forward_hook(
                 lambda m, i, o, n=name: spotlight_attention_hook(m, i, o, module_name=n)
             )
-            self._hooks.append(hook)
+            self._spotlight_hooks.append(hook)
             matched.append(name)
 
-        logger.info(f"Installed {len(self._hooks)} Spotlight hooks on: {matched[:3]}...")
-
-    def execute_model(self, *args, **kwargs):
-        self._hook_active = os.path.exists(self.hook_flag)
-        return super().execute_model(*args, **kwargs)
+        logger.info(f"Installed {len(self._spotlight_hooks)} Spotlight hooks on: {matched[:3]}...")
