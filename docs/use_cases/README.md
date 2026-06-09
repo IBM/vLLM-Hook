@@ -6,8 +6,8 @@ Each row maps a use case to its plugin code and the corresponding contributor.
 
 | Use case | Worker / Analyzer / Demo | Contributor |
 | --- | --- | --- |
-| Attention Tracker (prompt-injection guardrail) | `workers/probe_hookqk_worker.py`, `analyzers/attention_tracker_analyzer.py`, `examples/demo_attntracker.py` (Colab: @tburleyinfo) | @IRENEKO |
-| Core Reranker | `analyzers/core_reranker_analyzer.py`, `examples/demo_corer.py` (Colab: @tburleyinfo) | @IRENEKO |
-| Activation Steering | `workers/steer_activation_worker.py`, `examples/demo_actsteer.py`, `examples/demo_actsteer_serve.py` (Colab: @tburleyinfo) | @IRENEKO |
-| Hidden-State Probe | `workers/probe_hidden_states_worker.py`, `analyzers/hidden_states_analyzer.py`, `examples/demo_hiddenstate.py` | @IRENEKO |
-| Science Hallucination Detector | `analyzers/science_hallucination_analyzer.py`, `examples/demo_scihal.py` | @IRENEKO |
+| Attention Tracker| `workers/probe_hookqk_worker.py`, `analyzers/attention_tracker_analyzer.py`, `examples/demo_attntracker.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Core Reranker | `analyzers/core_reranker_analyzer.py`, `examples/demo_corer.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Activation Steering | `workers/steer_activation_worker.py`, `examples/demo_actsteer.py`, `examples/demo_actsteer_serve.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Hidden-State Probe | `workers/probe_hidden_states_worker.py`, `analyzers/hidden_states_analyzer.py`, `examples/demo_hiddenstate.py` | [@IRENEKO](https://github.com/IRENEKO) |
+| Science Hallucination Detector | `analyzers/science_hallucination_analyzer.py`, `examples/demo_scihal.py` | [@IRENEKO](https://github.com/IRENEKO) |
