@@ -10,7 +10,7 @@ Metrics:
 Usage:
   export VLLM_USE_V1=1
   export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  python Numerical_Analysis/benchmark_hidden_states.py [flags]
+  python docs/numerical_analysis/benchmark_hidden_states.py [flags]
 
 Common flags (see --help for the full list):
   --sweep-grid                full 3D sweep: layers × prompt_len × token_mode

@@ -20,6 +20,7 @@ The following files are **core infrastructure**. Please discuss with maintainers
 - [ ] New workers/analyzers are registered via `PluginRegistry` in `__init__.py`
 - [ ] New workers are implemented as `worker_extension_cls`  (for in-band artifact retrieval and concurrent request support)
 - [ ] Examples or notebooks are included for new features
+- [ ] If I added a new use case, I appended a row to `docs/use_cases/README.md` with my GitHub handle. If the use case has a writeup, I placed it under `docs/use_cases/<name>.md` and linked it from the table.
 
 ## Testing
 <!-- Describe how you tested this. Which demo/example did you run? -->

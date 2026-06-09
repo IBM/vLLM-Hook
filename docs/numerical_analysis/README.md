@@ -72,17 +72,17 @@ pip install -e vllm_hook_plugins
 
 # Run the comparisons
 rm -rf /dev/shm/vllm_hook
-python Numerical_Analysis/benchmark_hidden_states.py \
+python docs/numerical_analysis/benchmark_hidden_states.py \
     --sweep-grid \
     --hook-dir /dev/shm/vllm_hook \
     --variant-last-token disk-st-async \
     --variant-all-tokens disk-st-async \
-    --output Numerical_Analysis/grid_results.csv
+    --output docs/numerical_analysis/grid_results.csv
 
 # Generate plots
-python Numerical_Analysis/plot_grid_results.py \
-    --input Numerical_Analysis/grid_results.csv \
-    --output-dir Numerical_Analysis/plots/
+python docs/numerical_analysis/plot_grid_results.py \
+    --input docs/numerical_analysis/grid_results.csv \
+    --output-dir docs/numerical_analysis/plots/
 ```
 
 ---
@@ -92,7 +92,7 @@ python Numerical_Analysis/plot_grid_results.py \
 To verify that vLLM-Hook (`all_tokens`) produces the same hidden states as Native vLLM Eagle:
 
 ```bash
-python Numerical_Analysis/verify_artifact_parity.py
+python docs/numerical_analysis/verify_artifact_parity.py
 ```
 This runs both systems on the same 8 prompts, extracts all 20 layers, and compares tensors token-by-token. vLLM-Hook (`all_tokens`) mode was verified to produce numerically equivalent hidden states to Native vLLM Eagle (cosine similarity ∈ [0.999998, 1.000072] across all 160 layer×prompt tensors, max absolute diff = 0.0 — i.e., bitwise identical at float16).
 
