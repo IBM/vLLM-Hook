@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "vllm_hook_plugins"))
 
 MODEL_ID = os.path.expanduser(
@@ -18,7 +18,7 @@ LAYERS = list(range(1, 21))  # 1-based: layer N = output after Nth transformer b
 TARGET_PROMPT_LEN = 64
 N_PROMPTS = 8
 
-sys.path.insert(0, str(PROJECT_ROOT / "Numerical_Analysis"))
+sys.path.insert(0, str(PROJECT_ROOT / "docs" / "numerical_analysis"))
 from benchmark_hidden_states import _prompts_for_length
 
 def _build_prompts():
