@@ -1,166 +1,201 @@
-# 🪝 vLLM.hook
-*A modular plugin library for vLLM.*
+# 🪝 vLLM.hook Apple Silicon
+*A modular plugin library for vLLM on Apple Silicon via vLLM-Metal.*
 
 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
-vLLM.hook is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
+🔗 Metal backend: [**vllm-project/vllm-metal**](https://github.com/vllm-project/vllm-metal)
 
-This includes dynamic analysis of:  
-- attention patterns  
-- attention heads  
-- activations  
-- custom intervention behaviors  
+**vLLM-Hook Apple Silicon (Proof of Concept)**
+
+This proof-of-concept adapts vLLM-Hook for **Apple Silicon / MLX** by running on top of the **vLLM-Metal** execution path.
+
+Use the Metal entrypoint when you want to inspect, analyze, or steer model internals locally on a Mac:
+
+```python
+from vllm_hook_plugins.metal import HookLLMMetal
+```
+
+This includes dynamic analysis of:
+- attention patterns
+- attention heads
+- hidden states
+- activation steering behaviors
 
 ---
 
 ## 🚀 Features
 
-- **Model-agnostic plugin system** for vLLM engines  
-- **Extensible worker/analyzer abstraction**  
-  - Easy to define new hooks, analyzers, and behaviors  
-- **Introspection** of model internals  
-- **Interventions** (activation steering, attention control, etc.)  
-- **Example applications**:  
-  - Safety guardrails  
-  - Reranking  
-  - Enhanced instruction following  
+- **Apple Silicon support** through `vllm-metal`
+- **MLX-backed worker/analyzer implementations**
+  - Metal-specific hooks live beside the standard vLLM-Hook path
+- **Introspection** of model internals
+- **Interventions** through activation steering
+- **Example applications**:
+  - Safety guardrails
+  - Reranking
+  - Hidden state extraction
+  - Enhanced instruction following
 
 ---
 
-## 📊 Performance Analysis
+## 🍎 Apple Silicon Notes
 
-For a detailed benchmark comparing **vLLM-Hook** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction, see [`docs/numerical_analysis/`](docs/numerical_analysis/README.md).
+The Metal implementation keeps the same high-level vLLM-Hook workflow while swapping in Metal-specific components under:
 
-Key takeaways:
-- vLLM-Hook (`last_token`) offers significantly lower and prompt-length-invariant latency when only the final-position representation is needed
-- vLLM-Hook (`all_tokens`) is numerically equivalent to Native Eagle while avoiding its GPU memory overhead
-- Native Eagle requires loading a speculative decoding drafter model, reducing available KV cache
+- `vllm_hook_plugins/vllm_hook_plugins/metal`
+- `vllm_hook_plugins/vllm_hook_plugins/workers/metal`
+- `vllm_hook_plugins/vllm_hook_plugins/analyzers/metal`
+
+The Metal path is designed for macOS on Apple Silicon and expects the `vllm-metal` virtual environment created by the upstream installer.
+
+Apple Silicon uses unified memory, so smaller models, quantized MLX-community models, and shorter context lengths are recommended. The Metal notebooks pin `max_model_len=2048` to avoid reserving excessive KV-cache memory.
 
 ---
 
-## 🧩 Supported Configurations
+## 🧩 Supported Metal Configurations
 
-Each use case (e.g. attention tracker, activation steering, hidden states extraction, etc) runs across a Cartesian product of configuration axes — execution path (`offline` / `vllm serve`), storage (`rpc` / `disk` / `shm`), disk format (`pt` / `safetensors`), and save mode (`sync` / `async`). See [`docs/configs.md`](docs/configs.md) for code snippets showing how to select each config.
+The Metal path currently supports:
+
+- **Attention tracker** via Q/K capture
+- **Core reranker** via Q/K capture and Metal analyzer wrappers
+- **Hidden states extraction**
+- **Activation steering**
+
+`HookLLMMetal` maps standard worker names to Metal-specific implementations:
+
+| Worker name | Metal implementation |
+| --- | --- |
+| `probe_hook_qk` | `ProbeHookQKWorkerMetal` |
+| `probe_hidden_states` | `ProbeHiddenStatesWorkerMetal` |
+| `steer_hook_act` | `SteerHookActWorkerMetal` |
 
 ---
 
 ## 📦 Installation
-### 1. Clone the repository
+
+### 1. Install vllm-metal
+
+The upstream installer creates `~/.venv-vllm-metal` by default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+```
+
+Activate the environment:
+
+```bash
+source ~/.venv-vllm-metal/bin/activate
+```
+
+### 2. Clone the repository
 
 ```bash
 git clone https://github.com/IBM/vLLM-Hook.git
 cd vLLM-Hook
 ```
 
-### 2. (Optional) Create an environment 
-
-```bash
-conda create -n vllm_hook_env python=3.12 pip
-conda activate vllm_hook_env
-```
-
 ### 3. Install the plugin and dependencies
 
+Install vLLM-Hook into the active `vllm-metal` environment:
+
 ```bash
-pip install -r requirement.txt
-pip install -e vllm_hook_plugins
+python -m pip install -r requirement.txt
+python -m pip install -e vllm_hook_plugins
 ```
 
 ---
 
-## 📕 Notebook Setup 
+## 📕 Notebook Setup
 
-If you plan to use the notebooks under `notebooks/`, you may need to register your environment as a Jupyter kernel:
+Register the active vLLM-Metal environment as a Jupyter kernel:
 
 ```bash
-pip install ipykernel
-python -m ipykernel install --user --name vllm_hook_env --display-name "vllm_hook_env"
+./scripts/metal/register_vllm_metal_kernel.sh
 ```
 
-Then inside Jupyter Lab:
+Then launch Jupyter:
+
+```bash
+jupyter lab
+```
+
+Inside Jupyter Lab:
 
 ```
-Kernel → Change Kernel → vllm_hook_env
+Kernel → Change Kernel → Python (vllm-metal)
 ```
+
+For more details, see [`notebooks/metal/README.md`](notebooks/metal/README.md).
 
 ---
 
-## 👉 Usage Examples (Notebook / CLI)
+## 👉 Usage Examples (Metal Notebooks)
 
-You can also use the included **`examples/`** and/or **`notebooks/`** directories to explore different functionalities. For the full list of use cases, see [`docs/use_cases/`](docs/use_cases/README.md).
+Use the included **`notebooks/metal/`** demos to explore the Apple Silicon path.
 
 ### 1. Attention Tracker (In-Model Safety Guardrail)
 
-Notebook 📓: `notebooks/demo_attntracker.ipynb` <br />
-CLI 🧰 : 
-```bash
-python examples/demo_attntracker.py
-```
+Notebook 📓: `notebooks/metal/demo_attntracker_metal.ipynb`
 
 ### 2. Core Reranker (In-Model Relevance Ranking)
 
-Notebook 📓: `notebooks/demo_corer.ipynb` <br />
-CLI 🧰 : 
-```bash
-python examples/demo_corer.py
-```
+Notebook 📓: `notebooks/metal/demo_corer_metal.ipynb`
 
 ### 3. Activation Steering (Enhanced instruction following via activation steering)
 
-Notebook 📓: `notebooks/demo_actsteer.ipynb` <br />
-CLI 🧰 : 
-```bash
-python examples/demo_actsteer.py
-```
+Notebook 📓: `notebooks/metal/demo_actsteer_metal.ipynb`
 
 You can customize model configurations in the `model_configs/` folder, e.g.:
 
 ```
 model_configs/<example_name>/<model_name>.json
 ```
-For example `model_configs/attention_tracker/granite-3.1-8b-instruct.json`.
 
 ---
 
 ## 🏠 Plugin Architecture
 
-The main package is structured as follows:
+The Metal package is structured as follows:
 
 ```
 vllm_hook_plugins/
 ├── analyzers/
-│   ├── attention_tracker_analyzer.py
-│   ├── core_reranker_analyzer.py
+│   ├── metal/
+│   │   ├── attention_tracker_analyzer_metal.py
+│   │   ├── core_reranker_analyzer_metal.py
+│   │   ├── hidden_states_analyzer_metal.py
 ├── workers/
-│   ├── probe_hookqk_worker.py
-│   ├── steer_activation_worker.py
-├── hook_llm.py
-├── registry.py
+│   ├── metal/
+│   │   ├── probe_hookqk_worker_metal.py
+│   │   ├── probe_hidden_states_worker_metal.py
+│   │   ├── steer_activation_worker_metal.py
+├── metal/
+│   ├── hook_llm_metal.py
+│   ├── run_utils_metal.py
 ```
 
 Each component handles a key stage of the plugin lifecycle:
 
-- **Registry** — manages available hooks and extensions  
-- **Workers** — define execution behavior and orchestration  
-- **Analyzers** — optionally conduct analysis based on the saved statistics  
-
+- **Metal entrypoint** — exposes `HookLLMMetal`
+- **Workers** — define MLX/vLLM-Metal hook behavior
+- **Analyzers** — route Metal artifacts through analyzer-compatible loaders
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions from the community!  
+We welcome contributions from the community!
 
 ### To contribute:
-1. **Fork** this repository  
-2. **Create a branch** (`git checkout -b feature/amazing-feature`)  
-3. **Commit** your changes (`git commit -m 'Add amazing feature'`)  
-4. **Push** to your branch (`git push origin feature/amazing-feature`)  
-5. **Open a Pull Request**  
+1. **Fork** this repository
+2. **Create a branch** (`git checkout -b feature/amazing-feature`)
+3. **Commit** your changes (`git commit -m 'Add amazing feature'`)
+4. **Push** to your branch (`git push origin feature/amazing-feature`)
+5. **Open a Pull Request**
 
 ### Guidelines:
 - Users are encouraged to define new worker/analyzer, but should not touch hook_llm
-- Include examples and documentation for new features  
+- Include examples and documentation for new features
 - New use cases must be added to [`docs/use_cases/README.md`](docs/use_cases/README.md) with the contributor's GitHub handle
 
 ---
@@ -180,5 +215,5 @@ We welcome contributions from the community!
 ## IBM ❤️ Open Source AI
 
 vLLM.hook has been started by IBM Research.
-- Built for the **vLLM** ecosystem  
-- Inspired by community efforts to make LLMs more interpretable and controllable  
+- Built for the **vLLM** ecosystem
+- Extended here for **Apple Silicon / vLLM-Metal**
