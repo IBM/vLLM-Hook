@@ -216,4 +216,5 @@ We welcome contributions from the community!
 
 vLLM.hook has been started by IBM Research.
 - Built for the **vLLM** ecosystem
-- Extended here for **Apple Silicon / vLLM-Metal**
+- Extended here for Inspired by community efforts to make LLMs more interpretable and controllable
+
