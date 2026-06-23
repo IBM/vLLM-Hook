@@ -1,5 +1,5 @@
 # 🪝 vLLM.hook Apple Silicon
-*A modular plugin library for vLLM on Apple Silicon via vLLM-Metal.*
+*A modular plugin library for vLLM on Apple Silicon via vLLM-Metal. Authored by Timothy Burley*
 
 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
