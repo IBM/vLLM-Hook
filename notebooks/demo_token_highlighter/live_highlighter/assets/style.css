@@ -1,0 +1,54 @@
+.wrap {
+    color-scheme: light only;
+    font-family: ui-monospace, Menlo, monospace;
+    padding: 14px;
+    background: #fafafa;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #111;
+}
+
+.wrap .legend {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #333;
+    margin-bottom: 10px;
+}
+
+.wrap .swatch {
+    width: 80px;
+    height: 12px;
+    border-radius: 2px;
+    border: 1px solid #999;
+    background: linear-gradient(to right, #fff9c4, #ffc107, #ff6d00, #b71c1c, #7f0000);
+}
+
+.wrap .driver-chip {
+    border: 2px solid #c62828;
+    border-radius: 3px;
+    padding: 0 4px;
+    font-size: 11px;
+}
+
+.wrap .tokens {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    line-height: 2;
+    overflow: visible;
+}
+
+.wrap .completion {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed #aaa;
+}
+
+.wrap .completion pre {
+    margin: 4px 0 0;
+    white-space: pre-wrap;
+}
