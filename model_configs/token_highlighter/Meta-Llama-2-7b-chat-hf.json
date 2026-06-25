@@ -1,0 +1,15 @@
+{
+    "model_info": {
+        "name": "meta-llama/Meta-Llama-2-7b-chat-hf"
+    },
+    "highlighter": {
+        "target_phrase": "Sure, I'd like to help you with this.",
+        "mode": "top_percentage",
+        "threshold_k": 2.0,
+        "temperature": 0.6,
+        "beta": 0.5,
+        "alpha": 0.25,
+        "capture": "extended",
+        "require_attn_metadata": false
+    }
+}
