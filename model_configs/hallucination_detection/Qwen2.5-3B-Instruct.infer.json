@@ -1,0 +1,12 @@
+{
+  "model_info": {
+    "name": "Qwen/Qwen2.5-3B-Instruct",
+    "note": "Inference: capture only the probe's best layer. Update 'layers' to match probe.json:best_layer (typically near 50% depth \u2014 for 36 layers that's around layer 18). The demo script auto-rewrites this field after training."
+  },
+  "hidden_states": {
+    "layers": [
+      25
+    ],
+    "mode": "last_token"
+  }
+}

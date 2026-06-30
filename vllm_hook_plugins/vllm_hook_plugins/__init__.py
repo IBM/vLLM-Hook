@@ -17,6 +17,7 @@ from vllm_hook_plugins.utils.TokenHighlighter.utils import (
     load_highlighter_config,
 )
 from vllm_hook_plugins.analyzers.highlighter_analyzer import HighlighterAnalyzer
+from vllm_hook_plugins.analyzers.hallucination_analyzer import HallucinationAnalyzer
 
 
 def register_plugins():
@@ -34,6 +35,7 @@ def register_plugins():
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
     PluginRegistry.register_analyzer("science_hallucination", ScienceHallucinationAnalyzer)
     PluginRegistry.register_analyzer("token_highlighter", HighlighterAnalyzer)
+    PluginRegistry.register_analyzer("hallucination",         HallucinationAnalyzer)
 
 __all__ = [
     "PluginRegistry",
@@ -53,5 +55,6 @@ __all__ = [
     "analyze_with_highlighter",
     "load_highlighter_config",
     "HighlighterAnalyzer",
+    "HallucinationAnalyzer",
     "register_plugins"
 ]
