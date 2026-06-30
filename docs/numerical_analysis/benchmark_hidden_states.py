@@ -39,9 +39,12 @@ import torch
 from transformers import AutoTokenizer
 from vllm import SamplingParams
 
-os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+# Default: disable AOT compile, eager mode. Override via --native-compile.
+# Hook side ALWAYS runs eager — see eager_mode.md (CUDA graph replay skips
+# Python forward hooks). The flag only changes how Native is run.
+os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
 
-MODEL_ID = os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen2-1.5B-Instruct/snapshots/ba1cf1846d7df0a0591d6c00649f57e798519da8")
+MODEL_ID = "Qwen/Qwen2-1.5B-Instruct"
 TARGET_LAYERS = [1, 2, 3, 4]
 MAX_TOKENS = 1          # prefill-only: both approaches are designed for this
 N_WARMUP = 5
@@ -67,7 +70,7 @@ PROMPTS = [
     "By 1933, most of the subsidiaries had been merged into one company, IBM."
 ]
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = str(PROJECT_ROOT / "model_configs" / "hidden_states" / "Qwen2-1.5B-Instruct.json")
 DOWNLOAD_DIR = os.path.expanduser("~/.cache")
 
@@ -82,6 +85,7 @@ STORAGE_VARIANTS = {
     "rpc":           {"env": {},                                                                       "storage": "rpc",  "last_token_only": False},
     "disk-pt":       {"env": {},                                                                       "storage": "disk", "last_token_only": False},
     "disk-pt-async": {"env": {"VLLM_HOOK_ASYNC_SAVE": "1"},                                            "storage": "disk", "last_token_only": False},
+    "disk-st":       {"env": {"VLLM_HOOK_USE_SAFETENSORS": "1"},                                       "storage": "disk", "last_token_only": False},
     "disk-st-async": {"env": {"VLLM_HOOK_USE_SAFETENSORS": "1", "VLLM_HOOK_ASYNC_SAVE": "1"},          "storage": "disk", "last_token_only": False},
     "shm":           {"env": {"VLLM_HOOK_USE_SHM": "1"},                                               "storage": "shm",  "last_token_only": True},
 }
@@ -418,14 +422,16 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
     return results, _hook_dir, last_run_id, prev_run_id
 
 
-def run_native_benchmark(dry_run=False, *, layers=None, prompts=None):
+def run_native_benchmark(dry_run=False, *, layers=None, prompts=None,
+                         enforce_eager=True):
     from safetensors import safe_open
     from vllm import LLM, SamplingParams
 
     _layers = layers if layers is not None else TARGET_LAYERS
     _prompts = prompts if prompts is not None else PROMPTS
 
-    print("[Native vLLM] Initializing...")
+    print(f"[Native vLLM] Initializing  enforce_eager={enforce_eager}  "
+          f"VLLM_USE_AOT_COMPILE={os.environ.get('VLLM_USE_AOT_COMPILE')}")
     tmpdir = tempfile.mkdtemp(prefix="vllm_hs_native_")
     llm = LLM(
         model=MODEL_ID,
@@ -446,7 +452,7 @@ def run_native_benchmark(dry_run=False, *, layers=None, prompts=None):
             },
         },
         dtype="float16",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         enable_prefix_caching=False,
         download_dir=DOWNLOAD_DIR,
         gpu_memory_utilization=0.3,
@@ -477,7 +483,8 @@ def run_native_benchmark(dry_run=False, *, layers=None, prompts=None):
 
 def run_grid_sweep(dry_run: bool, hook_dir, skip_hook: bool, skip_native: bool,
                    variant_per_mode: dict = None, output_path: str = None,
-                   start_from: int = 1, existing_rows: list = None) -> list:
+                   start_from: int = 1, existing_rows: list = None,
+                   native_enforce_eager: bool = True) -> list:
     if variant_per_mode is None:
         variant_per_mode = {"last_token": "disk-pt", "all_tokens": "disk-pt"}
 
@@ -507,6 +514,7 @@ def run_grid_sweep(dry_run: bool, hook_dir, skip_hook: bool, skip_native: bool,
                 hook_kwargs, native_kwargs,
                 skip_hook,
                 skip_native or (token_mode == "last_token"),
+                native_enforce_eager=native_enforce_eager,
             )
         finally:
             _restore_env(env_snap)
@@ -533,7 +541,8 @@ def run_grid_sweep(dry_run: bool, hook_dir, skip_hook: bool, skip_native: bool,
 
 def _run_prompt_len_sweep_point(target_len, dry_run, hook_dir,
                                 hook_kwargs, native_kwargs,
-                                skip_hook, skip_native):
+                                skip_hook, skip_native,
+                                native_enforce_eager: bool = True):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=DOWNLOAD_DIR)
     prompts = _prompts_for_length(target_len, tokenizer)
     print(f"  Generated {len(prompts)} prompts of ~{target_len} tokens each")
@@ -571,6 +580,7 @@ def _run_prompt_len_sweep_point(target_len, dry_run, hook_dir,
         native_results = run_native_benchmark(
             dry_run=dry_run, prompts=prompts,
             layers=native_kwargs.get("layers"),
+            enforce_eager=native_enforce_eager,
         )
     else:
         native_results = _empty_results()
@@ -622,7 +632,26 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Number of prompts per cell (default 8). Set to 1 "
                              "to compare against single-prompt micro-benchmarks.")
+    parser.add_argument("--native-compile", default="eager",
+                        choices=["eager", "no-aot", "aot"],
+                        help="How to run Native vLLM. 'eager' (default) matches "
+                             "the original Fig3 setup. 'no-aot' enables CUDA graphs "
+                             "but disables AOT compile. 'aot' enables both — the "
+                             "torch>=2.10 default. Hook side is unaffected (always "
+                             "eager — see eager_mode.md).")
     args = parser.parse_args()
+
+    # Apply --native-compile BEFORE LLM imports happen inside run_native_benchmark.
+    # The Hook side runs eager regardless.
+    if args.native_compile == "aot":
+        os.environ["VLLM_USE_AOT_COMPILE"] = "1"
+        _native_enforce_eager = False
+    elif args.native_compile == "no-aot":
+        os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+        _native_enforce_eager = False
+    else:  # eager
+        os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+        _native_enforce_eager = True
 
     if args.layers is not None:
         ks = [int(x) for x in args.layers.split(",") if x.strip()]
@@ -663,6 +692,7 @@ if __name__ == "__main__":
             output_path=None if args.dry_run else args.output,
             start_from=args.start_from,
             existing_rows=existing_rows,
+            native_enforce_eager=_native_enforce_eager,
         )
         if not args.dry_run:
             _save_csv(rows, args.output)
@@ -675,7 +705,10 @@ if __name__ == "__main__":
             hook_results, *_ = run_hook_benchmark(dry_run=args.dry_run, hook_dir=args.hook_dir)
 
         if not args.skip_native:
-            native_results = run_native_benchmark(dry_run=args.dry_run)
+            native_results = run_native_benchmark(
+                dry_run=args.dry_run,
+                enforce_eager=_native_enforce_eager,
+            )
 
         if not args.dry_run:
             _print_table(hook_results, native_results)

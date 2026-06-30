@@ -38,6 +38,9 @@ class AttntrackerAnalyzer:
             cache = load_and_merge_qk_cache(self.hook_dir, run_id)
             config = cache["config"]
             qk_cache = cache["qk_cache"]
+        prev_threads = torch.get_num_threads()
+        if prev_threads > 1:
+            torch.set_num_threads(1)
         batch_attention_weights = None
 
         for layer_name, qk_data in qk_cache.items():
@@ -75,7 +78,9 @@ class AttntrackerAnalyzer:
                     'head_indices': important_head_indices,
                     'layer_index': layer_num
                 }
-        
+
+        if prev_threads > 1:
+            torch.set_num_threads(prev_threads)
         return batch_attention_weights
     
     def attn2score(self, batch_attention: List[Dict[str, Dict]], batch_input_range: List[Tuple[Tuple[int, int], Tuple[int, int]]], attn_func: str = "sum_normalize") -> float:

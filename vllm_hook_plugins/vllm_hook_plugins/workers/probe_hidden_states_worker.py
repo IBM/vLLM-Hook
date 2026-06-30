@@ -307,7 +307,7 @@ class ProbeHiddenStatesWorker:
                 found_any = True
                 for mod_name, entry in layer_dict.items():
                     cpu_entry = {
-                        "hidden_states": [t.cpu() for t in entry["hidden_states"]],
+                        "hidden_states": entry["hidden_states"],
                         "layer_num": entry["layer_num"],
                         "hs_mode": entry.get("hs_mode", self.hs_mode),
                     }
@@ -357,10 +357,12 @@ class ProbeHiddenStatesWorker:
             if mode == "all_tokens":
                 stacked = pad_sequence(hs_list, batch_first=True)  # (bs, max_seq, hidden)
                 if not seq_lens:
-                    seq_lens = [t.shape[0] for t in hs_list]
+                    seq_lens = [int(t.shape[0]) for t in hs_list]
             else:
                 stacked = torch.stack(hs_list)  # (bs, hidden_size)
 
+            if stacked.is_cuda:
+                stacked = stacked.cpu()
             batch_size = stacked.shape[0]
             flat_dict[safe_key] = stacked
             layer_order.append({

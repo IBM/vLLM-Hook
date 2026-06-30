@@ -173,11 +173,17 @@ class HookLLM:
                 new_sp_list.append(sp)
             sp_list = new_sp_list
 
+        # Pass through extra kwargs (e.g. use_tqdm) that aren't consumed above.
+        passthrough = {k: v for k, v in kwargs.items()
+                       if k not in ("temperature", "max_tokens", "top_p", "top_k",
+                                    "min_p", "n", "seed", "stop", "stop_token_ids",
+                                    "presence_penalty", "frequency_penalty",
+                                    "repetition_penalty")}
         if all(sp is sp_list[0] for sp in sp_list):
             # collapse to a single sp if they are all the same
-            outputs = self.llm.generate(prompts, sp_list[0])
+            outputs = self.llm.generate(prompts, sp_list[0], **passthrough)
         else:
-            outputs = self.llm.generate(prompts, sp_list)
+            outputs = self.llm.generate(prompts, sp_list, **passthrough)
 
         if hook and self.worker_name and not save_to_disk and len(outputs) > 1 and getattr(outputs[0], "probes", None) is not None:
             # Merge per-request probes onto outputs[0] so callers always use
