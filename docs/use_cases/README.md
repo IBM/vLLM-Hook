@@ -8,7 +8,7 @@ Each row maps a use case to its plugin code and the corresponding contributor.
 | --- | --- | --- | --- | --- |
 | Attention Tracker | `probe_hookqk_worker.py` | `attention_tracker_analyzer.py` | `demo_attntracker.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
 | Core Reranker | `probe_hookqk_worker.py` † | `core_reranker_analyzer.py` | `demo_corer.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
-| Activation Steering | `steer_activation_worker.py` | — | `demo_actsteer.py`, `demo_actsteer_serve.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Activation Steering | `steer_activation_worker.py` | — | `demo_actsteer.py`, `demo_actsteer_serve.py`, `demo_actsteer_language.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo); Language steering: [@lingyue404](https://github.com/lingyue404)) | [@IRENEKO](https://github.com/IRENEKO) |
 | Hidden-State Probe | `probe_hidden_states_worker.py` | `hidden_states_analyzer.py` | `demo_hiddenstate.py` | [@IRENEKO](https://github.com/IRENEKO) |
 | Science Hallucination Detector | `probe_hidden_states_worker.py` † | `science_hallucination_analyzer.py` | `demo_scihal.py` | [@IRENEKO](https://github.com/IRENEKO) |
 | [Spotlight](spotlight.md) | `spotlight_worker.py` | — | `demo_spotlight.py` | [@danishcontractor](https://github.com/danishcontractor) |

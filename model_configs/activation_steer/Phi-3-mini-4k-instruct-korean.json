@@ -1,0 +1,9 @@
+{
+  "steering": {
+    "method": "add_vector",
+    "coefficient": 4,
+    "optimal_layer": 0,
+    "vector_path": "steering_vectors/phi3_korean.pt",
+    "apply_at_all_positions": false
+  }
+}
