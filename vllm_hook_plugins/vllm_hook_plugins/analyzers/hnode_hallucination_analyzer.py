@@ -20,14 +20,14 @@ Usage (in-memory / RPC path)::
     llm = HookLLM(
         model=...,
         worker_name="probe_hidden_states",
-        analyzer_name="hallucination",
-        config_file="model_configs/hallucination_detection/<model>.infer.json",
+        analyzer_name="hnode_hallucination",
+        config_file="model_configs/hnode_hallucination/<model>.infer.json",
         ...,
     )
     output = llm.generate(prompts, SamplingParams(max_tokens=1))
     result = llm.analyze(
         probes=output[0].probes,
-        analyzer_spec={"probe_path": "artifacts/probe.npz", "threshold": 0.5},
+        analyzer_spec={"probe_path": "cache/hnode_probe/probe.npz", "threshold": 0.5},
     )
     # -> {"probabilities": [...], "h_node_excess": [...], "margins": [...],
     #     "best_layer": int, "verdicts": ["grounded"|"hallucinated", ...]}
@@ -43,7 +43,7 @@ from vllm_hook_plugins.run_utils import load_and_merge_hs_cache, unpack_hidden_s
 from vllm_hook_plugins.shm_utils import load_from_shm
 
 
-class HallucinationAnalyzer:
+class HNodeHallucinationAnalyzer:
 
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
         self.hook_dir = hook_dir
@@ -70,7 +70,7 @@ class HallucinationAnalyzer:
         probe_path = spec.get("probe_path")
         if not probe_path:
             raise ValueError(
-                "HallucinationAnalyzer requires analyzer_spec={'probe_path': ...}"
+                "HNodeHallucinationAnalyzer requires analyzer_spec={'probe_path': ...}"
             )
         threshold = float(spec.get("threshold", 0.5))
 
@@ -84,7 +84,7 @@ class HallucinationAnalyzer:
         else:
             if run_id is None:
                 raise ValueError(
-                    "HallucinationAnalyzer.analyze: pass either probes= or run_id=."
+                    "HNodeHallucinationAnalyzer.analyze: pass either probes= or run_id=."
                 )
             cache = load_and_merge_hs_cache(self.hook_dir, run_id)
             hs_cache = cache["hs_cache"]

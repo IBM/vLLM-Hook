@@ -1,20 +1,21 @@
 """H-Node hallucination detection demo (inference-only).
 
-Loads a pre-built probe artifact and scores example prompts via the
-registered ``hallucination`` analyzer.
+Downloads a pre-built probe artifact (~22 KB) on first run and scores example
+prompts via the registered ``hnode_hallucination`` analyzer.
 
 Usage:
     python examples/demo_halludetect.py
 
-Requires:
-    vllm_hook_plugins/vllm_hook_plugins/utils/hnode/artifacts/probe.npz  \\
-    vllm_hook_plugins/vllm_hook_plugins/utils/hnode/artifacts/probe.json  — pre-built probe artifact.
+The probe artifact (probe.npz + probe.json) is hosted in the config-building
+repo and cached under ./cache/hnode_probe/ — only users who run H-Node
+download it:
 
-    To build your own probe, see:
-    https://github.com/Samarpit-bhatia/hnode-probe-builder
+    https://github.com/Samarpit-bhatia/hnode-probe-builder/tree/master/artifacts
+
+To build your own probe instead, see that repo's README.
 
 Method: "H-Node Attack and Defense in Large Language Models"
-        Yocam, Vaidyan, Wang, 2026 — https://arxiv.org/abs/2506.07230
+        Yocam, Vaidyan, Wang, 2026 — https://arxiv.org/abs/2603.26045
 """
 from __future__ import annotations
 
@@ -37,9 +38,38 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 CACHE_DIR = "./cache/"
 HOOK_DIR = "/dev/shm/vllm_hook"
-ART_DIR = "./vllm_hook_plugins/vllm_hook_plugins/utils/hnode/artifacts"
+INFER_CFG = "model_configs/hnode_hallucination/Qwen2.5-1.5B-Instruct.infer.json"
+
+# Pre-built probe for Qwen2.5-1.5B-Instruct (layer 14, AUC 0.902, 50 H-Nodes).
+# Hosted in the config-building repo so it is fetched only when H-Node is used.
+PROBE_BASE_URL = (
+    "https://raw.githubusercontent.com/Samarpit-bhatia/hnode-probe-builder/"
+    "master/artifacts"
+)
+ART_DIR = "./cache/hnode_probe"
 PROBE_PATH = os.path.join(ART_DIR, "probe.npz")
-INFER_CFG = "model_configs/hallucination_detection/Qwen2.5-1.5B-Instruct.infer.json"
+
+
+def ensure_probe():
+    """Download probe.npz + probe.json into ART_DIR if not already cached."""
+    import urllib.error
+    import urllib.request
+
+    os.makedirs(ART_DIR, exist_ok=True)
+    for name in ("probe.npz", "probe.json"):
+        dest = os.path.join(ART_DIR, name)
+        if os.path.exists(dest):
+            continue
+        url = f"{PROBE_BASE_URL}/{name}"
+        print(f"Downloading {name} from {url}")
+        try:
+            urllib.request.urlretrieve(url, dest)
+        except urllib.error.URLError as exc:
+            sys.exit(
+                f"Could not download {name} ({exc}).\n"
+                f"Download it manually from {url}\n"
+                f"and place it in {ART_DIR}/."
+            )
 
 
 def _make_llm(config_file: str, analyzer_name: str = "hidden_states"):
@@ -69,13 +99,7 @@ def _make_llm(config_file: str, analyzer_name: str = "hidden_states"):
 
 
 def stage_detect():
-    if not os.path.exists(PROBE_PATH):
-        sys.exit(
-            f"Probe artifact not found at {PROBE_PATH}.\n"
-            "Download probe.npz + probe.json from:\n"
-            "  https://github.com/Samarpit-bhatia/hnode-probe-builder\n"
-            "and place them in vllm_hook_plugins/vllm_hook_plugins/utils/hnode/artifacts/."
-        )
+    ensure_probe()
 
     examples = [
         "Q: What is the capital of France?\nA: Paris",
@@ -87,7 +111,7 @@ def stage_detect():
     ]
 
     print("Loading model with inference config (best layer only) + hallucination analyzer...")
-    llm = _make_llm(INFER_CFG, analyzer_name="hallucination")
+    llm = _make_llm(INFER_CFG, analyzer_name="hnode_hallucination")
 
     print("Running detection on example prompts...\n")
     run_id = "halludetect_detect"

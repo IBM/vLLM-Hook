@@ -1,11 +1,11 @@
 """Numpy-only scorer for a trained H-Node probe.
 
-Used by ``HallucinationAnalyzer`` at inference and standalone for evaluation.
+Used by ``HNodeHallucinationAnalyzer`` at inference and standalone for evaluation.
 Keeps a hard dependency only on numpy so it loads in the vLLM worker process
 without dragging in sklearn.
 
 Method: "H-Node Attack and Defense in Large Language Models"
-        Yocam, Vaidyan, Wang, 2026 — https://arxiv.org/abs/2506.07230
+        Yocam, Vaidyan, Wang, 2026 — https://arxiv.org/abs/2603.26045
 Config-building (probe training) code:
         https://github.com/Samarpit-bhatia/hnode-probe-builder
 """
