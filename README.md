@@ -13,6 +13,14 @@ This includes dynamic analysis of:
 
 ---
 
+## 📰 News & Events
+
+- **July 24, 2026** — Featured in IBM Think: [*A new way of debugging open-weight models*](https://www.ibm.com/think/news/new-way-debugging-open-weight-models).
+
+- **July 6, 2026** — Presented at ICML 2026: [*vLLM-Hook: Live Programming of Model Internals on vLLM*](https://icml.cc/virtual/2026/75729). (ICML registration and login are required to view the presentation.)
+
+---
+
 ## 🚀 Features
 
 - **Model-agnostic plugin system** for vLLM engines  
