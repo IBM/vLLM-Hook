@@ -56,7 +56,13 @@ def test_accepts_full_spec():
                 "transform": {
                     "kind": "rotation",
                     "angle": 0.35,
-                    "modifiers": [{"kind": "alignment_adaptive", "artifact": PROBE}],
+                    "mode": "target",
+                    "modifiers": [{
+                        "kind": "alignment_adaptive",
+                        "threshold": 0.0,
+                        "use_cosine": False,
+                        "artifact": PROBE,
+                    }],
                     "artifact": PROBE,
                 },
                 "scope": {"kind": "after_prompt"},
@@ -152,7 +158,7 @@ def test_unknown_transform_param():
 
 def test_gate_kind_not_served_without_conditional_handler():
     err = _reject(
-        {"ops": [_op(gate={"kind": "probe_sum", "threshold": 0.5, "condition_layers": [2],
+        {"ops": [_op(gate={"kind": "probe_sum", "condition_layers": [2], "pooling": "mean",
                            "artifact": PROBE})]},
         "E_UNKNOWN_KIND", "ops[0].gate.kind",
         allowed_gates=BASE_GATE_KINDS,
@@ -240,9 +246,22 @@ def test_layer_out_of_range():
 
 def test_condition_layer_out_of_range():
     _reject(
-        {"ops": [_op(gate={"kind": "probe_sum", "threshold": 0.5,
+        {"ops": [_op(gate={"kind": "probe_sum", "pooling": "mean",
                            "condition_layers": [NUM_LAYERS], "artifact": PROBE})]},
         "E_LAYER_RANGE", "ops[0].gate.condition_layers[0]",
+    )
+
+
+def test_string_param_values_validated():
+    _reject(
+        {"ops": [_op(gate={"kind": "probe_sum", "pooling": "max",
+                           "condition_layers": [2], "artifact": PROBE})]},
+        "E_BAD_PARAM", "ops[0].gate.pooling",
+    )
+    _reject(
+        {"ops": [_op(transform={"kind": "rotation", "angle": 0.1, "mode": "spin",
+                                "modifiers": [], "artifact": PROBE})]},
+        "E_BAD_PARAM", "ops[0].transform.mode",
     )
 
 

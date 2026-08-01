@@ -21,6 +21,7 @@ from vllm_hook_plugins.core.kinds import (
     KIND_PARAMS,
     MODIFIER_KINDS,
     SCOPE_KINDS,
+    STRING_PARAM_VALUES,
     TRANSFORM_KINDS,
 )
 
@@ -189,6 +190,21 @@ def _parse_scalar_param(kind: str, name: str, value, expected: type, path: str):
         if isinstance(value, bool) or not isinstance(value, int):
             raise SpecError(E_BAD_PARAM, path, f"{name!r} for kind {kind!r} must be an integer")
         return int(value)
+    if expected is bool:
+        if not isinstance(value, bool):
+            raise SpecError(E_BAD_PARAM, path, f"{name!r} for kind {kind!r} must be a boolean")
+        return value
+    if expected is str:
+        if not isinstance(value, str):
+            raise SpecError(E_BAD_PARAM, path, f"{name!r} for kind {kind!r} must be a string")
+        allowed = STRING_PARAM_VALUES.get((kind, name))
+        if allowed is not None and value not in allowed:
+            raise SpecError(
+                E_BAD_PARAM,
+                path,
+                f"{name!r} for kind {kind!r} must be one of {sorted(allowed)}; got {value!r}",
+            )
+        return value
     if expected is list:
         if not isinstance(value, list):
             raise SpecError(E_BAD_PARAM, path, f"{name!r} for kind {kind!r} must be a list")

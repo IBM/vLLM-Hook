@@ -42,26 +42,32 @@ class GateState:
 
 
 class ProbeSumGate(GateState):
-    """Linear probe summed over every observed (layer, position).
+    """Calibrated linear probe over pooled per-layer readings.
 
-    Each condition-layer row contributes ``row @ weight + bias``; the gate
-    opens while the running sum is >= ``threshold``. Scores are computed in
-    float32 regardless of stream dtype.
+    Each condition layer contributes ``weights[i] @ pool(x_layer)``, where
+    ``weights`` rows align with the ``condition_layers`` order and pooling
+    runs over that layer's observed positions (``"mean"``) or takes the
+    reading at the highest observed position (``"last"``). The decision is
+    ``sum of observed-layer contributions + bias >= 0`` (ties open),
+    undecided before any evidence. Scores are computed in float32
+    regardless of stream dtype.
     """
 
-    def __init__(self, *, threshold: float, condition_layers: list, weight: torch.Tensor, bias: float = 0.0):
-        self.threshold = float(threshold)
-        self.condition_layers = frozenset(condition_layers)
-        self.weight = weight.detach().float()
+    def __init__(self, *, condition_layers: list, pooling: str, weights: torch.Tensor, bias: float = 0.0):
+        self.condition_layers = [int(layer) for layer in condition_layers]
+        self._weight_row = {layer: index for index, layer in enumerate(self.condition_layers)}
+        self.pooling = pooling
+        self.weights = weights.detach().float()
         self.bias = float(bias)
         self._scores: dict = {}  # (layer, position) -> float
 
     def observe(self, layer: int, positions: range, stream_rows: torch.Tensor) -> None:
-        if layer not in self.condition_layers:
+        row = self._weight_row.get(layer)
+        if row is None:
             return
-        weight = self.weight.to(stream_rows.device)
+        weight = self.weights[row].to(stream_rows.device)
         # one device sync per pass, not one per token
-        scores = (stream_rows.detach().float() @ weight + self.bias).tolist()
+        scores = (stream_rows.detach().float() @ weight).tolist()
         for idx, position in enumerate(positions):
             self._scores[(layer, position)] = scores[idx]
 
@@ -71,7 +77,20 @@ class ProbeSumGate(GateState):
     def decision(self) -> bool | None:
         if not self._scores:
             return None
-        return sum(self._scores.values()) >= self.threshold
+        total = 0.0
+        for layer in self.condition_layers:
+            observed = [
+                (position, score)
+                for (score_layer, position), score in self._scores.items()
+                if score_layer == layer
+            ]
+            if not observed:
+                continue
+            if self.pooling == "last":
+                total += max(observed)[1]
+            else:
+                total += sum(score for _, score in observed) / len(observed)
+        return total + self.bias >= 0
 
     def reset(self) -> None:
         self._scores.clear()
@@ -180,9 +199,9 @@ def build_gate(gate_spec, artifacts: dict) -> GateState:
     tensors = artifacts[gate_spec.artifact]
     if gate_spec.kind == "probe_sum":
         return ProbeSumGate(
-            threshold=gate_spec.params["threshold"],
             condition_layers=gate_spec.params["condition_layers"],
-            weight=tensors["weight"],
+            pooling=gate_spec.params["pooling"],
+            weights=tensors["weights"],
             bias=float(tensors["bias"]) if "bias" in tensors else 0.0,
         )
     if gate_spec.kind == "multi_key_threshold":

@@ -11,37 +11,45 @@ from __future__ import annotations
 import torch
 
 # Norm floor guarding divisions; small enough to be inert at model scales.
-_EPS = 1e-6
+_EPS = 1e-8
 
 
 def norm_preserving(inner):
-    """Rescale each transformed row back to its input L2 norm, so the
-    wrapped transform only redirects the row, never changes its length.
+    """Rescale transformed rows whose L2 norm increased back to their input
+    norm; rows whose norm decreased or held are returned as transformed.
     """
 
     def wrapped(stream: torch.Tensor) -> torch.Tensor:
+        original_norm = stream.norm(dim=-1, keepdim=True)
         out = inner(stream)
-        in_norm = stream.norm(dim=-1, keepdim=True)
-        out_norm = out.norm(dim=-1, keepdim=True).clamp_min(_EPS)
-        return out * (in_norm / out_norm)
+        new_norm = out.norm(dim=-1, keepdim=True)
+        needs_rescale = new_norm > original_norm
+        if needs_rescale.any():
+            scale = torch.where(needs_rescale, original_norm / (new_norm + _EPS), torch.ones_like(new_norm))
+            out = out * scale
+        return out
 
     return wrapped
 
 
-def alignment_adaptive(inner, *, vector: torch.Tensor):
-    """Scale the wrapped transform's effect per row by that row's cosine
-    alignment with ``vector``, clamped to [0, 1]:
-    ``out = stream + a * (inner(stream) - stream)`` with
-    ``a = clamp(cos(stream_row, vector), 0, 1)``. Rows pointing away from
-    the direction are left untouched; aligned rows get the full transform.
+def alignment_adaptive(inner, *, vector: torch.Tensor, threshold: float, use_cosine: bool):
+    """Apply the wrapped transform only at rows aligned with ``vector``.
+
+    Each row's alignment is its cosine similarity with ``vector`` when
+    ``use_cosine`` is true, else its projection onto the unit-normalized
+    vector. Rows with alignment strictly above ``threshold`` receive the
+    transformed value; every other row is returned unchanged.
     """
 
     def wrapped(stream: torch.Tensor) -> torch.Tensor:
+        if use_cosine:
+            alignment = torch.nn.functional.cosine_similarity(stream, vector.view(1, -1), dim=-1)
+        else:
+            unit = vector / (vector.norm() + _EPS)
+            alignment = stream @ unit
+        keep = (alignment > threshold).unsqueeze(-1)
         out = inner(stream)
-        unit = vector / vector.norm()
-        alignment = (stream @ unit) / stream.norm(dim=-1).clamp_min(_EPS)
-        alignment = alignment.clamp(0.0, 1.0).unsqueeze(-1)
-        return stream + alignment * (out - stream)
+        return torch.where(keep, out, stream)
 
     return wrapped
 

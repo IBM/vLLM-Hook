@@ -194,9 +194,9 @@ def test_scope_truth_table_chunked_prefill_plus_decode():
     assert positions_for(ScopeSpec("all", {})) == list(range(0, 11))
     assert positions_for(ScopeSpec("after_prompt", {})) == [8, 9, 10]
     assert positions_for(ScopeSpec("from_position", {"position": 6})) == [6, 7, 8, 9, 10]
-    # last_k selects the trailing k rows of every pass
-    assert positions_for(ScopeSpec("last_k", {"k": 2})) == [3, 4, 6, 7, 8, 9, 10]
-    assert positions_for(ScopeSpec("last_k", {"k": 1})) == [4, 7, 8, 9, 10]
+    # last_k selects absolute positions >= prompt_len - k, invariant to chunking
+    assert positions_for(ScopeSpec("last_k", {"k": 2})) == [6, 7, 8, 9, 10]
+    assert positions_for(ScopeSpec("last_k", {"k": 1})) == [7, 8, 9, 10]
 
 
 def test_scope_truth_table_decode_only_pass():

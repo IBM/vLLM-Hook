@@ -28,25 +28,34 @@ def directional_ablation(stream: torch.Tensor, *, vector: torch.Tensor) -> torch
     return stream - coefficients.unsqueeze(-1) * unit
 
 
-def rotation(stream: torch.Tensor, *, basis: torch.Tensor, angle: float) -> torch.Tensor:
-    """Rotate each row by ``angle`` radians within the plane spanned by
+def rotation(stream: torch.Tensor, *, basis: torch.Tensor, angle: float, mode: str) -> torch.Tensor:
+    """Rotate each row's in-plane component within the plane spanned by
     ``basis[0]`` and ``basis[1]``.
 
-    The basis is orthonormalized here (Gram-Schmidt: normalize ``basis[0]``,
-    project it out of ``basis[1]``, normalize the remainder) so callers may
-    pass any two linearly independent plane-spanning vectors. Components
-    orthogonal to the plane are untouched.
+    ``mode="target"`` rotates each row's in-plane component TO the absolute
+    angle ``angle`` measured from ``basis[0]`` (a per-row rotation by
+    ``angle - atan2(c2, c1)``); ``mode="offset"`` rotates every row BY
+    ``angle``. The basis is orthonormalized here (Gram-Schmidt with a 1e-8
+    norm floor: normalize ``basis[0]``, project it out of ``basis[1]``,
+    normalize the remainder) so callers may pass any two linearly independent
+    plane-spanning vectors. Components orthogonal to the plane are untouched.
     """
-    b1 = basis[0] / basis[0].norm()
+    b1 = basis[0] / (basis[0].norm() + 1e-8)
     b2 = basis[1] - (basis[1] @ b1) * b1
-    b2 = b2 / b2.norm()
+    b2 = b2 / (b2.norm() + 1e-8)
     c1 = stream @ b1
     c2 = stream @ b2
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    c1_rot = c1 * cos_a - c2 * sin_a
-    c2_rot = c1 * sin_a + c2 * cos_a
-    return stream + (c1_rot - c1).unsqueeze(-1) * b1 + (c2_rot - c2).unsqueeze(-1) * b2
+    if mode == "target":
+        delta = angle - torch.atan2(c2, c1)
+        cos_d, sin_d = torch.cos(delta), torch.sin(delta)
+    else:
+        cos_d = stream.new_tensor(math.cos(angle))
+        sin_d = stream.new_tensor(math.sin(angle))
+    c1_new = cos_d * c1 - sin_d * c2
+    c2_new = sin_d * c1 + cos_d * c2
+    delta_c1 = (c1_new - c1).unsqueeze(-1)
+    delta_c2 = (c2_new - c2).unsqueeze(-1)
+    return stream + delta_c1 * b1 + delta_c2 * b2
 
 
 def head_additive(heads: torch.Tensor, *, vector: torch.Tensor, strength: float) -> torch.Tensor:

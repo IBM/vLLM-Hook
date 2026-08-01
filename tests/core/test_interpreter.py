@@ -51,26 +51,43 @@ def test_directional_ablation_removes_component_and_is_idempotent():
     assert torch.allclose(out, again, atol=1e-6)
 
 
-def test_rotation_quarter_turn_maps_b1_to_b2():
+def test_rotation_offset_quarter_turn_maps_b1_to_b2():
     hidden = 16
     b1 = torch.zeros(hidden)
     b1[0] = 1.0
     b2 = torch.zeros(hidden)
     b2[1] = 1.0
     basis = torch.stack([b1, b2])
-    out = rotation(b1.unsqueeze(0), basis=basis, angle=math.pi / 2)
+    out = rotation(b1.unsqueeze(0), basis=basis, angle=math.pi / 2, mode="offset")
     assert torch.allclose(out[0], b2, atol=1e-6)
 
 
-def test_rotation_preserves_norm_and_orthogonal_complement():
+def test_rotation_target_sets_absolute_in_plane_angle():
+    hidden = 16
+    b1 = torch.zeros(hidden)
+    b1[0] = 1.0
+    b2 = torch.zeros(hidden)
+    b2[1] = 1.0
+    basis = torch.stack([b1, b2])
+    # rows at different starting angles all land at the target angle
+    stream = torch.stack([2.0 * b1, 3.0 * b2, -1.5 * b1])
+    out = rotation(stream, basis=basis, angle=math.pi / 4, mode="target")
+    angles = torch.atan2(out @ b2, out @ b1)
+    assert torch.allclose(angles, torch.full((3,), math.pi / 4), atol=1e-5)
+    # in-plane magnitude preserved per row
+    assert torch.allclose(out.norm(dim=-1), stream.norm(dim=-1), atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", ["target", "offset"])
+def test_rotation_preserves_norm_and_orthogonal_complement(mode):
     stream = torch.randn(5, 32)
     basis = torch.randn(2, 32)
-    out = rotation(stream, basis=basis, angle=0.7)
+    out = rotation(stream, basis=basis, angle=0.7, mode=mode)
     assert torch.allclose(out.norm(dim=-1), stream.norm(dim=-1), atol=1e-5)
     # components orthogonal to the (orthonormalized) plane are untouched
-    b1 = basis[0] / basis[0].norm()
+    b1 = basis[0] / (basis[0].norm() + 1e-8)
     b2 = basis[1] - (basis[1] @ b1) * b1
-    b2 = b2 / b2.norm()
+    b2 = b2 / (b2.norm() + 1e-8)
     residual_in = stream - (stream @ b1).unsqueeze(-1) * b1 - (stream @ b2).unsqueeze(-1) * b2
     residual_out = out - (out @ b1).unsqueeze(-1) * b1 - (out @ b2).unsqueeze(-1) * b2
     assert torch.allclose(residual_in, residual_out, atol=1e-5)
@@ -106,20 +123,42 @@ def test_norm_preserving_restores_row_norms():
     assert torch.all(cos > 0.999)
 
 
-def test_alignment_adaptive_interpolates_by_cosine():
+def test_alignment_adaptive_masks_rows_by_projection_threshold():
     vector = torch.zeros(8)
     vector[0] = 1.0
     aligned = torch.zeros(1, 8)
-    aligned[0, 0] = 2.0  # cos = 1 -> full effect
+    aligned[0, 0] = 2.0  # projection = 2 > 0 -> transformed
     opposed = torch.zeros(1, 8)
-    opposed[0, 0] = -2.0  # cos = -1 -> clamped to 0, untouched
+    opposed[0, 0] = -2.0  # projection = -2 <= 0 -> untouched
 
     def inner(rows):
         return rows + 1.0
 
-    wrapped = alignment_adaptive(inner, vector=vector)
+    wrapped = alignment_adaptive(inner, vector=vector, threshold=0.0, use_cosine=False)
     assert torch.allclose(wrapped(aligned), aligned + 1.0)
     assert torch.allclose(wrapped(opposed), opposed)
+
+    # threshold is strict: alignment exactly at the threshold stays untouched
+    at_threshold = torch.zeros(1, 8)
+    at_threshold[0, 0] = 1.0
+    strict = alignment_adaptive(inner, vector=vector, threshold=1.0 - 1e-7, use_cosine=False)
+    assert torch.allclose(strict(at_threshold), at_threshold + 1.0)
+    strict = alignment_adaptive(inner, vector=vector, threshold=1.0, use_cosine=False)
+    assert torch.allclose(strict(at_threshold), at_threshold)
+
+
+def test_alignment_adaptive_cosine_mode_normalizes_rows():
+    vector = torch.zeros(8)
+    vector[0] = 1.0
+    weakly_aligned = torch.ones(1, 8)  # cos = 1/sqrt(8) ~ 0.35
+
+    def inner(rows):
+        return rows + 1.0
+
+    below = alignment_adaptive(inner, vector=vector, threshold=0.5, use_cosine=True)
+    assert torch.allclose(below(weakly_aligned), weakly_aligned)
+    above = alignment_adaptive(inner, vector=vector, threshold=0.3, use_cosine=True)
+    assert torch.allclose(above(weakly_aligned), weakly_aligned + 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +191,7 @@ def test_apply_op_composes_modifiers_innermost_first():
     vector = torch.randn(16)
     artifacts = {VEC: {"vector": vector}}
     op = _op(modifiers=[
-        ModifierSpec(kind="alignment_adaptive", params={}, artifact=VEC),
+        ModifierSpec(kind="alignment_adaptive", params={"threshold": 0.0, "use_cosine": False}, artifact=VEC),
         ModifierSpec(kind="norm_preserving", params={}, artifact=None),
     ])
     out = apply_op(op, stream, artifacts)
@@ -160,7 +199,9 @@ def test_apply_op_composes_modifiers_innermost_first():
     def inner(rows):
         return additive(rows, vector=vector, strength=2.0)
 
-    reference = norm_preserving(alignment_adaptive(inner, vector=vector))(stream)
+    reference = norm_preserving(
+        alignment_adaptive(inner, vector=vector, threshold=0.0, use_cosine=False)
+    )(stream)
     assert torch.allclose(out, reference)
 
 
@@ -176,30 +217,48 @@ def test_apply_op_casts_artifacts_to_stream_dtype():
 # ---------------------------------------------------------------------------
 
 
-def test_probe_sum_accumulates_and_overwrites_on_replay():
-    weight = torch.tensor([1.0, 0.0])
-    gate = ProbeSumGate(threshold=3.0, condition_layers=[2], weight=weight)
+def test_probe_sum_pools_per_layer_and_overwrites_on_replay():
+    weights = torch.tensor([[1.0, 0.0]])
+    gate = ProbeSumGate(condition_layers=[2], pooling="mean", weights=weights, bias=-3.0)
     assert gate.decision() is None
 
-    rows = torch.tensor([[2.0, 5.0]])
-    gate.observe(2, range(0, 1), rows)
-    assert gate.decision() is False  # sum = 2.0 < 3.0
+    gate.observe(2, range(0, 1), torch.tensor([[2.0, 5.0]]))
+    assert gate.decision() is False  # mean = 2.0; 2.0 - 3.0 < 0
 
-    gate.observe(2, range(1, 2), rows)
-    assert gate.decision() is True  # sum = 4.0
+    gate.observe(2, range(1, 2), torch.tensor([[6.0, 5.0]]))
+    assert gate.decision() is True  # mean = 4.0; 4.0 - 3.0 >= 0
 
     # replaying position 1 overwrites, not accumulates
-    gate.observe(2, range(1, 2), rows)
+    gate.observe(2, range(1, 2), torch.tensor([[6.0, 5.0]]))
     assert gate.decision() is True
     gate.observe(2, range(1, 2), torch.tensor([[0.5, 0.0]]))
-    assert gate.decision() is False  # sum = 2.5
+    assert gate.decision() is False  # mean = 1.25
 
     # readings from non-condition layers are ignored
-    gate.observe(7, range(2, 3), rows)
+    gate.observe(7, range(2, 3), torch.tensor([[100.0, 0.0]]))
     assert gate.decision() is False
 
     gate.reset()
     assert gate.decision() is None
+
+
+def test_probe_sum_sums_pooled_contributions_across_layers():
+    weights = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    gate = ProbeSumGate(condition_layers=[1, 3], pooling="mean", weights=weights, bias=-5.0)
+
+    gate.observe(1, range(0, 2), torch.tensor([[2.0, 0.0], [4.0, 0.0]]))  # mean = 3.0
+    assert gate.decision() is False  # unobserved layer contributes nothing yet
+    gate.observe(3, range(0, 2), torch.tensor([[0.0, 2.0], [0.0, 4.0]]))  # mean = 3.0
+    assert gate.decision() is True  # 3.0 + 3.0 - 5.0 >= 0
+
+
+def test_probe_sum_last_pooling_takes_highest_observed_position():
+    weights = torch.tensor([[1.0]])
+    gate = ProbeSumGate(condition_layers=[0], pooling="last", weights=weights, bias=0.0)
+    gate.observe(0, range(0, 3), torch.tensor([[5.0], [5.0], [-1.0]]))
+    assert gate.decision() is False  # position 2 scores -1.0
+    gate.observe(0, range(2, 3), torch.tensor([[2.0]]))
+    assert gate.decision() is True  # replay overwrote position 2
 
 
 def test_multi_key_threshold_counts_fired_keys():
@@ -219,8 +278,8 @@ def test_multi_key_threshold_counts_fired_keys():
 
 
 def test_cache_once_freezes_decision_at_final_prompt_position():
-    weight = torch.tensor([1.0])
-    inner = ProbeSumGate(threshold=1.0, condition_layers=[0], weight=weight)
+    weights = torch.tensor([[1.0]])
+    inner = ProbeSumGate(condition_layers=[0], pooling="mean", weights=weights, bias=-0.4)
     gate = CacheOnceGate(inner)
 
     # mid-prompt pass: evidence lands but no decision yet
@@ -231,7 +290,7 @@ def test_cache_once_freezes_decision_at_final_prompt_position():
     # pass covering the final prompt position triggers the single decision
     gate.observe(0, range(4, 8), torch.full((4, 1), 0.5))
     gate.note_pass(range(4, 8), prompt_len=8)
-    assert gate.decision() is True  # sum = 4.0 >= 1.0
+    assert gate.decision() is True  # mean = 0.5; 0.5 - 0.4 >= 0
 
     # later evidence cannot flip the held decision
     gate.observe(0, range(8, 9), torch.tensor([[-100.0]]))
@@ -248,7 +307,7 @@ def test_cache_once_defers_freeze_until_trigger_pass_evidence_arrives():
     fires in the trigger pass; the freeze then defers to the first
     post-prompt pass so the decision reflects the full prompt.
     """
-    inner = ProbeSumGate(threshold=1.0, condition_layers=[5], weight=torch.tensor([1.0]))
+    inner = ProbeSumGate(condition_layers=[5], pooling="mean", weights=torch.tensor([[1.0]]), bias=-0.4)
     gate = CacheOnceGate(inner)
 
     # op-layer check in the covering pass: layer 5 has not been read yet
@@ -269,7 +328,7 @@ def test_cache_once_defers_freeze_until_trigger_pass_evidence_arrives():
 
 
 def test_cache_once_freezes_closed_when_no_evidence_ever_arrives():
-    inner = ProbeSumGate(threshold=1.0, condition_layers=[5], weight=torch.tensor([1.0]))
+    inner = ProbeSumGate(condition_layers=[5], pooling="mean", weights=torch.tensor([[1.0]]), bias=-0.4)
     gate = CacheOnceGate(inner)
     gate.note_pass(range(0, 8), prompt_len=8)
     assert gate.decision() is None  # undecided, closed at op time
@@ -281,18 +340,19 @@ def test_cache_once_freezes_closed_when_no_evidence_ever_arrives():
 
 def test_build_gate_resolves_artifacts_and_nesting():
     probe = "sha256:" + "cd" * 32
-    artifacts = {probe: {"weight": torch.tensor([1.0]), "bias": torch.tensor(0.5)}}
+    artifacts = {probe: {"weights": torch.tensor([[1.0]]), "bias": torch.tensor(0.5)}}
     spec = GateSpec(
         kind="cache_once",
         params={},
         artifact=None,
-        inner=GateSpec(kind="probe_sum", params={"threshold": 1.0, "condition_layers": [3]},
+        inner=GateSpec(kind="probe_sum", params={"condition_layers": [3], "pooling": "mean"},
                        artifact=probe, inner=None),
     )
     gate = build_gate(spec, artifacts)
     assert isinstance(gate, CacheOnceGate)
     assert isinstance(gate.inner, ProbeSumGate)
     assert gate.inner.bias == 0.5
+    assert gate.inner.pooling == "mean"
 
 
 # ---------------------------------------------------------------------------

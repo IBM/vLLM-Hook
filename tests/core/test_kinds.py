@@ -42,12 +42,18 @@ def test_kind_params_covers_every_parameterized_kind():
     # appear with an empty table but must not be missing when they need one.
     assert kinds.KIND_PARAMS["additive"] == {"strength": float}
     assert kinds.KIND_PARAMS["directional_ablation"] == {}
-    assert kinds.KIND_PARAMS["rotation"] == {"angle": float}
+    assert kinds.KIND_PARAMS["rotation"] == {"angle": float, "mode": str}
     assert kinds.KIND_PARAMS["head_additive"] == {"strength": float}
+    assert kinds.KIND_PARAMS["norm_preserving"] == {}
+    assert kinds.KIND_PARAMS["alignment_adaptive"] == {"threshold": float, "use_cosine": bool}
     assert kinds.KIND_PARAMS["last_k"] == {"k": int}
     assert kinds.KIND_PARAMS["from_position"] == {"position": int}
-    assert kinds.KIND_PARAMS["probe_sum"] == {"threshold": float, "condition_layers": list}
+    assert kinds.KIND_PARAMS["probe_sum"] == {"condition_layers": list, "pooling": str}
     assert kinds.KIND_PARAMS["multi_key_threshold"] == {"threshold": float, "condition_layers": list}
+    assert kinds.STRING_PARAM_VALUES == {
+        ("rotation", "mode"): ("target", "offset"),
+        ("probe_sum", "pooling"): ("mean", "last"),
+    }
 
 
 def test_artifact_tensors_and_constraints_name_registered_kinds():

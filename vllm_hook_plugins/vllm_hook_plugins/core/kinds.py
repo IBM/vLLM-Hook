@@ -22,14 +22,20 @@ CONSTRAINTS = {"head_additive": "tensor_parallel_size==1"}
 KIND_PARAMS = {
     "additive": {"strength": float},
     "directional_ablation": {},
-    "rotation": {"angle": float},
+    "rotation": {"angle": float, "mode": str},
     "head_additive": {"strength": float},
     "norm_preserving": {},
-    "alignment_adaptive": {},  # artifact-carried; scalars added additively
+    "alignment_adaptive": {"threshold": float, "use_cosine": bool},
     "last_k": {"k": int},
     "from_position": {"position": int},
     "multi_key_threshold": {"threshold": float, "condition_layers": list},
-    "probe_sum": {"threshold": float, "condition_layers": list},
+    "probe_sum": {"condition_layers": list, "pooling": str},
+}
+
+# (kind, param) -> allowed values for string-typed params.
+STRING_PARAM_VALUES = {
+    ("rotation", "mode"): ("target", "offset"),
+    ("probe_sum", "pooling"): ("mean", "last"),
 }
 
 # kind -> tensor names its artifact must carry; a kind listed here requires
@@ -41,6 +47,6 @@ ARTIFACT_TENSORS = {
     "rotation": ("basis",),
     "head_additive": ("vector",),
     "alignment_adaptive": ("vector",),
-    "probe_sum": ("weight",),
+    "probe_sum": ("weights",),
     "multi_key_threshold": ("weights",),
 }

@@ -407,28 +407,37 @@ class UnifiedHookWorker:
         """
         artifacts = {}
         for op_index, op in enumerate(spec.ops):
-            entries = [(op.transform_kind, op.artifact, f"ops[{op_index}].transform.artifact")]
+            entries = [
+                (op.transform_kind, op.transform_params, op.artifact, f"ops[{op_index}].transform.artifact")
+            ]
             for m_index, modifier in enumerate(op.modifiers):
                 entries.append(
-                    (modifier.kind, modifier.artifact, f"ops[{op_index}].transform.modifiers[{m_index}].artifact")
+                    (
+                        modifier.kind,
+                        modifier.params,
+                        modifier.artifact,
+                        f"ops[{op_index}].transform.modifiers[{m_index}].artifact",
+                    )
                 )
             gate = op.gate
             gate_path = f"ops[{op_index}].gate"
             while gate is not None:
-                entries.append((gate.kind, gate.artifact, f"{gate_path}.artifact"))
+                entries.append((gate.kind, gate.params, gate.artifact, f"{gate_path}.artifact"))
                 gate = gate.inner
                 gate_path += ".inner"
-            for kind, artifact_id, path in entries:
+            for kind, params, artifact_id, path in entries:
                 if artifact_id is None:
                     continue
                 tensors = artifacts.get(artifact_id)
                 if tensors is None:
                     tensors = self._load_artifact(artifact_id, path)
-                self._check_artifact_tensors(kind, artifact_id, tensors, path)
+                self._check_artifact_tensors(kind, artifact_id, tensors, path, params)
                 artifacts[artifact_id] = tensors
         return artifacts
 
-    def _check_artifact_tensors(self, kind: str, artifact_id: str, tensors: dict, path: str) -> None:
+    def _check_artifact_tensors(
+        self, kind: str, artifact_id: str, tensors: dict, path: str, params: dict | None = None
+    ) -> None:
         """Reject artifacts whose tensors would blow up inside a hook.
 
         Hooks run inside the forward pass; a shape mismatch there aborts
@@ -473,9 +482,18 @@ class UnifiedHookWorker:
                     f"({self._num_heads}, {self._head_dim}) or ({self._head_dim},)"
                 )
         elif kind == "probe_sum":
-            weight = tensors["weight"]
-            if tuple(weight.shape) != (hidden,):
-                _fail(f"tensor 'weight' has shape {tuple(weight.shape)}; probe_sum needs ({hidden},)")
+            weights = tensors["weights"]
+            num_condition_layers = len(params["condition_layers"]) if params else None
+            if (
+                weights.dim() != 2
+                or weights.shape[1] != hidden
+                or (num_condition_layers is not None and weights.shape[0] != num_condition_layers)
+            ):
+                _fail(
+                    f"tensor 'weights' has shape {tuple(weights.shape)}; probe_sum needs "
+                    f"({num_condition_layers if num_condition_layers is not None else 'num_condition_layers'}, "
+                    f"{hidden}) row-aligned with condition_layers"
+                )
             if "bias" in tensors and tensors["bias"].numel() != 1:
                 _fail("tensor 'bias' must be a scalar")
         elif kind == "multi_key_threshold":

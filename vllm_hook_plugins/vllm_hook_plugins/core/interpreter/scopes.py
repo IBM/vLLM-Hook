@@ -12,14 +12,15 @@ def scope_rows(view, scope) -> slice | None:
     scope selects nothing this pass.
 
     The returned slice is relative to the request's own rows (0 = the
-    first row of ``view.row_slice``). Selection semantics per kind:
+    first row of ``view.row_slice``). Selection semantics per kind, all in
+    absolute positions and therefore invariant to prefill chunking:
 
     - ``all``: every row of the pass.
     - ``after_prompt``: rows at absolute positions >= ``prompt_len``.
     - ``from_position``: rows at absolute positions >= ``position``.
-    - ``last_k``: the trailing ``k`` rows of the pass (during decode every
-      pass has one row, so any k >= 1 selects it; during prefill this is
-      the last ``k`` prompt rows of the chunk).
+    - ``last_k``: rows at absolute positions >= ``prompt_len - k`` (the
+      last ``k`` prompt rows, plus every decode row since decode positions
+      all exceed ``prompt_len - k``).
     """
     positions = view.positions
     num_rows = len(positions)
@@ -33,7 +34,7 @@ def scope_rows(view, scope) -> slice | None:
     elif scope.kind == "from_position":
         first = max(0, scope.params["position"] - positions.start)
     elif scope.kind == "last_k":
-        first = max(0, num_rows - scope.params["k"])
+        first = max(0, (view.prompt_len - scope.params["k"]) - positions.start)
     else:
         raise KeyError(f"no row selection for scope kind {scope.kind!r}")
 
