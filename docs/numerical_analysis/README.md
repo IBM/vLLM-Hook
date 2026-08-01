@@ -96,3 +96,9 @@ python docs/numerical_analysis/verify_artifact_parity.py
 ```
 This runs both systems on the same 8 prompts, extracts all 20 layers, and compares tensors token-by-token. vLLM-Hook (`all_tokens`) mode was verified to produce numerically equivalent hidden states to Native vLLM Eagle (cosine similarity ∈ [0.999998, 1.000072] across all 160 layer×prompt tensors, max absolute diff = 0.0 — i.e., bitwise identical at float16).
 
+To verify the unified worker's `layer_input` boundary against the `layer_output` boundary (layer N's output must equal layer N+1's input):
+
+```bash
+VLLM_HOOK_WORKER=unified python docs/numerical_analysis/verify_layer_input_parity.py
+```
+

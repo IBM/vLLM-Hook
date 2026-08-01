@@ -8,16 +8,22 @@ from typing import Literal
 
 import pytest
 
-pytest.importorskip("vllm")
-
-mp.set_start_method("spawn", force=True)
+# vLLM is only needed by tests/use_cases, tests/engine, and tests/serve;
+# their own conftests skip collection when it is absent. tests/core and
+# tests/workers run on the bare package (the CI isolation job relies on
+# this).
+if mp.get_start_method(allow_none=True) is None:
+    mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = PROJECT_ROOT / "examples"
+# The installable package lives in PROJECT_ROOT/vllm_hook_plugins; putting
+# that directory first resolves `vllm_hook_plugins` to the real package.
+PACKAGE_DIR = PROJECT_ROOT / "vllm_hook_plugins"
 
-for p in (PROJECT_ROOT, EXAMPLES_DIR):
+for p in (PROJECT_ROOT, EXAMPLES_DIR, PACKAGE_DIR):
     sys.path.insert(0, str(p))
 
 

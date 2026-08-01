@@ -66,6 +66,29 @@ def match_attn(name: str):
     return None
 
 
+O_PROJ_PATTERNS = [
+    # Qwen/LLaMA: model.layers.<i>.self_attn.o_proj
+    re.compile(r"^model\.layers\.(\d+)\.self_attn\.o_proj$"),
+
+    # Qwen3.5 multimodal: language_model.model.layers.<i>.self_attn.o_proj
+    re.compile(r"^language_model\.model\.layers\.(\d+)\.self_attn\.o_proj$"),
+
+    # GPT-2: transformer.h.<i>.attn.c_proj
+    re.compile(r"^transformer\.h\.(\d+)\.attn\.c_proj$"),
+
+    # OPT: model.decoder.layers.<i>.self_attn.out_proj
+    re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn\.out_proj$"),
+]
+
+
+def match_o_proj(name: str):
+    for pat in O_PROJ_PATTERNS:
+        m = pat.match(name)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-request bookkeeping
 # ---------------------------------------------------------------------------
