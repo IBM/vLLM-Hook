@@ -22,10 +22,14 @@ def additive(stream: torch.Tensor, *, vector: torch.Tensor, strength: float) -> 
 def directional_ablation(stream: torch.Tensor, *, vector: torch.Tensor) -> torch.Tensor:
     """Remove each row's component along ``vector``:
     ``out = stream - (stream @ v̂) v̂`` with ``v̂ = vector / ||vector||``.
+
+    Computed via einsum contractions over a ``[1, H]`` basis so the kernel dispatch matches
+    the reference in-process implementation bit-for-bit.
     """
-    unit = vector / vector.norm()
-    coefficients = stream @ unit
-    return stream - coefficients.unsqueeze(-1) * unit
+    basis = (vector / vector.norm()).unsqueeze(0)
+    coefficients = torch.einsum("rh,kh->rk", stream, basis)
+    component = torch.einsum("rk,kh->rh", coefficients, basis)
+    return stream - component
 
 
 def rotation(stream: torch.Tensor, *, basis: torch.Tensor, angle: float, mode: str) -> torch.Tensor:
