@@ -1,10 +1,18 @@
-"""Register GET /v1/hook/capabilities on the OpenAI-compatible app.
+"""Register the hook routes on the OpenAI-compatible app.
 
-Patches the api-server app builder using the same multi-path/version
-fallback pattern as the response-builder patches in ``_hook_plugin``.
-The route lives on the serving app, so it inherits its auth middleware.
-Payload comes from collective_rpc("hook_capabilities") at first request
-and is memoized for the process lifetime.
+Two routes are added by patching the api-server app builder using the same
+multi-path/version fallback pattern as the response-builder patches in
+``_hook_plugin``; both live on the serving app, so they inherit its auth
+middleware.
+
+- ``GET /v1/hook/capabilities``: payload from
+  collective_rpc("hook_capabilities") at first request, memoized for the
+  process lifetime.
+- ``PUT /v1/hook/artifacts/{artifact_id}``: a direct HTTP face on the
+  artifact registry. The body is safetensors bytes; the id is verified
+  server-side against the written content address, so a client cannot
+  register bytes under the wrong id. Already-exists is success (writes
+  are content-addressed and idempotent).
 """
 from __future__ import annotations
 
@@ -46,6 +54,7 @@ def register_discovery() -> None:
         def _patched_build_app(args, *extra_args, _original=build_app, **kwargs):
             app = _original(args, *extra_args, **kwargs)
             _add_capabilities_route(app)
+            _add_artifacts_route(app)
             return app
 
         _patched_build_app._vllm_hook_discovery = True
@@ -76,3 +85,41 @@ def _add_capabilities_route(app) -> None:
         return JSONResponse(_capabilities_cache)
 
     logger.info("registered GET /v1/hook/capabilities")
+
+
+def _add_artifacts_route(app) -> None:
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    @app.put("/v1/hook/artifacts/{artifact_id}")
+    async def put_hook_artifact(artifact_id: str, raw_request: Request):
+        import safetensors.torch
+
+        from ..core.artifacts import ArtifactRegistry
+        from ..core.schema import SpecError
+
+        data = await raw_request.body()
+        try:
+            tensors = safetensors.torch.load(data)
+        except Exception as error:
+            return JSONResponse(
+                {"error": f"body is not a safetensors payload: {error}"}, status_code=400,
+            )
+        registry = ArtifactRegistry()
+        try:
+            written_id = registry.write(tensors)
+        except SpecError as error:
+            return JSONResponse(error.payload(), status_code=400)
+        if written_id != artifact_id:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"content address mismatch: body hashes to {written_id}, "
+                        f"not {artifact_id}"
+                    )
+                },
+                status_code=400,
+            )
+        return JSONResponse({"id": written_id})
+
+    logger.info("registered PUT /v1/hook/artifacts/{artifact_id}")

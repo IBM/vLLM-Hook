@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(git push *)",
+      "Bash(python -c \"import vllm; print\\('vllm version:', vllm.__version__\\); print\\('vllm path:', vllm.__file__\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python3 -c \"import vllm; print\\('vllm version:', vllm.__version__\\); print\\('vllm path:', vllm.__file__\\)\")",
+      "mcp__web-search__google_pse_search",
+      "WebFetch(domain:github.com)",
+      "Bash(git -C /Users/erikmiehling/code/vLLM-Hook log --oneline -15)",
+      "Bash(git -C /Users/erikmiehling/code/vLLM-Hook status)",
+      "Bash(python3 -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python3 -c \"import torch, numpy, safetensors, pytest; print\\('torch', torch.__version__, '| numpy', numpy.__version__, '| pytest', pytest.__version__\\)\")",
+      "Bash(uv venv *)",
+      "Bash(.venv/bin/python -m ensurepip)",
+      "Bash(uv pip *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(/tmp/vllm_hook_iso/bin/python -c ' *)",
+      "Read(//private/tmp/**)",
+      "Bash(/tmp/vllm_hook_iso/bin/python -m pytest /Users/erikmiehling/code/vLLM-Hook/tests/core /Users/erikmiehling/code/vLLM-Hook/tests/workers -q)"
+    ]
+  }
+}
