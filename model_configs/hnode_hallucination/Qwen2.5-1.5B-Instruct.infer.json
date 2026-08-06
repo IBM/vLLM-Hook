@@ -1,0 +1,12 @@
+{
+  "model_info": {
+    "name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "note": "Inference config: captures only the probe's best layer (14). Must match probe.json:best_layer."
+  },
+  "hidden_states": {
+    "layers": [
+      14
+    ],
+    "mode": "last_token"
+  }
+}
