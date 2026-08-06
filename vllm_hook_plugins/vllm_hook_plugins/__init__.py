@@ -6,10 +6,12 @@ from vllm_hook_plugins.workers.steer_activation_worker import SteerHookActWorker
 from vllm_hook_plugins.workers.probe_hidden_states_worker import ProbeHiddenStatesWorker
 from vllm_hook_plugins.workers.spotlight_worker import SpotlightWorker
 from vllm_hook_plugins.workers.highlighter_worker import HighlighterWorker
+from vllm_hook_plugins.workers.recurrent_depth_worker import RecurrentDepthWorker
 from vllm_hook_plugins.analyzers.attention_tracker_analyzer import AttntrackerAnalyzer
 from vllm_hook_plugins.analyzers.core_reranker_analyzer import CorerAnalyzer
 from vllm_hook_plugins.analyzers.hidden_states_analyzer import HiddenStatesAnalyzer
 from vllm_hook_plugins.analyzers.science_hallucination_analyzer import ScienceHallucinationAnalyzer
+from vllm_hook_plugins.analyzers.recurrent_conv_analyzer import RecurrentConvergenceAnalyzer
 from vllm_hook_plugins.utils.spotlight.utils import generate_with_spotlight
 from vllm_hook_plugins.utils.TokenHighlighter.utils import (
     analyze_with_highlighter,
@@ -17,6 +19,11 @@ from vllm_hook_plugins.utils.TokenHighlighter.utils import (
     load_highlighter_config,
 )
 from vllm_hook_plugins.analyzers.highlighter_analyzer import HighlighterAnalyzer
+from vllm_hook_plugins.protocols.recurrent_depth import (
+    RecurrentDepthProtocol,
+    attach_recurrent_depth,
+)
+from vllm_hook_plugins.protocols.recurrent_config import RecurrentDepthConfig
 from vllm_hook_plugins.analyzers.hnode_hallucination_analyzer import HNodeHallucinationAnalyzer
 
 
@@ -34,6 +41,8 @@ def register_plugins():
     PluginRegistry.register_analyzer("core_reranker",         CorerAnalyzer)
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
     PluginRegistry.register_analyzer("science_hallucination", ScienceHallucinationAnalyzer)
+    PluginRegistry.register_analyzer("token_highlighter", HighlighterAnalyzer)
+    PluginRegistry.register_analyzer("recurrent_depth",       RecurrentConvergenceAnalyzer)
     PluginRegistry.register_analyzer("token_highlighter",     HighlighterAnalyzer)
     PluginRegistry.register_analyzer("hnode_hallucination",   HNodeHallucinationAnalyzer)
 
@@ -46,15 +55,21 @@ __all__ = [
     "ProbeHiddenStatesWorker",
     "SpotlightWorker",
     "HighlighterWorker",
+    "RecurrentDepthWorker",
     "AttntrackerAnalyzer",
     "CorerAnalyzer",
     "HiddenStatesAnalyzer",
     "ScienceHallucinationAnalyzer",
+    "RecurrentConvergenceAnalyzer",
+    "RecurrentDepthProtocol",
+    "RecurrentDepthConfig",
+    "attach_recurrent_depth",
     "generate_with_spotlight",
     "generate_with_highlighter",
     "analyze_with_highlighter",
     "load_highlighter_config",
     "HighlighterAnalyzer",
+    "register_plugins",
     "HNodeHallucinationAnalyzer",
     "register_plugins"
 ]
