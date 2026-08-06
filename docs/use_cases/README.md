@@ -13,4 +13,6 @@ Each row maps a use case to its plugin code and the corresponding contributor.
 | Science Hallucination Detector | `probe_hidden_states_worker.py` † | `science_hallucination_analyzer.py` | `demo_scihal.py` | [@IRENEKO](https://github.com/IRENEKO) |
 | [Spotlight](spotlight.md) | `spotlight_worker.py` | — | `demo_spotlight.py` | [@danishcontractor](https://github.com/danishcontractor) |
 | [Token Highlighter](TokenHighlighter.md) | `highlighter_worker.py` | `highlighter_analyzer.py` | `demo_token_highlighter.py`, [`live_TH.ipynb`](../../notebooks/demo_token_highlighter/live_highlighter/live_TH.ipynb) | [@asanth7](https://github.com/asanth7) |
+| [Recurrent Depth](RecurrentDepth.md) | `recurrent_depth_worker.py` ‡ | `recurrent_conv_analyzer.py` | `demo_recurrent_depth.py` | [@asanth7](https://github.com/asanth7) |
 > † Reuses an existing worker.
+> ‡ In-process inside the recurrence loop (not a HookLLM `worker_extension_cls`); see writeup.
