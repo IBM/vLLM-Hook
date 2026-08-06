@@ -24,6 +24,7 @@ from vllm_hook_plugins.protocols.recurrent_depth import (
     attach_recurrent_depth,
 )
 from vllm_hook_plugins.protocols.recurrent_config import RecurrentDepthConfig
+from vllm_hook_plugins.analyzers.hnode_hallucination_analyzer import HNodeHallucinationAnalyzer
 
 
 def register_plugins():
@@ -41,9 +42,9 @@ def register_plugins():
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
     PluginRegistry.register_analyzer("science_hallucination", ScienceHallucinationAnalyzer)
     PluginRegistry.register_analyzer("token_highlighter", HighlighterAnalyzer)
-    # Recurrent depth runs in-process on AdaptiveRavenForCausalLM (not a
-    # WorkerExtension mixin). Analyzer registered for discovery / HookLLM naming.
     PluginRegistry.register_analyzer("recurrent_depth",       RecurrentConvergenceAnalyzer)
+    PluginRegistry.register_analyzer("token_highlighter",     HighlighterAnalyzer)
+    PluginRegistry.register_analyzer("hnode_hallucination",   HNodeHallucinationAnalyzer)
 
 __all__ = [
     "PluginRegistry",
@@ -69,4 +70,6 @@ __all__ = [
     "load_highlighter_config",
     "HighlighterAnalyzer",
     "register_plugins",
+    "HNodeHallucinationAnalyzer",
+    "register_plugins"
 ]
