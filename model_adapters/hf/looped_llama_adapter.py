@@ -1,4 +1,7 @@
-"""Adaptive Raven adapter: per-token exit inside ``iterate_forward`` only.
+"""
+looped_llama_adapter.py:
+
+Adaptive Raven adapter: per-token exit inside ``iterate_forward`` only.
 
 Model-specific details live here:
   - Raven ``core_block_forward`` / RoPE slicing

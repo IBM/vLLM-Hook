@@ -15,7 +15,12 @@ import torch
 
 from vllm_hook_plugins.analyzers.recurrent_conv_analyzer import RecurrentConvergenceAnalyzer
 from vllm_hook_plugins.protocols.exit_controller import ConvergenceState
-from vllm_hook_plugins.protocols.recurrent_config import RecurrentDepthConfig
+from vllm_hook_plugins.protocols.recurrent_config import (
+    RecurrentDepthConfig,
+    _coerce_analyzer,
+    _coerce_worker,
+    build_recurrent_stack,
+)
 from vllm_hook_plugins.workers.recurrent_depth_worker import RecurrentDepthWorker
 
 
@@ -75,12 +80,27 @@ def attach_recurrent_depth(
     cfg: Optional[RecurrentDepthConfig] = None,
     *,
     raven_cfg=None,
+    worker=None,
+    analyzer=None,
     **cfg_kwargs,
 ) -> RecurrentDepthProtocol:
-    """Attach the shared stack. Pass ``raven_cfg=RavenAdapterConfig(...)`` for Raven."""
-    if cfg is None and cfg_kwargs:
-        cfg = RecurrentDepthConfig(**cfg_kwargs)
+    """Attach the shared stack. Pass ``raven_cfg=RavenAdapterConfig(...)`` for Raven.
+
+    ``worker`` / ``analyzer`` may be import strings, classes, or instances
+    (same contract as :meth:`RecurrentStepController.from_config`).
+    """
     attach_kwargs = {}
     if raven_cfg is not None:
         attach_kwargs["raven_cfg"] = raven_cfg
-    return RecurrentDepthProtocol(model, cfg=cfg, attach_kwargs=attach_kwargs)
+    if cfg is None:
+        cfg, worker, analyzer = build_recurrent_stack(
+            model, cfg_kwargs, worker=worker, analyzer=analyzer
+        )
+    else:
+        if worker is not None:
+            worker = _coerce_worker(worker, model, cfg)
+        if analyzer is not None:
+            analyzer = _coerce_analyzer(analyzer, cfg)
+    return RecurrentDepthProtocol(
+        model, cfg=cfg, worker=worker, analyzer=analyzer, attach_kwargs=attach_kwargs
+    )

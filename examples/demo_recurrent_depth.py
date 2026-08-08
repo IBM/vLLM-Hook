@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "vllm_hook_plugins"))
 
 
-def main():
+def test():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True, help="HF repo or local Raven checkpoint")
     p.add_argument("--prompt", default="The capital of France is")
@@ -38,7 +38,7 @@ def main():
     import torch
     from transformers import AutoTokenizer
 
-    from model_adapters import (
+    from model_adapters.hf import (
         AdaptiveRavenForCausalLM,
         HuginnDynamicCache,
         RavenAdapterConfig,
@@ -90,4 +90,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test()
