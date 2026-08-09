@@ -58,15 +58,15 @@ def test_vllm(args: argparse.Namespace) -> None:
     from vllm_hook_plugins import HookLLM
 
     register_adaptive_raven()
-    
+
     llm = HookLLM(
         model=args.model,
         download_dir=str(ROOT / "cache"),
         trust_remote_code=True,
         enforce_eager=True,
         tensor_parallel_size=1,
-        max_model_len=256,
-        gpu_memory_utilization=0.7,
+        max_model_len=128,
+        gpu_memory_utilization=0.8,
         hf_overrides={
             "architectures": [ADAPTIVE_RAVEN_ARCH],
             "recurrent_depth": {"rho": args.rho, "min_steps": 1},

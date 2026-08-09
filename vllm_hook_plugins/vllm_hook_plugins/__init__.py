@@ -46,26 +46,10 @@ def register_plugins():
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
     PluginRegistry.register_analyzer("science_hallucination", ScienceHallucinationAnalyzer)
     PluginRegistry.register_analyzer("token_highlighter", HighlighterAnalyzer)
-    # Recurrent depth runs in-process inside the model's recurrence loop (not a
-    # WorkerExtension mixin). Analyzer registered for discovery / HookLLM naming.
+    # Recurrent depth runs in-process inside the recurrence loop (not a
+    # WorkerExtension mixin). Analyzer registered for discovery only.
+    # Call `model_adapters.vllm.register_adaptive_raven` for adaptive Raven vLLM plugin registration.
     PluginRegistry.register_analyzer("recurrent_depth",       RecurrentConvergenceAnalyzer)
-
-    # Register the adaptive Raven executor with vLLM's model registry so
-    # HookLLM / vllm serve can host "RavenForCausalLM" checkpoints with the
-    # adaptive-exit protocol. Lazy string path avoids importing vLLM layers
-    # (and CUDA-initialising) in forked worker processes until a Raven model
-    # is actually loaded. Guarded so environments without vLLM still register
-    # the in-process workers/analyzers above.
-    try:
-        from vllm import ModelRegistry
-
-        if "RavenForCausalLM" not in ModelRegistry.get_supported_archs():
-            ModelRegistry.register_model(
-                "RavenForCausalLM",
-                "model_adapters.vllm.adaptive_raven_vllm:AdaptiveRavenForvLLM",
-            )
-    except Exception:
-        pass
 
 __all__ = [
     "PluginRegistry",

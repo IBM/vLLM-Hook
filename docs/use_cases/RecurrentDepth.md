@@ -119,7 +119,7 @@ flowchart TB
 
 ### Layout
 
-`model_adapters/` is split by runtime: **`hf/`** (HuggingFace adapters + upstream HF Raven) and **`vllm/`** (out-of-tree vLLM executors). `from model_adapters import ...` still re-exports the public names.
+`model_adapters/` is split by runtime: **`hf/`** (HuggingFace adapters + upstream HF Raven) and **`vllm/`** (out-of-tree vLLM executors). Package re-exports are lazy, so `from model_adapters.vllm import ...` does not import the HF stack. HF and vLLM each have their own `RavenConfig` (`hf/raven_config_minimal.py` vs `vllm/original_raven_vllm.py`).
 
 
 | Path                                                                                                                                           | Role                                                     |
@@ -132,8 +132,9 @@ flowchart TB
 | `[model_adapters/hf/looped_llama_adapter.py](../../model_adapters/hf/looped_llama_adapter.py)`                                                 | HF `AdaptiveRavenForCausalLM`, `RowSliceCacheProxy`      |
 | `[model_adapters/hf/raven_baseline_exit.py](../../model_adapters/hf/raven_baseline_exit.py)`                                                   | Huginn native criteria for A/B                           |
 | `[model_adapters/hf/raven_modeling_minimal_llama.py](../../model_adapters/hf/raven_modeling_minimal_llama.py)`                                 | Upstream HF Raven (reference; do not edit)               |
+| `[model_adapters/hf/raven_config_minimal.py](../../model_adapters/hf/raven_config_minimal.py)`                                                 | HF `RavenConfig` for the oracle (not used by vLLM)       |
 | `[model_adapters/vllm/adaptive_raven_vllm.py](../../model_adapters/vllm/adaptive_raven_vllm.py)`                                               | Adaptive vLLM executor (`AdaptiveRavenForvLLM`)          |
-| `[model_adapters/vllm/original_raven_vllm.py](../../model_adapters/vllm/original_raven_vllm.py)`                                               | Vendored fixed-depth vLLM Raven (reference; do not edit) |
+| `[model_adapters/vllm/original_raven_vllm.py](../../model_adapters/vllm/original_raven_vllm.py)`                                               | Vendored fixed-depth vLLM Raven + `RavenConfig`          |
 
 
 **Important:** `RecurrentDepthWorker` is **not** a HookLLM `worker_extension_cls`. Exit decisions must run **in-process inside the recurrence loop**. Disk/RPC analyze is post-hoc only and cannot freeze mid-iteration. Do not pass `worker_name` / `analyzer_name` for this use case — those construct the RPC probe plane. Call `register_adaptive_raven()` (not `register_plugins()`) and pass `hf_overrides={"architectures": ["AdaptiveRavenForvLLM"], "recurrent_depth": {...}}`.

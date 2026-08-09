@@ -128,14 +128,9 @@ class RecurrentStepController:
 
         ``x``: flattened ``[T, D]``. ``decision.steer_gate``: ``[T, 1]``. The
         worker caches the unit direction as ``[T, 1, D]`` during ``build_state``.
+        Delegates steering to the worker.
         """
-        direction = getattr(self.worker, "_cached_direction", None)
-        gate = decision.steer_gate
-        if not self.cfg.enable_steering or direction is None or gate is None:
-            return x
-        if not torch.any(gate != 0):
-            return x
-        return x + gate * direction.squeeze(1)
+        return self.worker.apply_steering(x, decision)
 
     # ------------------------------------------------------------------ #
     # Diagnostics (flattened [T] views)
