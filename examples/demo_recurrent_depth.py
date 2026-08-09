@@ -1,40 +1,89 @@
 #!/usr/bin/env python3
-"""Stage-1 recurrent-depth adaptive exit demo (HF AdaptiveRaven path).
+"""Stage-1 recurrent-depth adaptive exit demo (HF and/or vLLM).
 
-Wiring::
+HF::
 
-    model = AdaptiveRavenForCausalLM.from_pretrained(...)
-    attach_recurrent_depth(model, rho=0.0)  # contraction; exact-match check
-    # or A/B vs Huginn:
-    # attach_recurrent_depth(model, raven_cfg=RavenAdapterConfig(baseline_criterion="latent-diff"))
+    python examples/demo_recurrent_depth.py --model tomg-group-umd/huginn-0125 --rho 0.0
 
-Requires a Raven / Huginn / retrofitted checkpoint and transformers==4.51.0.
+vLLM (registers only AdaptiveRavenForvLLM, not the full Hook plugin set)::
+
+    python examples/demo_recurrent_depth.py --backend vllm --model tomg-group-umd/huginn-0125 --rho 0.0
+
+Requires a Raven / Huginn / retrofitted checkpoint. HF path: transformers==4.51.0.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Must precede any vLLM import (including HookLLM).
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "vllm_hook_plugins"))
 
 
-def test():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, help="HF repo or local Raven checkpoint")
+    p.add_argument(
+        "--backend",
+        choices=("hf", "vllm", "both"),
+        default="hf",
+        help="Which runtime to exercise (HF or vLLM)",
+    )
+    p.add_argument(
+        "--model",
+        default="tomg-group-umd/huginn-0125",
+        help="HF repo or local Raven checkpoint",
+    )
     p.add_argument("--prompt", default="The capital of France is")
     p.add_argument("--rho", type=float, default=0.0, help="0 → no exit (exact-match check)")
     p.add_argument(
         "--baseline",
         default=None,
-        help="Huginn baseline instead of contraction: latent-diff|kl|entropy-diff|argmax-stability|none",
+        help="HF only. Huginn baseline: latent-diff|kl|entropy-diff|argmax-stability|none",
     )
-    p.add_argument("--num-steps", type=int, default=None)
-    args = p.parse_args()
+    p.add_argument("--num-steps", type=int, default=None, help="HF only. Override recurrence steps.")
+    return p.parse_args()
 
+
+def test_vllm(args: argparse.Namespace) -> None:
+    from vllm import SamplingParams
+
+    from model_adapters.vllm import ADAPTIVE_RAVEN_ARCH, register_adaptive_raven
+    from vllm_hook_plugins import HookLLM
+
+    register_adaptive_raven()
+    
+    llm = HookLLM(
+        model=args.model,
+        download_dir=str(ROOT / "cache"),
+        trust_remote_code=True,
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        max_model_len=256,
+        gpu_memory_utilization=0.7,
+        hf_overrides={
+            "architectures": [ADAPTIVE_RAVEN_ARCH],
+            "recurrent_depth": {"rho": args.rho, "min_steps": 1},
+        },
+    )
+    out = llm.generate(
+        [args.prompt],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=20),
+    )
+    print("backend: vllm")
+    print("arch:", ADAPTIVE_RAVEN_ARCH)
+    print("prompt:", args.prompt)
+    print("rho:", args.rho)
+    print(out[0].outputs[0].text)
+
+
+def test_HF(args: argparse.Namespace) -> None:
     import torch
     from transformers import AutoTokenizer
 
@@ -79,6 +128,7 @@ def test():
 
     exits = proto.last_exit_iteration
     nonconv = proto.last_nonconverging
+    print("backend: hf")
     print("prompt:", args.prompt)
     print("rho:", args.rho, "baseline:", args.baseline)
     if exits is not None:
@@ -90,4 +140,8 @@ def test():
 
 
 if __name__ == "__main__":
-    test()
+    args = parse_args()
+    if args.backend in ("hf", "both"):
+        test_HF(args)
+    if args.backend in ("vllm", "both"):
+        test_vllm(args)

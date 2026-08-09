@@ -136,7 +136,7 @@ flowchart TB
 | `[model_adapters/vllm/original_raven_vllm.py](../../model_adapters/vllm/original_raven_vllm.py)`                                               | Vendored fixed-depth vLLM Raven (reference; do not edit) |
 
 
-**Important:** `RecurrentDepthWorker` is **not** a HookLLM `worker_extension_cls`. Exit decisions must run **in-process inside the recurrence loop**. Disk/RPC analyze is post-hoc only and cannot freeze mid-iteration. Do not pass `worker_name` / `analyzer_name` for this use case — those construct the RPC probe plane. Configure recurrence via `HookLLM(..., hf_overrides={"recurrent_depth": {...}})`.
+**Important:** `RecurrentDepthWorker` is **not** a HookLLM `worker_extension_cls`. Exit decisions must run **in-process inside the recurrence loop**. Disk/RPC analyze is post-hoc only and cannot freeze mid-iteration. Do not pass `worker_name` / `analyzer_name` for this use case — those construct the RPC probe plane. Call `register_adaptive_raven()` (not `register_plugins()`) and pass `hf_overrides={"architectures": ["AdaptiveRavenForvLLM"], "recurrent_depth": {...}}`.
 
 ### Worker ↔ analyzer communication
 
@@ -212,6 +212,8 @@ python examples/demo_recurrent_depth.py \
   --model tomg-group-umd/huginn-0125 \
   --prompt "The capital of France is" \
   --rho 0.0
+# vLLM executor smoke test:
+python examples/demo_recurrent_depth.py --backend vllm --rho 0.0
 ```
 
 Programmatic wiring:
@@ -259,28 +261,30 @@ print(proto.last_nonconverging)    # positions with r̂ ≥ 1 while active
 
 ## Example usage (`HookLLM` / vLLM)
 
-`HookLLM` already forwards `**vllm_kwargs` (including `hf_overrides`) to `vllm.LLM`. Pass the recurrent-depth dict under that key; `AdaptiveRavenModel` reads `config.recurrent_depth` and builds `RecurrentStepController.from_config`. Class **instances** cannot cross the GPU-worker process boundary; import **strings** can.
+Register **only** `AdaptiveRavenForvLLM` (do not call `register_plugins()` — that is the probe worker/analyzer set). The arch name is **not** seal-rg `RavenForCausalLM`; Huginn checkpoints still advertise that name, so override `architectures`.
 
 ```python
 from vllm_hook_plugins import HookLLM
+from model_adapters.vllm import ADAPTIVE_RAVEN_ARCH, register_adaptive_raven
 
+register_adaptive_raven()
 llm = HookLLM(
     model="tomg-group-umd/huginn-0125",
     trust_remote_code=True,
     enforce_eager=True,
-    hf_overrides={"recurrent_depth": {
-        "rho": 0.02,
-        "min_steps": 2,
-        # optional custom/out-of-tree classes (Worker(model, cfg) / Analyzer(cfg)):
-        # "compute_kl": True,
-        # "kl_threshold": 1e-3,
-        # "analyzer": "my_pkg.policy:ContractionAndKL",
-        # "worker": "my_pkg.metrics:MyRecurrentWorker",
-    }},
+    hf_overrides={
+        "architectures": [ADAPTIVE_RAVEN_ARCH],  # "AdaptiveRavenForvLLM"
+        "recurrent_depth": {
+            "rho": 0.02,
+            "min_steps": 2,
+            # optional out-of-tree classes (Worker(model, cfg) / Analyzer(cfg)):
+            # "analyzer": "my_pkg.policy:ContractionAndKL",
+        },
+    },
 )
 ```
 
-`vllm serve` uses the same engine `hf_overrides`. Prototype new criteria offline (or on the HF `attach_recurrent_depth` path) before pointing vLLM at an import string.
+Demo: `python examples/demo_recurrent_depth.py --backend vllm --rho 0.0`. `vllm serve` uses the same `hf_overrides` after calling `register_adaptive_raven()`.
 
 ---
 
@@ -326,7 +330,7 @@ flowchart LR
 
 1. **Shared Hook helper** (e.g. `RecurrentStepController`): call protocol → `exit_mask` / `steer_gate`; optional **hidden-state** freeze. No Attention/KV APIs.
 2. **Thin** `RavenForvLLM`: prelude / core / coda, weight load, and Raven Attention/KV slot scheme under vLLM (prefer distinct per-recurrence Attention identities, as Ouro did in-tree). Loop body calls the Hook helper for decisions only. Exploring adaptation of experimental [seal-rg Huginn vLLM plugin](https://github.com/seal-rg/recurrent-pretraining/tree/main/vllm) to support per-token adaptive compute/exit via vLLM-Hook.
-3. `ModelRegistry.register_model("RavenForCausalLM", "…:RavenForvLLM")` via lazy string (required for V1 workers).
+3. `register_adaptive_raven()` → `ModelRegistry.register_model("AdaptiveRavenForvLLM", "…:AdaptiveRavenForvLLM")` via lazy string (own name, not seal-rg `RavenForCausalLM`; callers set `hf_overrides["architectures"]`).
 4. **Demo:** `HookLLM(..., enforce_eager=True)` on Huginn / retrofitted Llama; keep HF `AdaptiveRavenForCausalLM` as `ρ = 0` numerical oracle.
 5. Later families (Ouro, OpenMythos): more thin shims calling the same helper.
 

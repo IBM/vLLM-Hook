@@ -29,7 +29,11 @@ __all__ = [
     "block_geometry_from_config",
 ]
 
-# vLLM executor path is optional so the HF oracle works without vLLM installed.
+from .vllm import ADAPTIVE_RAVEN_ARCH, register_adaptive_raven
+
+__all__ += ["ADAPTIVE_RAVEN_ARCH", "register_adaptive_raven"]
+
+# Executor classes pull in vLLM; optional so the HF oracle still imports.
 try:
     from .vllm import AdaptiveRavenForvLLM, AdaptiveRavenModel
 

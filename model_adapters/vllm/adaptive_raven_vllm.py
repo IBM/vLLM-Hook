@@ -16,20 +16,22 @@ recurrent block, to skip the MLP on converged tokens) are overridden.
 Everything else (weights, logits, attention, RoPE, cache) is inherited from the
 reference implementation.
 
-Users reach this through ``HookLLM`` / ``vllm serve`` once the architecture is
-registered (see :func:`register`). Pass exit knobs (and optional import-string
-worker/analyzer) via vLLM's ``hf_overrides`` — ``HookLLM`` already forwards
-``**vllm_kwargs`` to ``vllm.LLM``::
+Users reach this through ``HookLLM`` / ``vllm serve`` after
+:func:`model_adapters.vllm.register_adaptive_raven`. The architecture name is
+``AdaptiveRavenForvLLM`` (not seal-rg ``RavenForCausalLM``), so Huginn
+checkpoints need ``hf_overrides["architectures"]``::
 
+    from model_adapters.vllm import ADAPTIVE_RAVEN_ARCH, register_adaptive_raven
+
+    register_adaptive_raven()
     HookLLM(
         model="tomg-group-umd/huginn-0125",
         trust_remote_code=True,
         enforce_eager=True,
-        hf_overrides={"recurrent_depth": {
-            "rho": 0.02,
-            "min_steps": 2,
-            "analyzer": "my_pkg.policy:ContractionAndKL",  # optional
-        }},
+        hf_overrides={
+            "architectures": [ADAPTIVE_RAVEN_ARCH],
+            "recurrent_depth": {"rho": 0.02, "min_steps": 2},
+        },
     )
 
 ``rho = 0`` (default) never exits, reproducing the fixed-depth model exactly.
@@ -38,6 +40,9 @@ worker/analyzer) via vLLM's ``hf_overrides`` — ``HookLLM`` already forwards
 from typing import Optional
 
 import torch
+from torch import nn
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 
 from vllm_hook_plugins.protocols.recurrent_step_controller import RecurrentStepController
@@ -93,6 +98,7 @@ class AdaptiveRavenModel(RavenModel):
         # parent are reused as-is (no re-registration).
         core_start = self.config.n_layers_in_prelude
         for i in range(core_start, core_start + self.config.n_layers_in_recurrent_block):
+            # Use subclassed decoder layer instead of the base class
             self.layers[i].__class__ = AdaptiveRavenDecoderLayer
 
     def forward(
@@ -156,25 +162,20 @@ class AdaptiveRavenModel(RavenModel):
 
 
 class AdaptiveRavenForvLLM(RavenForvLLM):
-    """``RavenForvLLM`` wired to use the adaptive model core."""
-
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.model = AdaptiveRavenModel(vllm_config=vllm_config, prefix="model")
-
-
-def register() -> None:
-    """Register the adaptive Raven executor with vLLM's model registry.
-
-    Uses a lazy string path so importing this module (and CUDA-initialising
-    vLLM layers) is deferred to when a Raven checkpoint is actually loaded,
-    which keeps it safe to call from the ``vllm.general_plugins`` entry point in
-    forked worker processes.
-    """
-    from vllm import ModelRegistry
-
-    if "RavenForCausalLM" not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            "RavenForCausalLM",
-            "model_adapters.vllm.adaptive_raven_vllm:AdaptiveRavenForvLLM",
+        nn.Module.__init__(self)
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.vllm_config = vllm_config
+        self.model = AdaptiveRavenModel(
+            vllm_config=vllm_config,
+            prefix="model" if prefix == "" else prefix,
         )
+        if config.tie_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.n_embd,
+                quant_config=vllm_config.quant_config,
+            )
+        self.logits_processor = LogitsProcessor(config.vocab_size, config.vocab_size, 1.0)
