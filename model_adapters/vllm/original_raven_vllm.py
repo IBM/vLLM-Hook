@@ -21,7 +21,10 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from vllm.attention.layer import Attention
+try:
+    from vllm.model_executor.layers.attention import Attention
+except ImportError:  # vLLM < 0.11
+    from vllm.attention.layer import Attention
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
