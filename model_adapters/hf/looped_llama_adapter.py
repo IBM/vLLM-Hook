@@ -239,7 +239,10 @@ class AdaptiveRavenForCausalLM(RavenForCausalLM):
 
         cache = past_key_values
         proxy = None
-        if raven_cfg.slice_decode and past_key_values is not None:
+        # Only wrap for decode (S==1). Prefill must use the raw Huginn cache;
+        # wrapping here has been observed to NaN latents under transformers 5.x
+        # even when use_slice stays false.
+        if raven_cfg.slice_decode and past_key_values is not None and S == 1:
             r, p = block_geometry_from_config(self.config)
             proxy = RowSliceCacheProxy(
                 past_key_values, recurrent_block_size=r, prelude_depth=p

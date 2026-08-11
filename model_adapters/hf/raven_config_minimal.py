@@ -13,7 +13,16 @@ from math import sqrt
 class RavenConfig(PretrainedConfig):
     model_type = "huginn_raven"
     keys_to_ignore_at_inference = [""]
-    attribute_map = {"num_attention_heads": "n_heads", "hidden_size": "n_embd", "num_hidden_layers": "n_layers"}
+    # LlamaRotaryEmbedding (transformers≥4.5x / 5.x) and other Llama helpers
+    # expect these names; Raven stores them as block_size / n_embd / n_heads / rope_base.
+    attribute_map = {
+        "num_attention_heads": "n_heads",
+        "hidden_size": "n_embd",
+        "num_hidden_layers": "n_layers",
+        "max_position_embeddings": "block_size",
+        "rope_theta": "rope_base",
+        "rms_norm_eps": "norm_eps",
+    }
 
     def __init__(
         self,
@@ -49,10 +58,16 @@ class RavenConfig(PretrainedConfig):
         transformers_version: str = "4.47.1",
         **kwargs,
     ):
+        # Pop Llama-style aliases so they do not fight Raven field names in kwargs.
+        kwargs.pop("max_position_embeddings", None)
+        kwargs.pop("rope_theta", None)
+        rope_parameters = kwargs.pop("rope_parameters", None)
+
         self.n_embd = n_embd
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.block_size = block_size
+        self.max_position_embeddings = block_size
         self.vocab_size = self.padded_vocab_size = vocab_size
         self.padding_multiple = padding_multiple
         self.tie_embeddings = tie_embeddings
@@ -77,6 +92,16 @@ class RavenConfig(PretrainedConfig):
         self.qk_bias = qk_bias
         self.activation_checkpoint_impl = activation_checkpoint_impl
         self.rope_base = rope_base
+        self.rope_theta = rope_base
+        # transformers 5.x LlamaRotaryEmbedding reads config.rope_parameters.
+        if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+            self.rope_parameters = dict(rope_parameters)
+            self.rope_parameters.setdefault("rope_type", "default")
+        else:
+            self.rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": float(rope_base),
+            }
         self.torch_dtype = torch_dtype  # Added from JSON
         self.transformers_version = transformers_version  # Added from JSON
         # inference
