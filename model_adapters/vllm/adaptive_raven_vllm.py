@@ -126,6 +126,7 @@ class AdaptiveRavenModel(RavenModel):
         hidden_states = self.initialize_state(input_embeds)
         active = self.controller.reset(hidden_states.shape[0], hidden_states.device)
         core_start = self.config.n_layers_in_prelude
+        steps_run = 0
 
         for recurrent_step in range(self.config.mean_recurrence):
             prev = hidden_states  # start-of-step state (not mutated in place)
@@ -147,9 +148,16 @@ class AdaptiveRavenModel(RavenModel):
             decision = self.controller.step(h, prev, recurrent_step)
             hidden_states = self.controller.steer(h, decision)  # no-op in Stage 1
             active = self.controller.apply(decision, recurrent_step)
+            steps_run = recurrent_step + 1
 
             if not active.any():
                 break  # all tokens converged; skip remaining recurrence
+
+        # Diagnostics for demos / A/B (flattened [T]; mirrors HF adapter fields).
+        self.last_exit_iteration = self.controller.exit_iteration
+        self.last_nonconverging = self.controller.nonconverging
+        self.last_active = self.controller.active
+        self.last_recurrence_steps_run = steps_run
 
         hidden_states = self.ln_f(hidden_states)
 

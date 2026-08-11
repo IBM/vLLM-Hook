@@ -6,7 +6,7 @@
 
 Recurrent-depth LMs (Huginn family / Raven, retrofitted Llama/OLMo, Ouro / OpenMythos, etc.) iterate a shared transformer block (often comprised of a stack of decoder layers) many times per token. Different tokens need different depth, but serving stacks typically run a fixed recurrence. **Stage 1** adds a training-free, per-token adaptive exit protocol inside vLLM-Hook. **Stage 2** (safety steering mid-recurrence) is scaffolded but not yet finalized.
 
-This document outlines current implementation (HuggingFace Raven path + adaptive exit protocol draft), worker and analyzer communication in-process, and the planned thin out-of-tree vLLM model executor so the same protocol can run under `HookLLM` without forking the vLLM engine.
+This document outlines current implementation (HuggingFace Raven path + adaptive exit protocol draft), worker and analyzer communication in-process, and the out-of-tree vLLM model executor so the same protocol can run under `HookLLM` without forking the vLLM engine.
 
 ---
 
@@ -18,7 +18,7 @@ This document outlines current implementation (HuggingFace Raven path + adaptive
 | Stage        | Capability                                                                            | Status                                                                             |
 | ------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | **1**        | Per-token adaptive exit via contraction-rate criterion; A/B vs Huginn native criteria | **Implemented** on HF in-process with `AdaptiveRavenForCausalLM`                   |
-| **1 → vLLM** | Same protocol under `HookLLM` via OOT `RavenForvLLM`                                  | **In-progress** (no vLLM core fork)                                                |
+| **1 → vLLM** | Same protocol under `HookLLM` via OOT `AdaptiveRavenForvLLM`                  | **Implemented** (no vLLM core fork; scheduler reclaim deferred)                |
 | **2**        | Contrastive safety margin + mid-recurrence steering                                   | To finalize following Stage 1 completion (currently scaffold only within protocol) |
 
 
@@ -79,31 +79,35 @@ forward()                        # no loop
 ```mermaid
 flowchart TB
   subgraph hook [vLLM-Hook shared]
-    proto[ExitController + analyzers]
-    helper[RecurrentStepController planned]
-    proto --> helper
+    helper[RecurrentStepController]
+    worker[RecurrentDepthWorker]
+    analyzer[RecurrentConvergenceAnalyzer]
+    exitCtrl[ExitController]
+    helper --> worker
+    helper --> analyzer
+    helper --> exitCtrl
   end
   subgraph family [Thin per-family hosts]
-    hfRaven[AdaptiveRavenForCausalLM HF currently]
-    raven[RavenForvLLM]
-    ouro[OuroForvLLM]
-    mythos[MythosForvLLM]
+    hfRaven[AdaptiveRavenForCausalLM<br/>HF]
+    raven[AdaptiveRavenForvLLM<br/>OOT plugin]
+    ouro[OuroForvLLM<br/>planned]
+    mythos[MythosForvLLM<br/>planned]
   end
-  hfRaven -->|"each recurrence step"| proto
+  hfRaven -->|"each recurrence step"| helper
   raven -->|"each recurrence step"| helper
-  ouro -->|"each recurrence step"| helper
-  mythos -->|"each recurrence step"| helper
+  ouro -.->|"each recurrence step"| helper
+  mythos -.->|"each recurrence step"| helper
 ```
 
 
 
-*Figure 2. Adaptive exit/steering decisions live once in Hook. Each model family still needs a thin host for its forward graph, weight load, and Attention/KV layout.*
+*Figure 2. Adaptive exit/steering decisions live once in Hook (`RecurrentStepController`). Each model family still needs a thin host for its forward graph, weight load, and Attention/KV layout.*
 
 
 | Component                                    | Shared in Hook?      | Location/Handler                       |
 | -------------------------------------------- | -------------------- | -------------------------------------- |
 | Exit / steer protocol, contraction analyzer  | Yes                  | `protocols/`, `workers/`, `analyzers/` |
-| Hidden-state freeze from `exit_mask`         | Yes (tensor ops)     | protocol / planned step helper         |
+| Hidden-state freeze from `exit_mask`         | Yes (tensor ops)     | `RecurrentStepController`              |
 | Attention / KV slot indexing, congruent fill | **No**               | Family adapter / executor              |
 | Prelude–core–coda vs UT-over-all-layers      | No                   | Family host                            |
 | Scheduler / paged-KV reclaim / CUDA graphs   | Out of scope Stage 1 | Upstream vLLM (defer)                  |
@@ -205,7 +209,11 @@ At decode (`S == 1`), inactive batch rows can be sliced out of `core_block_forwa
 
 ## Example usage (HF Raven)
 
-Requires a Raven / Huginn / retrofitted checkpoint and `transformers==4.51.0`.
+Requires a Raven / Huginn / retrofitted checkpoint. HF Raven was validated on
+`transformers==4.51.0` (KV-cache / generate contract). vLLM 0.22 needs
+`transformers>=4.56`, so the shared env usually cannot pin 4.51. The HF adapter
+tolerates transformers 5.x `generate` input shapes; for a strict HF-only oracle,
+use a separate env with 4.51.0.
 
 ```bash
 # From repo root; install vllm_hook_plugins editable as usual
@@ -215,6 +223,8 @@ python examples/demo_recurrent_depth.py \
   --rho 0.0
 # vLLM executor smoke test:
 python examples/demo_recurrent_depth.py --backend vllm --rho 0.0
+# Timed HF vs AdaptiveRavenForvLLM comparison (default prompt set):
+python examples/demo_recurrent_depth.py --backend both --rho 0.02 --max-tokens 16
 ```
 
 Programmatic wiring:
@@ -308,32 +318,54 @@ HookLLM alone cannot host Raven: it wraps `vllm.LLM` and expects a **vLLM model-
 
 Planning to defer engine PRs (scheduler mid-recurrence retire, reclaim unused recurrent KV, CUDA graphs with variable depth, continuous-batching wall-clock when depths differ). Stage 1 success is in-forward / FLOP savings and `ρ = 0` parity with the HF model, not improvements on scheduler-level continuous-batching.
 
-### Planned stack under HookLLM
+### Stack under HookLLM (`AdaptiveRavenForvLLM`)
 
 ```mermaid
-flowchart LR
-  client[HookLLM.generate]
-  engine[vLLM engine unchanged]
-  raven[RavenForvLLM forward]
-  helper[Shared Hook helper]
-  proto[ExitController protocol]
-  client --> engine --> raven
-  raven -->|"per recurrence step"| helper
-  helper --> proto
-  proto -->|"exit_mask"| raven
+flowchart TB
+  client["HookLLM.generate<br/>hf_overrides: architectures + recurrent_depth"]
+  reg["register_adaptive_raven()<br/>ModelRegistry → AdaptiveRavenForvLLM"]
+  subgraph engine ["vLLM engine unchanged (Stage 1)"]
+    sched[Scheduler / continuous batching]
+    runner[GPU model runner]
+    kv[Paged KV cache]
+  end
+  subgraph oot ["OOT plugin: AdaptiveRavenForvLLM"]
+    prelude[Prelude]
+    subgraph loop ["Recurrent core loop"]
+      adapter["adapter cat x, e"]
+      core["Core layers<br/>Attn all rows · MLP active only"]
+      ctrl["RecurrentStepController"]
+      subgraph hook ["vLLM-Hook protocol in-process"]
+        W[RecurrentDepthWorker]
+        A[RecurrentConvergenceAnalyzer]
+        E[ExitController]
+      end
+      adapter --> core --> ctrl
+      ctrl --> W --> A --> E
+      E -->|"exit_mask / active"| core
+    end
+    coda[Coda → ln_f]
+    prelude --> loop --> coda
+  end
+  logits[LogitsProcessor / sampler]
+
+  client --> reg --> engine
+  sched --> runner --> oot
+  oot --> kv
+  coda --> logits
 ```
 
 
 
-*Figure 4. OOT executor under an unchanged vLLM engine; decisions stay in Hook.*
+*Figure 4. Out-of-tree `AdaptiveRavenForvLLM` under an unchanged vLLM engine. Recurrence + Attention/KV live in the executor; exit decisions stay in Hook via `RecurrentStepController` (no disk/RPC analyze). Stage 1 does not fork the scheduler.*
 
-### Planned Stage 1 additions
+### Stage 1 status
 
-1. **Shared Hook helper** (e.g. `RecurrentStepController`): call protocol → `exit_mask` / `steer_gate`; optional **hidden-state** freeze. No Attention/KV APIs.
-2. **Thin** `RavenForvLLM`: prelude / core / coda, weight load, and Raven Attention/KV slot scheme under vLLM (prefer distinct per-recurrence Attention identities, as Ouro did in-tree). Loop body calls the Hook helper for decisions only. Exploring adaptation of experimental [seal-rg Huginn vLLM plugin](https://github.com/seal-rg/recurrent-pretraining/tree/main/vllm) to support per-token adaptive compute/exit via vLLM-Hook.
-3. `register_adaptive_raven()` → `ModelRegistry.register_model("AdaptiveRavenForvLLM", "…:AdaptiveRavenForvLLM")` via lazy string (own name, not seal-rg `RavenForCausalLM`; callers set `hf_overrides["architectures"]`).
-4. **Demo:** `HookLLM(..., enforce_eager=True)` on Huginn / retrofitted Llama; keep HF `AdaptiveRavenForCausalLM` as `ρ = 0` numerical oracle.
-5. Later families (Ouro, OpenMythos): more thin shims calling the same helper.
+1. **Shared Hook helper** — `RecurrentStepController`: worker → analyzer → `exit_mask` / `steer_gate`; hidden-state freeze. No Attention/KV APIs.
+2. **Thin adaptive executor** — `AdaptiveRavenForvLLM` subclasses vendored fixed-depth `RavenForvLLM` / `RavenModel` (seal-rg–style Huginn plugin). Overrides recurrence `forward` only; core layers class-swap to `AdaptiveRavenDecoderLayer` (active-token MLP).
+3. **Registration** — `register_adaptive_raven()` → `ModelRegistry.register_model("AdaptiveRavenForvLLM", …)` (own name, not seal-rg `RavenForCausalLM`; callers set `hf_overrides["architectures"]`).
+4. **Demo** — `HookLLM(..., enforce_eager=True)` on Huginn; HF `AdaptiveRavenForCausalLM` remains the `ρ = 0` numerical oracle.
+5. **Later families** — Ouro, OpenMythos: more thin shims calling the same helper.
 
 `enforce_eager=True` remains mandatory: currently, CUDA graphs do not support variable-depth inference/exit.
 
