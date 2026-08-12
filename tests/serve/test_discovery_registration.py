@@ -37,3 +37,36 @@ def test_bare_get_reaches_handler_with_injected_request(monkeypatch):
 
     assert response.status_code == 200, response.text
     assert response.json()["active_worker"] == "unified"
+
+
+def test_head_artifact_absent_returns_404(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_HOOK_REGISTRY_DIR", str(tmp_path))
+
+    app = FastAPI()
+    discovery._add_artifacts_route(app)
+
+    client = TestClient(app)
+    response = client.head("/v1/hook/artifacts/sha256:" + "ab" * 32)
+
+    assert response.status_code == 404
+
+
+def test_head_artifact_present_returns_200(monkeypatch, tmp_path):
+    import os
+
+    from vllm_hook_plugins.core.artifacts import ArtifactRegistry
+
+    monkeypatch.setenv("VLLM_HOOK_REGISTRY_DIR", str(tmp_path))
+    artifact_id = "sha256:" + "cd" * 32
+    artifact_path = ArtifactRegistry().path_for(artifact_id)
+    os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+    with open(artifact_path, "wb") as handle:
+        handle.write(b"payload")
+
+    app = FastAPI()
+    discovery._add_artifacts_route(app)
+
+    client = TestClient(app)
+    response = client.head("/v1/hook/artifacts/" + artifact_id)
+
+    assert response.status_code == 200

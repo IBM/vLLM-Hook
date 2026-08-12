@@ -9,7 +9,8 @@ middleware.
   collective_rpc("hook_capabilities") at first request, memoized for the
   process lifetime.
 - ``PUT /v1/hook/artifacts/{artifact_id}``: a direct HTTP face on the
-  artifact registry. The body is safetensors bytes; the id is verified
+  artifact registry, with a ``HEAD`` on the same path answering whether the
+  registry already holds an id (the shared_fs visibility probe). The body is safetensors bytes; the id is verified
   server-side against the written content address, so a client cannot
   register bytes under the wrong id. Already-exists is success (writes
   are content-addressed and idempotent).
@@ -86,8 +87,21 @@ def _add_capabilities_route(app) -> None:
 
 
 def _add_artifacts_route(app) -> None:
-    from fastapi import Request
+    from fastapi import Request, Response
     from fastapi.responses import JSONResponse
+
+    @app.head("/v1/hook/artifacts/{artifact_id}")
+    async def head_hook_artifact(artifact_id: str):
+        import os
+
+        from ..core.artifacts import ArtifactRegistry
+
+        registry = ArtifactRegistry()
+        try:
+            present = os.path.exists(registry.path_for(artifact_id))
+        except Exception:
+            present = False
+        return Response(status_code=200 if present else 404)
 
     @app.put("/v1/hook/artifacts/{artifact_id}")
     async def put_hook_artifact(artifact_id: str, raw_request: Request):
@@ -120,4 +134,4 @@ def _add_artifacts_route(app) -> None:
             )
         return JSONResponse({"id": written_id})
 
-    logger.info("registered PUT /v1/hook/artifacts/{artifact_id}")
+    logger.info("registered PUT and HEAD /v1/hook/artifacts/{artifact_id}")

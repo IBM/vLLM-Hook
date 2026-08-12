@@ -37,7 +37,8 @@ def test_capabilities_payload_shape(server):
     assert payload["capture_kinds"]["kinds"] == ["residual"]
     assert set(payload["capture_kinds"]["locations"]) == {"layer_output", "layer_input"}
     assert set(payload["capture_kinds"]["modes"]) == {"all_tokens", "last_token"}
-    assert payload["artifact_transports"] == ["shared_fs"]
+    assert set(payload["artifact_transports"]) == {"shared_fs", "http"}
+    assert payload["artifact_registry_root"]
 
     engine = payload["engine"]
     assert engine["enforce_eager"] is True

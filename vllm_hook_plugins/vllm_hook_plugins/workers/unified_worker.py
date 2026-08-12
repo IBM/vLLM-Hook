@@ -21,7 +21,7 @@ import torch
 from vllm.forward_context import get_forward_context
 
 from vllm_hook_plugins.core import __version__ as _PLUGIN_VERSION
-from vllm_hook_plugins.core.artifacts import ArtifactRegistry
+from vllm_hook_plugins.core.artifacts import ArtifactRegistry, default_registry_root
 from vllm_hook_plugins.core.canonical import canonical_bytes, spec_hash
 from vllm_hook_plugins.core.fingerprints import (
     chat_template_fingerprint,
@@ -324,7 +324,8 @@ class UnifiedHookWorker:
                 "locations": sorted(CAPTURE_LOCATIONS),
                 "modes": sorted(CAPTURE_MODES),
             },
-            "artifact_transports": ["shared_fs"],
+            "artifact_transports": ["shared_fs", "http"],
+            "artifact_registry_root": default_registry_root(),
             "engine": {
                 "enforce_eager": bool(getattr(model_config, "enforce_eager", True)),
                 "prefix_caching": bool(getattr(cache_config, "enable_prefix_caching", False)),
