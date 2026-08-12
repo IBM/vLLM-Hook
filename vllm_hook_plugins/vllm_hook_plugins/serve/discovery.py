@@ -14,8 +14,6 @@ middleware.
   register bytes under the wrong id. Already-exists is success (writes
   are content-addressed and idempotent).
 """
-from __future__ import annotations
-
 import logging
 import sys
 
