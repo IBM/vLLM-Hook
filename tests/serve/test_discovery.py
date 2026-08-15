@@ -27,10 +27,12 @@ def test_capabilities_payload_shape(server):
     assert payload["vllm_version"]
 
     kinds = payload["intervention_kinds"]
-    assert set(kinds["transforms"]) == {"additive", "directional_ablation", "rotation", "head_additive"}
+    assert set(kinds["transforms"]) == {"additive", "projection", "rotation", "head_additive"}
     assert set(kinds["modifiers"]) == {"norm_preserving", "alignment_adaptive"}
     assert set(kinds["scopes"]) == {"all", "after_prompt", "last_k", "from_position"}
-    assert set(kinds["gates"]) == {"null", "cache_once", "probe_sum", "multi_key_threshold"}
+    assert set(kinds["readouts"]) == {"affine", "cosine", "projected_cosine"}
+    assert set(kinds["rules"]) == {"per_key_threshold", "sum_threshold"}
+    assert "gates" not in kinds
     assert kinds["constraints"] == {"head_additive": "tensor_parallel_size==1"}
 
     assert payload["processor_kinds"] == {"processors": []}

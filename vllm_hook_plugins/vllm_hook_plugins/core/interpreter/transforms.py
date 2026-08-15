@@ -19,7 +19,7 @@ def additive(stream: torch.Tensor, *, vector: torch.Tensor, strength: float) -> 
     return stream + strength * vector
 
 
-def directional_ablation(stream: torch.Tensor, *, vector: torch.Tensor) -> torch.Tensor:
+def projection(stream: torch.Tensor, *, vector: torch.Tensor) -> torch.Tensor:
     """Remove each row's component along ``vector``:
     ``out = stream - (stream @ v̂) v̂`` with ``v̂ = vector / ||vector||``.
 
@@ -73,7 +73,7 @@ def head_additive(heads: torch.Tensor, *, vector: torch.Tensor, strength: float)
 
 TRANSFORMS = {
     "additive": additive,
-    "directional_ablation": directional_ablation,
+    "projection": projection,
     "rotation": rotation,
     "head_additive": head_additive,
 }

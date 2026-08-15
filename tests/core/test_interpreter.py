@@ -1,26 +1,28 @@
 # tests/core/test_interpreter.py
-"""Golden-tensor tests per transform/modifier/gate kind. These functions
-are the reference semantics, so the expectations here are the spec.
+"""Golden-tensor tests per transform/modifier/readout/rule kind. These
+functions are the reference semantics, so the expectations here are the spec.
 """
 import math
 
 import pytest
 import torch
 
-from vllm_hook_plugins.core.interpreter import apply_op, build_gate, scope_rows
+from vllm_hook_plugins.core.interpreter import apply_op, scope_rows
 from vllm_hook_plugins.core.interpreter.gates import (
-    CacheOnceGate,
-    MultiKeyThresholdGate,
-    ProbeSumGate,
+    affine,
+    cosine,
+    per_key_threshold,
+    projected_cosine,
+    sum_threshold,
 )
 from vllm_hook_plugins.core.interpreter.modifiers import alignment_adaptive, norm_preserving
 from vllm_hook_plugins.core.interpreter.transforms import (
     additive,
-    directional_ablation,
     head_additive,
+    projection,
     rotation,
 )
-from vllm_hook_plugins.core.schema import GateSpec, ModifierSpec, OpSpec, ScopeSpec
+from vllm_hook_plugins.core.schema import ModifierSpec, OpSpec, ScopeSpec
 
 VEC = "sha256:" + "ab" * 32
 
@@ -41,13 +43,13 @@ def test_additive_golden():
     assert torch.equal(stream, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
 
 
-def test_directional_ablation_removes_component_and_is_idempotent():
+def test_projection_removes_component_and_is_idempotent():
     stream = torch.randn(6, 32)
     vector = torch.randn(32) * 3
-    out = directional_ablation(stream, vector=vector)
+    out = projection(stream, vector=vector)
     unit = vector / vector.norm()
     assert torch.allclose(out @ unit, torch.zeros(6), atol=1e-5)
-    again = directional_ablation(out, vector=vector)
+    again = projection(out, vector=vector)
     assert torch.allclose(out, again, atol=1e-6)
 
 
@@ -213,146 +215,72 @@ def test_apply_op_casts_artifacts_to_stream_dtype():
 
 
 # ---------------------------------------------------------------------------
-# gates
+# readouts (pooled row -> one value per condition layer)
 # ---------------------------------------------------------------------------
 
 
-def test_probe_sum_pools_per_layer_and_overwrites_on_replay():
-    weights = torch.tensor([[1.0, 0.0]])
-    gate = ProbeSumGate(condition_layers=[2], pooling="mean", weights=weights, bias=-3.0)
-    assert gate.decision() is None
-
-    gate.observe(2, range(0, 1), torch.tensor([[2.0, 5.0]]))
-    assert gate.decision() is False  # mean = 2.0; 2.0 - 3.0 < 0
-
-    gate.observe(2, range(1, 2), torch.tensor([[6.0, 5.0]]))
-    assert gate.decision() is True  # mean = 4.0; 4.0 - 3.0 >= 0
-
-    # replaying position 1 overwrites, not accumulates
-    gate.observe(2, range(1, 2), torch.tensor([[6.0, 5.0]]))
-    assert gate.decision() is True
-    gate.observe(2, range(1, 2), torch.tensor([[0.5, 0.0]]))
-    assert gate.decision() is False  # mean = 1.25
-
-    # readings from non-condition layers are ignored
-    gate.observe(7, range(2, 3), torch.tensor([[100.0, 0.0]]))
-    assert gate.decision() is False
-
-    gate.reset()
-    assert gate.decision() is None
+def test_affine_is_signed_dot_with_weight_row():
+    pooled = torch.tensor([2.0, 5.0])
+    weights = torch.tensor([1.0, 0.0])
+    assert float(affine(pooled, weights)) == pytest.approx(2.0)
+    assert float(affine(pooled, torch.tensor([0.0, -1.0]))) == pytest.approx(-5.0)
 
 
-def test_probe_sum_sums_pooled_contributions_across_layers():
-    weights = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    gate = ProbeSumGate(condition_layers=[1, 3], pooling="mean", weights=weights, bias=-5.0)
-
-    gate.observe(1, range(0, 2), torch.tensor([[2.0, 0.0], [4.0, 0.0]]))  # mean = 3.0
-    assert gate.decision() is False  # unobserved layer contributes nothing yet
-    gate.observe(3, range(0, 2), torch.tensor([[0.0, 2.0], [0.0, 4.0]]))  # mean = 3.0
-    assert gate.decision() is True  # 3.0 + 3.0 - 5.0 >= 0
-
-
-def test_probe_sum_last_pooling_takes_highest_observed_position():
-    weights = torch.tensor([[1.0]])
-    gate = ProbeSumGate(condition_layers=[0], pooling="last", weights=weights, bias=0.0)
-    gate.observe(0, range(0, 3), torch.tensor([[5.0], [5.0], [-1.0]]))
-    assert gate.decision() is False  # position 2 scores -1.0
-    gate.observe(0, range(2, 3), torch.tensor([[2.0]]))
-    assert gate.decision() is True  # replay overwrote position 2
+def test_cosine_sign_tracks_alignment():
+    direction = torch.tensor([1.0, 0.0, 0.0])
+    aligned = torch.tensor([3.0, 0.0, 0.0])
+    opposed = torch.tensor([-2.0, 0.0, 0.0])
+    orthogonal = torch.tensor([0.0, 4.0, 0.0])
+    assert float(cosine(aligned, direction)) == pytest.approx(1.0, abs=1e-6)
+    assert float(cosine(opposed, direction)) == pytest.approx(-1.0, abs=1e-6)
+    assert float(cosine(orthogonal, direction)) == pytest.approx(0.0, abs=1e-6)
 
 
-def test_multi_key_threshold_counts_fired_keys():
-    # keys fire on x>0 / y>0 / x+y<0 respectively
-    weights = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]])
-    gate = MultiKeyThresholdGate(threshold=0.5, condition_layers=[1], weights=weights)
-    assert gate.decision() is None
-
-    gate.observe(1, range(0, 1), torch.tensor([[1.0, -1.0]]))
-    assert gate.decision() is False  # 1/3 fired
-
-    gate.observe(1, range(1, 2), torch.tensor([[-1.0, 1.0]]))
-    assert gate.decision() is True  # 2/3 fired across positions
-
-    gate.reset()
-    assert gate.decision() is None
+def test_cosine_zero_pooled_is_finite():
+    # The epsilon floor keeps a zero row from dividing by zero.
+    value = float(cosine(torch.zeros(4), torch.tensor([1.0, 0.0, 0.0, 0.0])))
+    assert math.isfinite(value)
+    assert value == pytest.approx(0.0)
 
 
-def test_cache_once_freezes_decision_at_final_prompt_position():
-    weights = torch.tensor([[1.0]])
-    inner = ProbeSumGate(condition_layers=[0], pooling="mean", weights=weights, bias=-0.4)
-    gate = CacheOnceGate(inner)
-
-    # mid-prompt pass: evidence lands but no decision yet
-    gate.observe(0, range(0, 4), torch.full((4, 1), 0.5))
-    gate.note_pass(range(0, 4), prompt_len=8)
-    assert gate.decision() is None
-
-    # pass covering the final prompt position triggers the single decision
-    gate.observe(0, range(4, 8), torch.full((4, 1), 0.5))
-    gate.note_pass(range(4, 8), prompt_len=8)
-    assert gate.decision() is True  # mean = 0.5; 0.5 - 0.4 >= 0
-
-    # later evidence cannot flip the held decision
-    gate.observe(0, range(8, 9), torch.tensor([[-100.0]]))
-    gate.note_pass(range(8, 9), prompt_len=8)
-    assert gate.decision() is True
-
-    gate.reset()
-    assert gate.decision() is None
-    assert inner.decision() is None
+def test_projected_cosine_matches_rank_one_projector_formula():
+    pooled = torch.tensor([0.7, -1.3, 2.0])
+    direction = torch.tensor([1.0, 2.0, -0.5])
+    eps = 1e-8
+    projector = torch.outer(direction, direction) / (direction @ direction + eps)
+    projected = torch.tanh(pooled @ projector)
+    expected = (pooled @ projected) / (pooled.norm() * projected.norm() + eps)
+    assert float(projected_cosine(pooled, direction)) == pytest.approx(float(expected), abs=1e-6)
 
 
-def test_cache_once_defers_freeze_until_trigger_pass_evidence_arrives():
-    """A condition layer above the gated op's layer feeds after the op
-    fires in the trigger pass; the freeze then defers to the first
-    post-prompt pass so the decision reflects the full prompt.
-    """
-    inner = ProbeSumGate(condition_layers=[5], pooling="mean", weights=torch.tensor([[1.0]]), bias=-0.4)
-    gate = CacheOnceGate(inner)
-
-    # op-layer check in the covering pass: layer 5 has not been read yet
-    gate.note_pass(range(0, 8), prompt_len=8)
-    assert gate.decision() is None
-
-    # the reading lands later in the same pass
-    gate.observe(5, range(0, 8), torch.full((8, 1), 0.5))
-
-    # first post-prompt pass freezes with the full prompt evidence
-    gate.note_pass(range(8, 9), prompt_len=8)
-    assert gate.decision() is True
-
-    # frozen: later evidence is ignored
-    gate.observe(5, range(8, 9), torch.tensor([[-100.0]]))
-    gate.note_pass(range(9, 10), prompt_len=8)
-    assert gate.decision() is True
+def test_projected_cosine_zero_direction_is_finite():
+    # A zero direction collapses the projector to zeros; the epsilon floor
+    # keeps the result finite rather than NaN.
+    value = float(projected_cosine(torch.tensor([1.0, 2.0, 3.0]), torch.zeros(3)))
+    assert math.isfinite(value)
 
 
-def test_cache_once_freezes_closed_when_no_evidence_ever_arrives():
-    inner = ProbeSumGate(condition_layers=[5], pooling="mean", weights=torch.tensor([[1.0]]), bias=-0.4)
-    gate = CacheOnceGate(inner)
-    gate.note_pass(range(0, 8), prompt_len=8)
-    assert gate.decision() is None  # undecided, closed at op time
-    gate.note_pass(range(8, 9), prompt_len=8)
-    assert gate.decision() is False  # frozen closed at the post-prompt pass
-    gate.observe(5, range(9, 10), torch.tensor([[100.0]]))
-    assert gate.decision() is False
+# ---------------------------------------------------------------------------
+# rules (per-layer values -> boolean decision)
+# ---------------------------------------------------------------------------
 
 
-def test_build_gate_resolves_artifacts_and_nesting():
-    probe = "sha256:" + "cd" * 32
-    artifacts = {probe: {"weights": torch.tensor([[1.0]]), "bias": torch.tensor(0.5)}}
-    spec = GateSpec(
-        kind="cache_once",
-        params={},
-        artifact=None,
-        inner=GateSpec(kind="probe_sum", params={"condition_layers": [3], "pooling": "mean"},
-                       artifact=probe, inner=None),
-    )
-    gate = build_gate(spec, artifacts)
-    assert isinstance(gate, CacheOnceGate)
-    assert isinstance(gate.inner, ProbeSumGate)
-    assert gate.inner.bias == 0.5
-    assert gate.inner.pooling == "mean"
+def test_sum_threshold_ties_open():
+    # sum(values) + bias >= 0, with exact-zero opening the gate.
+    assert sum_threshold({0: 1.5, 1: 0.5}, bias=-2.0) is True  # exactly 0
+    assert sum_threshold({0: 1.0}, bias=-1.5) is False
+    assert sum_threshold({0: 4.0}, bias=1.0) is True
+
+
+def test_per_key_threshold_ge_and_le_with_any_all():
+    values = {0: 0.8, 1: 0.2}
+    assert per_key_threshold(values, threshold=0.5, comparator="ge", aggregate="any") is True
+    assert per_key_threshold(values, threshold=0.5, comparator="ge", aggregate="all") is False
+    assert per_key_threshold(values, threshold=0.5, comparator="le", aggregate="any") is True
+    assert per_key_threshold(values, threshold=0.5, comparator="le", aggregate="all") is False
+    # comparison is inclusive at the threshold
+    assert per_key_threshold({0: 0.5}, threshold=0.5, comparator="ge", aggregate="all") is True
+    assert per_key_threshold({0: 0.5}, threshold=0.5, comparator="le", aggregate="all") is True
 
 
 # ---------------------------------------------------------------------------

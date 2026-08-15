@@ -7,4 +7,4 @@ unified worker calls into this package; external tools can import it to
 validate specs, derive cache salts, and reproduce interventions offline.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

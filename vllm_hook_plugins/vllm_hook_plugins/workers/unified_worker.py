@@ -35,8 +35,9 @@ from vllm_hook_plugins.core.kinds import (
     CAPTURE_LOCATIONS,
     CAPTURE_MODES,
     CONSTRAINTS,
-    GATE_KINDS,
     MODIFIER_KINDS,
+    READOUT_KINDS,
+    RULE_KINDS,
     SCOPE_KINDS,
     TRANSFORM_KINDS,
 )
@@ -315,7 +316,8 @@ class UnifiedHookWorker:
                 "transforms": sorted(TRANSFORM_KINDS),
                 "modifiers": sorted(MODIFIER_KINDS),
                 "scopes": sorted(SCOPE_KINDS),
-                "gates": sorted(GATE_KINDS),
+                "readouts": sorted(READOUT_KINDS),
+                "rules": sorted(RULE_KINDS),
                 "constraints": dict(CONSTRAINTS),
             },
             "processor_kinds": {"processors": []},
@@ -360,7 +362,7 @@ class UnifiedHookWorker:
         spec = None
         artifacts = {}
         if intervention_obj is not None:
-            spec = parse_intervention_spec(intervention_obj, num_layers=self._num_layers, allowed_gates=GATE_KINDS)
+            spec = parse_intervention_spec(intervention_obj, num_layers=self._num_layers)
             self._check_constraints(spec)
             artifacts = self._resolve_artifacts(spec)
 
@@ -420,12 +422,15 @@ class UnifiedHookWorker:
                         f"ops[{op_index}].transform.modifiers[{m_index}].artifact",
                     )
                 )
-            gate = op.gate
-            gate_path = f"ops[{op_index}].gate"
-            while gate is not None:
-                entries.append((gate.kind, gate.params, gate.artifact, f"{gate_path}.artifact"))
-                gate = gate.inner
-                gate_path += ".inner"
+            if op.gate is not None:
+                entries.append(
+                    (
+                        op.gate.readout.kind,
+                        {"layers": op.gate.layers},
+                        op.gate.readout.artifact,
+                        f"ops[{op_index}].gate.readout.artifact",
+                    )
+                )
             for kind, params, artifact_id, path in entries:
                 if artifact_id is None:
                     continue
@@ -457,7 +462,7 @@ class UnifiedHookWorker:
                 _fail(f"tensor {name!r} has non-finite values")
 
         hidden = self._hidden_size
-        if kind in ("additive", "directional_ablation", "alignment_adaptive"):
+        if kind in ("additive", "projection", "alignment_adaptive"):
             vector = tensors["vector"]
             if tuple(vector.shape) != (hidden,):
                 _fail(f"tensor 'vector' has shape {tuple(vector.shape)}; kind {kind!r} needs ({hidden},)")
@@ -482,30 +487,24 @@ class UnifiedHookWorker:
                     f"tensor 'vector' has shape {tuple(vector.shape)}; head_additive needs "
                     f"({self._num_heads}, {self._head_dim}) or ({self._head_dim},)"
                 )
-        elif kind == "probe_sum":
-            weights = tensors["weights"]
-            num_condition_layers = len(params["condition_layers"]) if params else None
+        elif kind in READOUT_KINDS:
+            tensor_name = ARTIFACT_TENSORS[kind][0]
+            readout_tensor = tensors[tensor_name]
+            num_layers = len(params["layers"]) if params else None
             if (
-                weights.dim() != 2
-                or weights.shape[1] != hidden
-                or (num_condition_layers is not None and weights.shape[0] != num_condition_layers)
+                readout_tensor.dim() != 2
+                or readout_tensor.shape[1] != hidden
+                or (num_layers is not None and readout_tensor.shape[0] != num_layers)
             ):
                 _fail(
-                    f"tensor 'weights' has shape {tuple(weights.shape)}; probe_sum needs "
-                    f"({num_condition_layers if num_condition_layers is not None else 'num_condition_layers'}, "
-                    f"{hidden}) row-aligned with condition_layers"
+                    f"tensor {tensor_name!r} has shape {tuple(readout_tensor.shape)}; readout {kind!r} needs "
+                    f"({num_layers if num_layers is not None else 'num_condition_layers'}, "
+                    f"{hidden}) row-aligned with the gate's condition layers"
                 )
-            if "bias" in tensors and tensors["bias"].numel() != 1:
-                _fail("tensor 'bias' must be a scalar")
-        elif kind == "multi_key_threshold":
-            weights = tensors["weights"]
-            if weights.dim() != 2 or weights.shape[0] == 0 or weights.shape[1] != hidden:
-                _fail(
-                    f"tensor 'weights' has shape {tuple(weights.shape)}; "
-                    f"multi_key_threshold needs (num_keys >= 1, {hidden})"
-                )
-            if "biases" in tensors and tuple(tensors["biases"].shape) != (weights.shape[0],):
-                _fail(f"tensor 'biases' must have shape ({weights.shape[0]},)")
+            if kind != "affine":
+                zero_rows = readout_tensor.float().norm(dim=1) == 0.0
+                if bool(zero_rows.any()):
+                    _fail(f"tensor {tensor_name!r} has a zero row; readout {kind!r} needs a direction per condition layer")
 
     def _load_artifact(self, artifact_id: str, path: str) -> dict:
         cached = self._artifact_cache.get(artifact_id)

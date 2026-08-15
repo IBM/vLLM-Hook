@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import torch
 
-from vllm_hook_plugins.core.interpreter.gates import GATES, GateState, build_gate
+from vllm_hook_plugins.core.interpreter.gates import READOUTS, RULES, GateState, build_gate
 from vllm_hook_plugins.core.interpreter.modifiers import MODIFIERS
 from vllm_hook_plugins.core.interpreter.scopes import scope_rows
 from vllm_hook_plugins.core.interpreter.transforms import TRANSFORMS
 from vllm_hook_plugins.core.kinds import ARTIFACT_TENSORS
 
 __all__ = [
-    "GATES",
     "GateState",
     "MODIFIERS",
+    "READOUTS",
+    "RULES",
     "TRANSFORMS",
     "apply_op",
     "build_gate",

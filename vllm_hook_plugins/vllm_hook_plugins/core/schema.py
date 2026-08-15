@@ -17,9 +17,10 @@ from vllm_hook_plugins.core.kinds import (
     CAPTURE_KINDS,
     CAPTURE_LOCATIONS,
     CAPTURE_MODES,
-    GATE_KINDS,
     KIND_PARAMS,
     MODIFIER_KINDS,
+    READOUT_KINDS,
+    RULE_KINDS,
     SCOPE_KINDS,
     STRING_PARAM_VALUES,
     TRANSFORM_KINDS,
@@ -46,8 +47,8 @@ _ARTIFACT_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
 
 class SpecError(ValueError):
     """``code`` is one of the ``E_*`` constants; ``path`` locates the
-    offending element (e.g. ``ops[1].gate.kind``); ``str(err)`` is the
-    user-facing message including the fix hint.
+    offending element (e.g. ``ops[1].gate.readout.kind``); ``str(err)`` is
+    the user-facing message including the fix hint.
     """
 
     def __init__(self, code: str, path: str, msg: str):
@@ -68,11 +69,23 @@ class ScopeSpec:
 
 
 @dataclass(frozen=True)
-class GateSpec:
+class ReadoutSpec:
+    kind: str
+    artifact: str
+
+
+@dataclass(frozen=True)
+class RuleSpec:
     kind: str
     params: dict = field(default_factory=dict)
-    artifact: str | None = None
-    inner: "GateSpec | None" = None
+
+
+@dataclass(frozen=True)
+class GateSpec:
+    layers: tuple[int, ...]
+    pooling: str
+    readout: ReadoutSpec
+    rule: RuleSpec
 
 
 @dataclass(frozen=True)
@@ -99,7 +112,7 @@ class InterventionSpec:
 
     def artifact_ids(self) -> tuple[str, ...]:
         """All artifact ids the spec references, deduplicated in first-seen
-        order: transform, then modifiers, then gate (outermost first).
+        order: transform, then modifiers, then the gate readout.
         """
         seen: list[str] = []
 
@@ -111,10 +124,8 @@ class InterventionSpec:
             _add(op.artifact)
             for modifier in op.modifiers:
                 _add(modifier.artifact)
-            gate = op.gate
-            while gate is not None:
-                _add(gate.artifact)
-                gate = gate.inner
+            if op.gate is not None:
+                _add(op.gate.readout.artifact)
         return tuple(seen)
 
     def layers(self) -> frozenset[int]:
@@ -125,10 +136,8 @@ class InterventionSpec:
         """Every condition layer any gate reads at the layer_input boundary."""
         layers: set[int] = set()
         for op in self.ops:
-            gate = op.gate
-            while gate is not None:
-                layers.update(gate.params.get("condition_layers", ()))
-                gate = gate.inner
+            if op.gate is not None:
+                layers.update(op.gate.layers)
         return frozenset(layers)
 
 
@@ -288,38 +297,47 @@ def _parse_scope(obj, num_layers: int, path: str) -> ScopeSpec:
     return ScopeSpec(kind=kind, params=params)
 
 
-def _parse_gate(obj, num_layers: int, allowed_gates: frozenset[str], path: str, *, is_inner: bool = False) -> GateSpec | None:
+def _parse_readout(obj, path: str) -> ReadoutSpec:
+    obj = _require_dict(obj, path, "readout")
+    kind = obj.get("kind")
+    if not isinstance(kind, str) or kind not in READOUT_KINDS:
+        raise SpecError(E_UNKNOWN_KIND, f"{path}.kind", f"unknown readout kind {kind!r}; expected one of {sorted(READOUT_KINDS)}")
+    _parse_kind_params(kind, obj, path, extra_fields={"artifact"})
+    artifact = _parse_artifact_field(kind, obj, path)
+    return ReadoutSpec(kind=kind, artifact=artifact)
+
+
+def _parse_rule(obj, path: str) -> RuleSpec:
+    obj = _require_dict(obj, path, "rule")
+    kind = obj.get("kind")
+    if not isinstance(kind, str) or kind not in RULE_KINDS:
+        raise SpecError(E_UNKNOWN_KIND, f"{path}.kind", f"unknown rule kind {kind!r}; expected one of {sorted(RULE_KINDS)}")
+    if "artifact" in obj:
+        raise SpecError(E_BAD_PARAM, f"{path}.artifact", f"rule kind {kind!r} does not take an artifact")
+    params = _parse_kind_params(kind, obj, path, extra_fields=set())
+    return RuleSpec(kind=kind, params=params)
+
+
+def _parse_gate(obj, num_layers: int, path: str) -> GateSpec | None:
     if obj is None:
         return None
     obj = _require_dict(obj, path, "gate")
-    kind = obj.get("kind")
-    if not isinstance(kind, str) or kind not in GATE_KINDS:
-        raise SpecError(E_UNKNOWN_KIND, f"{path}.kind", f"unknown gate kind {kind!r}; expected one of {sorted(GATE_KINDS)}")
-    if kind not in allowed_gates:
+    _reject_unknown_fields(obj, {"layers", "pooling", "readout", "rule"}, path)
+    for required in ("layers", "pooling", "readout", "rule"):
+        if required not in obj:
+            raise SpecError(E_BAD_PARAM, f"{path}.{required}", f"gate requires a {required!r} field")
+    layers = _parse_layers(obj["layers"], num_layers, f"{path}.layers")
+    pooling = obj["pooling"]
+    allowed_pooling = STRING_PARAM_VALUES[("gate", "pooling")]
+    if not isinstance(pooling, str) or pooling not in allowed_pooling:
         raise SpecError(
-            E_UNKNOWN_KIND,
-            f"{path}.kind",
-            f"gate kind {kind!r} is not served by this worker (conditional handler inactive); allowed: {sorted(allowed_gates)}",
+            E_BAD_PARAM,
+            f"{path}.pooling",
+            f"'pooling' must be one of {sorted(allowed_pooling)}; got {pooling!r}",
         )
-    if kind == "null":
-        _reject_unknown_fields(obj, {"kind"}, path)
-        return None
-    if kind == "cache_once":
-        if is_inner:
-            raise SpecError(E_BAD_PARAM, f"{path}.kind", "'cache_once' cannot wrap another 'cache_once'")
-        _reject_unknown_fields(obj, {"kind", "inner"}, path)
-        if "inner" not in obj or obj["inner"] is None:
-            raise SpecError(E_BAD_PARAM, f"{path}.inner", "'cache_once' requires an 'inner' gate")
-        inner = _parse_gate(obj["inner"], num_layers, allowed_gates, f"{path}.inner", is_inner=True)
-        if inner is None:
-            raise SpecError(E_BAD_PARAM, f"{path}.inner", "'cache_once' requires a conditional 'inner' gate, not 'null'")
-        return GateSpec(kind=kind, params={}, artifact=None, inner=inner)
-    params = _parse_kind_params(kind, obj, path, extra_fields={"artifact"})
-    condition_layers = params.get("condition_layers")
-    if condition_layers is not None:
-        params["condition_layers"] = list(_parse_layers(condition_layers, num_layers, f"{path}.condition_layers"))
-    artifact = _parse_artifact_field(kind, obj, path)
-    return GateSpec(kind=kind, params=params, artifact=artifact, inner=None)
+    readout = _parse_readout(obj["readout"], f"{path}.readout")
+    rule = _parse_rule(obj["rule"], f"{path}.rule")
+    return GateSpec(layers=layers, pooling=pooling, readout=readout, rule=rule)
 
 
 def _parse_modifier(obj, path: str) -> ModifierSpec:
@@ -332,7 +350,7 @@ def _parse_modifier(obj, path: str) -> ModifierSpec:
     return ModifierSpec(kind=kind, params=params, artifact=artifact)
 
 
-def _parse_op(obj, num_layers: int, allowed_gates: frozenset[str], path: str) -> OpSpec:
+def _parse_op(obj, num_layers: int, path: str) -> OpSpec:
     obj = _require_dict(obj, path, "op")
     _reject_unknown_fields(obj, {"layers", "transform", "scope", "gate"}, path)
     for required in ("layers", "transform", "scope"):
@@ -360,7 +378,7 @@ def _parse_op(obj, num_layers: int, allowed_gates: frozenset[str], path: str) ->
     )
 
     scope = _parse_scope(obj["scope"], num_layers, f"{path}.scope")
-    gate = _parse_gate(obj.get("gate"), num_layers, allowed_gates, f"{path}.gate")
+    gate = _parse_gate(obj.get("gate"), num_layers, f"{path}.gate")
 
     return OpSpec(
         layers=layers,
@@ -373,10 +391,9 @@ def _parse_op(obj, num_layers: int, allowed_gates: frozenset[str], path: str) ->
     )
 
 
-def parse_intervention_spec(obj: dict, *, num_layers: int, allowed_gates: frozenset[str] = GATE_KINDS) -> InterventionSpec:
+def parse_intervention_spec(obj: dict, *, num_layers: int) -> InterventionSpec:
     """Validate ``obj`` against the kind registries, ``KIND_PARAMS``, and
-    ``num_layers``. ``allowed_gates`` is ``GATE_KINDS`` when the
-    conditional handler is active, else ``BASE_GATE_KINDS``.
+    ``num_layers``.
     """
     obj = _require_dict(obj, "", "intervention_spec")
     _check_size(obj, "")
@@ -384,7 +401,7 @@ def parse_intervention_spec(obj: dict, *, num_layers: int, allowed_gates: frozen
     if "ops" not in obj or not isinstance(obj["ops"], list):
         raise SpecError(E_BAD_PARAM, "ops", "intervention_spec requires an 'ops' list")
     ops = tuple(
-        _parse_op(op, num_layers, allowed_gates, f"ops[{i}]") for i, op in enumerate(obj["ops"])
+        _parse_op(op, num_layers, f"ops[{i}]") for i, op in enumerate(obj["ops"])
     )
     return InterventionSpec(ops=ops)
 

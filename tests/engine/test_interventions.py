@@ -7,7 +7,7 @@ import uuid
 import torch
 
 from tests.engine.conftest import generate_one, load_capture, prompt_rows
-from vllm_hook_plugins.core.interpreter.transforms import additive, directional_ablation
+from vllm_hook_plugins.core.interpreter.transforms import additive, projection
 
 PROMPT = "The quick brown fox jumps over the lazy dog and then"
 
@@ -55,7 +55,7 @@ def test_steered_prompt_rows_match_interpreter_reference(unified_llm, registry, 
     assert torch.allclose(steer_rows, reference, atol=2e-2, rtol=2e-2)
 
 
-def test_directional_ablation_reference(unified_llm, registry, model_info):
+def test_projection_reference(unified_llm, registry, model_info):
     layer = model_info["num_layers"] // 2
     vector = torch.randn(model_info["hidden_size"], dtype=torch.float32)
     artifact_id = registry.write({"vector": vector})
@@ -68,7 +68,7 @@ def test_directional_ablation_reference(unified_llm, registry, model_info):
         extra={
             "intervention_spec": {"ops": [{
                 "layers": [layer],
-                "transform": {"kind": "directional_ablation", "artifact": artifact_id},
+                "transform": {"kind": "projection", "artifact": artifact_id},
                 "scope": {"kind": "all"},
                 "gate": None,
             }]},
@@ -83,7 +83,7 @@ def test_directional_ablation_reference(unified_llm, registry, model_info):
     base_rows, _ = prompt_rows(base_manifest, base_tensors, layer, n_prompt)
     steer_rows, _ = prompt_rows(steer_manifest, steer_tensors, layer, n_prompt)
 
-    reference = directional_ablation(base_rows.float(), vector=vector).to(base_rows.dtype)
+    reference = projection(base_rows.float(), vector=vector).to(base_rows.dtype)
     assert torch.allclose(steer_rows, reference, atol=2e-2, rtol=2e-2)
 
 
