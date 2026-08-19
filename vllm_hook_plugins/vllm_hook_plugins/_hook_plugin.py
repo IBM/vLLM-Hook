@@ -11,6 +11,14 @@ outputs for both online (async) and offline (sync) usage.
 
 For ``vllm serve``, also patches the OpenAI response builders so probe
 outputs are included in HTTP responses as ``response.probes``.
+
+With VLLM_HOOK_WORKER=unified, the same patch points serve the
+declarative surface instead: ``intervention_spec`` / ``capture`` /
+``processor_spec`` in extra_args are admitted (legacy keys rejected with
+E_LEGACY_KEY, unsalted spec-bearing requests rejected with
+E_SALT_REQUIRED when prefix caching is on), staged on the workers before
+scheduling, and capture results attached as ``output.captures``.
+GET /v1/hook/capabilities is registered on the serving app.
 """
 
 from __future__ import annotations
@@ -34,6 +42,26 @@ _original_chat_full_generator: Callable | None = None
 _WORKER_EXT_HS = "vllm_hook_plugins.workers.probe_hidden_states_worker.ProbeHiddenStatesWorker"
 _WORKER_EXT_QK = "vllm_hook_plugins.workers.probe_hookqk_worker.ProbeHookQKWorker"
 _WORKER_EXT_STEER = "vllm_hook_plugins.workers.steer_activation_worker.SteerHookActWorker"
+_WORKER_EXT_UNIFIED = "vllm_hook_plugins.workers.unified_worker.UnifiedHookWorker"
+
+_WORKER_NAMES = {
+    _WORKER_EXT_HS: "hidden_states",
+    _WORKER_EXT_QK: "qk",
+    _WORKER_EXT_STEER: "steer",
+    _WORKER_EXT_UNIFIED: "unified",
+}
+
+# Engine facts stashed at create_engine_config time; read by admission (the
+# cache-salt rule needs prefix_caching) and by discovery.
+_ENGINE_FACTS: dict = {}
+
+# Legacy keys that drive the legacy workers, and the new-surface keys the
+# unified worker serves. The two sets are mutually exclusive per engine.
+_LEGACY_HOOK_KEYS = (
+    "output_hidden_states", "output_qk", "steer",
+    "save_to_disk", "run_id", "hook_dir", "hs_mode", "hooks_on",
+)
+_NEW_SURFACE_KEYS = ("intervention_spec", "processor_spec", "capture")
 
 # Default hook_dir for save_to_disk requests when extra_args["hook_dir"] is not
 # set. /dev/shm/vllm_hook is a RAM tmpfs on Linux — fast and ephemeral, matching
@@ -83,12 +111,173 @@ def _patched_create_engine_config(self, *args, **kwargs):
             self.worker_extension_cls = _WORKER_EXT_QK
         elif worker_type == "steer":
             self.worker_extension_cls = _WORKER_EXT_STEER
+        elif worker_type == "unified":
+            self.worker_extension_cls = _WORKER_EXT_UNIFIED
         else:
             self.worker_extension_cls = _WORKER_EXT_HS
     self.enforce_eager = True
 
     assert _original_create_engine_config is not None
-    return _original_create_engine_config(self, *args, **kwargs)
+    config = _original_create_engine_config(self, *args, **kwargs)
+
+    _ENGINE_FACTS["active_worker"] = _WORKER_NAMES.get(self.worker_extension_cls, "custom")
+    if self.worker_extension_cls == _WORKER_EXT_UNIFIED:
+        if getattr(config, "speculative_config", None) is not None:
+            raise ValueError(
+                "speculative_config is not supported with VLLM_HOOK_WORKER=unified; "
+                "disable speculative decoding"
+            )
+        _ENGINE_FACTS.update({
+            "prefix_caching": bool(getattr(config.cache_config, "enable_prefix_caching", False)),
+            "tensor_parallel_size": config.parallel_config.tensor_parallel_size,
+            "pipeline_parallel_size": config.parallel_config.pipeline_parallel_size,
+            "model": config.model_config.model,
+            "dtype": str(config.model_config.dtype),
+        })
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Admission for the declarative surface (unified worker)
+# ---------------------------------------------------------------------------
+
+
+def _engine_facts_for(engine) -> dict:
+    """Admission facts for this engine instance.
+
+    Read from the engine's own vllm_config so two engines with different
+    workers in one process each get their own admission; the boot-time
+    module stash is the fallback when the config attributes move.
+    """
+    vllm_config = getattr(engine, "vllm_config", None)
+    if vllm_config is None:
+        vllm_config = getattr(getattr(engine, "llm_engine", None), "vllm_config", None)
+    if vllm_config is None:
+        return _ENGINE_FACTS
+    worker_cls = getattr(vllm_config.parallel_config, "worker_extension_cls", "") or ""
+    return {
+        "active_worker": _WORKER_NAMES.get(worker_cls, "custom" if worker_cls else None),
+        "prefix_caching": bool(getattr(vllm_config.cache_config, "enable_prefix_caching", False)),
+    }
+
+
+def _admit_new_surface(extra: dict, cache_salt, facts: dict) -> None:
+    """Reject inadmissible requests before the engine sees them.
+
+    On a unified-worker engine, legacy hook keys are not served
+    (E_LEGACY_KEY); on a legacy-worker engine, the new-surface keys are
+    not served. With prefix caching enabled, intervention- and
+    capture-bearing requests must carry a cache_salt (E_SALT_REQUIRED):
+    the prefix cache keys blocks on token content only, so an unsalted
+    request could reuse KV computed under a different intervention — and
+    a cache hit skips the forward pass entirely, so capture hooks would
+    never fire for cached tokens.
+    """
+    from vllm_hook_plugins.core.schema import E_LEGACY_KEY, E_SALT_REQUIRED, SpecError
+
+    if facts.get("active_worker") != "unified":
+        for key in _NEW_SURFACE_KEYS:
+            if extra.get(key) is not None:
+                raise ValueError(
+                    f"extra_args[{key!r}] requires the unified worker; "
+                    "run with VLLM_HOOK_WORKER=unified"
+                )
+        return
+
+    for key in _LEGACY_HOOK_KEYS:
+        if extra.get(key) is not None:
+            raise SpecError(
+                E_LEGACY_KEY,
+                key,
+                "legacy hook keys are not served by the unified worker; "
+                "run with VLLM_HOOK_WORKER=hidden_states|qk|steer",
+            )
+
+    wants_intervention = extra.get("intervention_spec") is not None
+    wants_capture = extra.get("capture") is not None
+    if facts.get("prefix_caching") and (wants_intervention or wants_capture) and not cache_salt:
+        raise SpecError(
+            E_SALT_REQUIRED,
+            "cache_salt",
+            "prefix caching is enabled: intervention requests must set cache_salt "
+            "(reference derivation: core.canonical.request_salt) and capture "
+            "requests must set a fresh random cache_salt per request",
+        )
+
+
+def _new_surface_entry(extra: dict) -> dict | None:
+    """The prepare_requests payload for one request, or None when the
+    request carries no new-surface keys.
+    """
+    if not any(extra.get(key) is not None for key in _NEW_SURFACE_KEYS):
+        return None
+    return {key: extra.get(key) for key in _NEW_SURFACE_KEYS}
+
+
+def _raise_prepare_errors(results, req_ids) -> None:
+    """Re-raise the first SpecError payload any rank reported for req_ids."""
+    from vllm_hook_plugins.core.schema import SpecError
+
+    for per_rank in results or ():
+        if not isinstance(per_rank, dict):
+            continue
+        for req_id in req_ids:
+            error = per_rank.get(req_id)
+            if error is not None:
+                raise SpecError(error["code"], error["path"], error["msg"])
+
+
+def _prompt_cache_salt(prompt: Any):
+    """cache_salt as carried on the request: an attribute on
+    EngineCoreRequest (serve) or a key on dict prompts (offline).
+    """
+    salt = getattr(prompt, "cache_salt", None)
+    if salt is None and isinstance(prompt, dict):
+        salt = prompt.get("cache_salt")
+    return salt
+
+
+def _merge_capture_results(results) -> Any:
+    """Merge per-rank get_capture returns into one (manifest, bytes) pair.
+
+    With one populated rank (the common TP-only case) its result passes
+    through untouched. Under pipeline parallelism each stage returns only
+    the layers it owns, so the manifests and tensor dicts are unioned.
+    """
+    parts = [r for r in results or () if r is not None]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+
+    import json as _json
+    import safetensors.torch as _st
+
+    tensors: dict = {}
+    layers: set = set()
+    positions: dict = {}
+    shapes: dict = {}
+    dtype = None
+    location = None
+    mode = None
+    for manifest_json, data in parts:
+        manifest = _json.loads(manifest_json)
+        location = manifest["location"]
+        mode = manifest["mode"]
+        layers.update(manifest["layers"])
+        positions.update(manifest["positions"])
+        shapes.update(manifest["shapes"])
+        dtype = manifest["dtype"] or dtype
+        tensors.update(_st.load(data))
+    merged = {
+        "layers": sorted(layers),
+        "location": location,
+        "mode": mode,
+        "positions": positions,
+        "dtype": dtype,
+        "shapes": shapes,
+    }
+    return (_json.dumps(merged), _st.save(tensors))
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +307,8 @@ async def _patched_generate(
     # vllm_xargs only allows scalar values, so HookClient JSON-encodes nested
     # structures. Decode them back here before the worker reads extra_args.
     import json as _json
-    for _k in ("output_qk", "output_hidden_states", "steer"):
+    for _k in ("output_qk", "output_hidden_states", "steer",
+               "intervention_spec", "processor_spec", "capture"):
         if isinstance(extra.get(_k), str):
             try:
                 _decoded = _json.loads(extra[_k])
@@ -131,22 +321,42 @@ async def _patched_generate(
             extra[_k] = _decoded
     effective_params.extra_args = extra
 
+    if extra:
+        _admit_new_surface(extra, _prompt_cache_salt(prompt), _engine_facts_for(self))
+
     wants_hs = extra.get("output_hidden_states") is not None
     wants_qk = extra.get("output_qk") is not None
     wants_steer = isinstance(extra.get("steer"), dict)
-    needs_hooks = wants_hs or wants_qk or wants_steer
+    wants_capture = extra.get("capture") is not None
+    new_surface_entry = _new_surface_entry(extra)
+    needs_hooks = wants_hs or wants_qk or wants_steer or new_surface_entry is not None
     save_to_disk = bool(extra.get("save_to_disk"))
 
     if needs_hooks and not getattr(self, "_vllm_hook_installed", False):
         await self.collective_rpc("install_hooks")
         setattr(self, "_vllm_hook_installed", True)
 
+    if new_surface_entry is not None:
+        results = await self.collective_rpc(
+            "prepare_requests", args=({request_id: new_surface_entry},)
+        )
+        _raise_prepare_errors(results, [request_id])
+
     assert _original_generate is not None
     try:
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
-            if output.finished and needs_hooks and not wants_steer:
+            if output.finished and wants_capture:
+                n_prompt = len(output.prompt_token_ids)
+                n_gen = len(output.outputs[0].token_ids)
+                captures = await self.collective_rpc(
+                    "get_capture", args=(request_id, n_prompt + n_gen - 1)
+                )
+                result = _merge_capture_results(captures)
+                if result is not None:
+                    output.captures = result
+            if output.finished and needs_hooks and not wants_steer and new_surface_entry is None:
                 if save_to_disk:
                     run_id = extra.get("run_id") or request_id
                     hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
@@ -165,7 +375,9 @@ async def _patched_generate(
                         output.probes = probes
             yield output
     finally:
-        if needs_hooks and not wants_steer and not save_to_disk:
+        if new_surface_entry is not None:
+            await self.collective_rpc("clear_request", args=(request_id,))
+        elif needs_hooks and not wants_steer and not save_to_disk:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
 
 
@@ -188,19 +400,77 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
     else:
         params_list = []
 
+    prompts_list = list(prompts) if isinstance(prompts, (list, tuple)) else [prompts]
+
+    def _params_for(idx):
+        if idx < len(params_list):
+            return params_list[idx]
+        return params_list[0] if params_list else None
+
+    # Admission runs per request against its own extra_args and cache_salt;
+    # new_surface_entries maps prompt index -> prepare_requests payload.
+    new_surface_entries: dict = {}
+    facts = _engine_facts_for(self)
+    for idx in range(len(prompts_list)):
+        sp = _params_for(idx)
+        extra = (sp.extra_args if sp is not None else None) or {}
+        if not extra:
+            continue
+        _admit_new_surface(extra, _prompt_cache_salt(prompts_list[idx]), facts)
+        entry = _new_surface_entry(extra)
+        if entry is not None:
+            new_surface_entries[idx] = entry
+
     needs_hooks = any(
         (sp.extra_args or {}).get("output_hidden_states") is not None
         or (sp.extra_args or {}).get("output_qk") is not None
         or bool((sp.extra_args or {}).get("steer"))
         for sp in params_list
-    )
+    ) or bool(new_surface_entries)
 
     if needs_hooks and not getattr(self, "_vllm_hook_installed", False):
         self.collective_rpc("install_hooks")
         self._vllm_hook_installed = True
 
+    # Stage new-surface requests before the engine sees them. LLM.generate
+    # assigns ids from a monotonic counter, so the batch's ids are known in
+    # advance; when the counter attribute is unavailable, staging under
+    # sentinel ids still validates the specs, and the worker re-stages from
+    # each request's own extra_args at hook time.
+    staged_ids: list = []
+    if new_surface_entries:
+        try:
+            base = int(self.request_counter.counter)
+        except AttributeError:
+            base = None
+        specs = {}
+        for idx, entry in new_surface_entries.items():
+            req_id = str(base + idx) if base is not None else f"__validate_{idx}"
+            specs[req_id] = entry
+        results = self.collective_rpc("prepare_requests", args=(specs,))
+        try:
+            _raise_prepare_errors(results, list(specs))
+        except Exception:
+            # One rejected request fails this call before any ids are
+            # consumed, so successfully staged siblings must be dropped —
+            # their predicted ids would otherwise match the next batch.
+            for req_id in specs:
+                self.collective_rpc("clear_request", args=(req_id,))
+            raise
+        if base is not None:
+            staged_ids = list(specs)
+        else:
+            for req_id in specs:
+                self.collective_rpc("clear_request", args=(req_id,))
+
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
+    outputs = None
+    try:
+        outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
+    finally:
+        if outputs is None:
+            for req_id in staged_ids:
+                self.collective_rpc("clear_request", args=(req_id,))
 
     if needs_hooks:
         import os
@@ -240,6 +510,25 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
             req_ids = [r for r, _ in req_list]
             _, hook_dir = req_list[0]
             self.collective_rpc("flush_disk", args=(req_ids, run_id, hook_dir))
+
+    if new_surface_entries:
+        try:
+            for idx, output in enumerate(outputs):
+                entry = new_surface_entries.get(idx)
+                if entry is None or entry.get("capture") is None:
+                    continue
+                n_prompt = len(output.prompt_token_ids)
+                n_gen = len(output.outputs[0].token_ids)
+                captures = self.collective_rpc(
+                    "get_capture", args=(output.request_id, n_prompt + n_gen - 1)
+                )
+                result = _merge_capture_results(captures)
+                if result is not None:
+                    output.captures = result
+        finally:
+            for idx, output in enumerate(outputs):
+                if idx in new_surface_entries:
+                    self.collective_rpc("clear_request", args=(output.request_id,))
 
     return outputs
 
@@ -332,6 +621,11 @@ def register() -> None:
     global _original_generate, _original_llm_generate
     global _original_completion_response, _original_chat_full_generator
 
+    # Idempotent: a second call would wrap the already-patched methods and
+    # recurse. The entry point fires once, but tests call register() directly.
+    if _original_create_engine_config is not None:
+        return
+
     from vllm import LLM
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
@@ -376,3 +670,8 @@ def register() -> None:
             break
         except Exception:
             pass
+
+    # Capability discovery route for vllm serve (no-op offline; use
+    # collective_rpc("hook_capabilities") there).
+    from vllm_hook_plugins.serve.discovery import register_discovery
+    register_discovery()

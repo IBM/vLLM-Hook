@@ -1,0 +1,28 @@
+name: core-isolation
+
+# Enforces the core import rule: the bare package (no vLLM) must install,
+# import, and pass the engine-free test suites.
+on: [push, pull_request]
+
+jobs:
+  core-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install bare package (no vLLM)
+        run: |
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu ./vllm_hook_plugins
+          python -m pip install pytest
+      - name: Verify vLLM is absent
+        run: |
+          if python -c "import vllm" 2>/dev/null; then
+            echo "vllm must not be installed in the isolation job" >&2
+            exit 1
+          fi
+      - name: Import engine-free core
+        run: python -c "import vllm_hook_plugins.core"
+      - name: Run engine-free test suites
+        run: python -m pytest tests/core tests/workers -q
