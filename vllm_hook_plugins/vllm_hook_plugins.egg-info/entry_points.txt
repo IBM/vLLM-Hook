@@ -1,3 +1,0 @@
-[vllm.general_plugins]
-hook_registry = vllm_hook_plugins:register_plugins
-vllm_hook = vllm_hook_plugins._hook_plugin:register
