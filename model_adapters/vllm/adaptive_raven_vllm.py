@@ -91,6 +91,8 @@ class AdaptiveRavenModel(RavenModel):
         # instantiate inside the GPU worker process (instances cannot cross fork).
         recur_dict = getattr(self.config, "recurrent_depth", None)
         self.controller = RecurrentStepController.from_config(self, recur_dict)
+        # Sidecar for lm-eval / Pareto: mean effective recurrence per forward.
+        self._exit_depth_samples: list[float] = []
 
         # Give the core recurrent-block layers the active-token MLP path. Class
         # reassignment swaps only ``forward`` (no new params / submodules), so
@@ -100,6 +102,14 @@ class AdaptiveRavenModel(RavenModel):
         for i in range(core_start, core_start + self.config.n_layers_in_recurrent_block):
             # Use subclassed decoder layer instead of the base class
             self.layers[i].__class__ = AdaptiveRavenDecoderLayer
+
+    def reset_exit_depth_samples(self) -> None:
+        self._exit_depth_samples.clear()
+
+    def pop_exit_depth_samples(self) -> list[float]:
+        out = list(self._exit_depth_samples)
+        self._exit_depth_samples.clear()
+        return out
 
     def forward(
         self,
@@ -127,8 +137,9 @@ class AdaptiveRavenModel(RavenModel):
         active = self.controller.reset(hidden_states.shape[0], hidden_states.device)
         core_start = self.config.n_layers_in_prelude
         steps_run = 0
+        max_steps = int(self.config.mean_recurrence)
 
-        for recurrent_step in range(self.config.mean_recurrence):
+        for recurrent_step in range(max_steps):
             prev = hidden_states  # start-of-step state (not mutated in place)
 
             # Inject embeddings, then run the weight-tied core block. Each core
@@ -153,11 +164,18 @@ class AdaptiveRavenModel(RavenModel):
             if not active.any():
                 break  # all tokens converged; skip remaining recurrence
 
-        # Diagnostics for demos / A/B (flattened [T]; mirrors HF adapter fields).
+        # Diagnostics for demos, benchmarks, etc. (flattened [T]; mirrors HF adapter fields).
         self.last_exit_iteration = self.controller.exit_iteration
         self.last_nonconverging = self.controller.nonconverging
         self.last_active = self.controller.active
         self.last_recurrence_steps_run = steps_run
+        exits = self.controller.exit_iteration
+        if exits is not None:
+            depths = exits.to(dtype=torch.long).clone()
+            never = depths < 0
+            depths = depths + 1
+            depths[never] = max_steps
+            self._exit_depth_samples.append(float(depths.float().mean().item()))
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -187,3 +205,9 @@ class AdaptiveRavenForvLLM(RavenForvLLM):
                 quant_config=vllm_config.quant_config,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, config.vocab_size, 1.0)
+
+    def reset_exit_depth_samples(self) -> None:
+        self.model.reset_exit_depth_samples()
+
+    def pop_exit_depth_samples(self) -> list[float]:
+        return self.model.pop_exit_depth_samples()

@@ -21,6 +21,7 @@ class HookLLM:
         enable_hook: bool = True,
         hook_dir: str = None,
         enforce_eager: bool = True,
+        recurrent_depth: dict = None,
         **vllm_kwargs
     ):
 
@@ -42,6 +43,7 @@ class HookLLM:
         self._hookq_mode = "all_tokens"  # default; overridable in config
         self._hs_mode = "last_token"     # default; overridable in config
         self._steering_config: Optional[Dict] = None  # set by load_config for steer worker
+        self._recurrent_depth_config: Optional[Dict] = None  # set by load_config for recurrent depth
         if config_file:
             self.load_config(config_file)
 
@@ -56,6 +58,20 @@ class HookLLM:
             import vllm.plugins
             vllm.plugins.load_general_plugins()
             worker = PluginRegistry.get_worker(worker_name).path
+
+        # Handle user-provided recurrent depth configurations and config file fallback
+        user_params = dict(recurrent_depth or {})
+        arch = user_params.pop("architectures", None)
+        recurrent_config_default = self._recurrent_depth_config or {}
+        # Merge user-provided parameters with default parameters from config file
+        recurrent_depth_params = {**recurrent_config_default, **user_params}
+        hf_overrides = dict(vllm_kwargs.get("hf_overrides", {}))
+
+        # Supported recurrent-depth architecture must be passed (additional settings not necessary for model loading)
+        if arch is not None:
+            hf_overrides.setdefault("architectures", arch if isinstance(arch, list) else [arch])
+            hf_overrides.setdefault("recurrent_depth", recurrent_depth_params)
+            vllm_kwargs["hf_overrides"] = hf_overrides
 
         self.llm = LLM(
             model=model,
@@ -93,6 +109,9 @@ class HookLLM:
             # vector_path is taken as-is from the config (legacy: usually relative
             # to the project root / current working directory).
             self._steering_config = dict(config_data["steering"])
+
+        if "recurrent_depth" in config_data:
+            self._recurrent_depth_config = dict(config_data["recurrent_depth"])
 
         if "hidden_states" in config_data:
             hs_cfg = config_data["hidden_states"]
