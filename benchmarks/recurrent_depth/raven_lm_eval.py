@@ -40,13 +40,10 @@ if str(_PLUGINS) not in sys.path:
 import torch
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
-try:
-    from lm_eval.models.utils_hf import get_dtype
-except ImportError:  # older lm_eval
-    from lm_eval.models.utils import get_dtype
+from lm_eval.models.utils_hf import get_dtype
 
 from model_adapters.hf import AdaptiveRavenForCausalLM, RavenAdapterConfig
-from vllm_hook_plugins.protocols.recurrent_depth import attach_recurrent_depth
+from vllm_hook_plugins.protocols.recurrent_depth import attach_recurrent_depth  # pyright: ignore[reportMissingImports]
 
 eval_logger = logging.getLogger(__name__)
 

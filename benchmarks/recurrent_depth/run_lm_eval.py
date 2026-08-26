@@ -24,12 +24,15 @@ Both arms in one invocation (fixed grid + rho grid)::
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import lm_eval
+import torch
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
@@ -170,39 +173,63 @@ def _build_lm(args: argparse.Namespace, cfg: Dict[str, Any]):
 
 
 def run_one(args: argparse.Namespace, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    import lm_eval
 
     lm = _build_lm(args, cfg)
-    lm.reset_exit_stats()
+    try:
+        lm.reset_exit_stats()
 
-    results = lm_eval.simple_evaluate(
-        model=lm,
-        tasks=_task_list(args.tasks),
-        num_fewshot=args.num_fewshot,
-        batch_size=args.batch_size,
-        limit=args.limit,
-        random_seed=args.seed,
-        numpy_random_seed=args.seed,
-        torch_random_seed=args.seed,
-        log_samples=args.log_samples,
-    )
+        results = lm_eval.simple_evaluate(
+            model=lm,
+            tasks=_task_list(args.tasks),
+            num_fewshot=args.num_fewshot,
+            batch_size=args.batch_size,
+            limit=args.limit,
+            random_seed=args.seed,
+            numpy_random_seed=args.seed,
+            torch_random_seed=args.seed,
+            log_samples=args.log_samples,
+        )
 
-    payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "backend": args.backend,
-        "model": args.model,
-        "tasks": _task_list(args.tasks),
-        "num_fewshot": args.num_fewshot,
-        "limit": args.limit,
-        "seed": args.seed,
-        "config": cfg,
-        "exit_stats": lm.exit_stats(),
-        "results": results.get("results") if isinstance(results, dict) else results,
-        "n-shot": results.get("n-shot") if isinstance(results, dict) else None,
-    }
-    if args.log_samples and isinstance(results, dict) and "samples" in results:
-        payload["samples"] = results["samples"]
-    return payload
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "backend": args.backend,
+            "model": args.model,
+            "tasks": _task_list(args.tasks),
+            "num_fewshot": args.num_fewshot,
+            "limit": args.limit,
+            "seed": args.seed,
+            "config": cfg,
+            "exit_stats": lm.exit_stats(),
+            "results": results.get("results") if isinstance(results, dict) else results,
+            "n-shot": results.get("n-shot") if isinstance(results, dict) else None,
+        }
+        if args.log_samples and isinstance(results, dict) and "samples" in results:
+            payload["samples"] = results["samples"]
+
+        return payload
+
+    finally:
+        # Memory freeing and vLLM core engine shutdown
+        model = getattr(lm, "model", None)
+        engine = getattr(model, "llm_engine", None)
+        if engine is not None:
+            if hasattr(engine, "reset_prefix_cache"):
+                try:
+                    engine.reset_prefix_cache()
+                except Exception:
+                    pass
+            core = getattr(engine, "engine_core", None)
+            if core is not None and hasattr(core, "shutdown"):
+                try:
+                    core.shutdown()
+                except Exception:
+                    pass
+
+        # Explicit garbage collection
+        del lm
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main() -> None:

@@ -44,8 +44,9 @@ from torch import nn
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
-
-from vllm_hook_plugins.protocols.recurrent_step_controller import RecurrentStepController
+from vllm.forward_context import get_forward_context
+from vllm_hook_plugins.workers._common import get_query_metadata  # pyright: ignore[reportMissingImports]
+from vllm_hook_plugins.protocols.recurrent_step_controller import RecurrentStepController  # pyright: ignore[reportMissingImports]
 
 from .original_raven_vllm import RavenDecoderLayer, RavenForvLLM, RavenModel
 
@@ -110,6 +111,24 @@ class AdaptiveRavenModel(RavenModel):
         out = list(self._exit_depth_samples)
         self._exit_depth_samples.clear()
         return out
+    
+    @staticmethod
+    def _get_allow_exit(num_tokens: torch.Tensor, device = torch.device) -> torch.Tensor:
+
+        allow_exit = torch.ones(num_tokens.shape[0], dtype=torch.bool, device=num_tokens.device)
+        attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+        if attn_metadata is None:
+            return allow_exit
+
+        qsl, seq_lens = get_query_metadata(attn_metadata)
+        if qsl is None:
+            return allow_exit
+
+        qsl = qsl.to(device)
+        for i in range(len(qsl) - 1):
+            if seq_lens[i] > 1: 
+                allow_exit[int(qsl[i]):int(qsl[i + 1])] = False
+        return allow_exit
 
     def forward(
         self,
@@ -126,7 +145,7 @@ class AdaptiveRavenModel(RavenModel):
         if self.embed_scale != 1.0:
             input_embeds = input_embeds * self.embed_scale
 
-        freqs_cis = self.freqs_cis.index_select(0, positions)
+        freqs_cis = self.freqs_cis.index_select(0, positions)  # type: ignore
 
         # Prelude (non-recurrent).
         for i in range(self.config.n_layers_in_prelude):
@@ -134,7 +153,10 @@ class AdaptiveRavenModel(RavenModel):
 
         # Recurrent state + per-token exit bookkeeping.
         hidden_states = self.initialize_state(input_embeds)
-        active = self.controller.reset(hidden_states.shape[0], hidden_states.device)
+        num_tokens = hidden_states.shape[0]
+        active = self.controller.reset(num_tokens, hidden_states.device)
+        allow_exit = _get_allow_exit(num_tokens, hidden_states.device)  # pyright: ignore[reportArgumentType]
+        
         core_start = self.config.n_layers_in_prelude
         steps_run = 0
         max_steps = int(self.config.mean_recurrence)
@@ -157,6 +179,8 @@ class AdaptiveRavenModel(RavenModel):
 
             # vLLM-Hook protocol call at the end of the step.
             decision = self.controller.step(h, prev, recurrent_step)
+            # Only allow exit for tokens during decode
+            decision.exit_mask &= allow_exit.unsqueeze(1)
             hidden_states = self.controller.steer(h, decision)  # no-op in Stage 1
             active = self.controller.apply(decision, recurrent_step)
             steps_run = recurrent_step + 1
