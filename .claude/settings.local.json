@@ -18,7 +18,29 @@
       "Bash(.venv/bin/python *)",
       "Bash(/tmp/vllm_hook_iso/bin/python -c ' *)",
       "Read(//private/tmp/**)",
-      "Bash(/tmp/vllm_hook_iso/bin/python -m pytest /Users/erikmiehling/code/vLLM-Hook/tests/core /Users/erikmiehling/code/vLLM-Hook/tests/workers -q)"
+      "Bash(/tmp/vllm_hook_iso/bin/python -m pytest /Users/erikmiehling/code/vLLM-Hook/tests/core /Users/erikmiehling/code/vLLM-Hook/tests/workers -q)",
+      "Bash(python -m pytest tests/serve/test_discovery_registration.py -q)",
+      "Bash(python *)",
+      "Bash(git add *)",
+      "Bash(git commit --amend -m 'Remove from __future__ import annotations since it turns the annotation into the string Request and FastAPI resolves string annotations against the handler'\\\\''s module globals where Request doesn'\\\\''t exist. This means that the parameter gets demoted to a required query field and every bare GET fails validation before reaching the handler *)",
+      "Bash(git apply *)",
+      "Bash(git commit *)",
+      "Bash(git fetch *)",
+      "Bash(git *)",
+      "Bash(gh repo *)",
+      "Read(//tmp/**)",
+      "Bash(awk '{print $4}')",
+      "Bash(awk '/^changed in both/,0' /tmp/mt_out.txt)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(python3 -m py_compile vllm_hook_plugins/vllm_hook_plugins/__init__.py)",
+      "Bash(GIT_EDITOR=true git rebase --continue)",
+      "Bash(cp .claude/settings.local.json /tmp/settings.local.json.backup)",
+      "Bash(rm .claude/settings.local.json)",
+      "Bash(PYTHONDONTWRITEBYTECODE=1 python3 *)",
+      "Bash([ -f \"$obj\" ])",
+      "Bash(rm .git/objects/21/cfbd578093d6a37c37e9c7c9462c5acc355e71)",
+      "Bash(sort -k2)",
+      "Bash(awk '{print $1, $2}')"
     ]
   }
 }
