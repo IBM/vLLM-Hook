@@ -1,8 +1,9 @@
 # tests/workers/test_positions.py
 """Pass-view construction against faked engine structures: chunked
-prefill, mixed batches, restart reset, post-stop pass idempotence, and
-the scope truth tables on real views.
+prefill, mixed batches, restart reset, post-stop pass idempotence, the
+runner-surface check, and the scope truth tables on real views.
 """
+import pytest
 import torch
 
 from vllm_hook_plugins.core.interpreter.scopes import scope_rows
@@ -11,6 +12,7 @@ from vllm_hook_plugins.workers.positions import (
     PositionTracker,
     RequestPassView,
     build_pass_views,
+    require_runner_surface,
 )
 
 
@@ -28,8 +30,21 @@ class FakeInputBatch:
 
 
 class FakeModelRunner:
+    """Legacy-runner shape: persistent input_batch plus a requests dict."""
+
     def __init__(self, input_batch):
         self.input_batch = input_batch
+        self.requests = {}
+
+
+class FakeV2ModelRunner:
+    """V2-runner shape: per-request state lives in req_states/input_buffers
+    and the per-step batch is not a runner attribute.
+    """
+
+    def __init__(self):
+        self.req_states = object()
+        self.input_buffers = object()
 
 
 def _pass(tracker, req_specs):
@@ -145,13 +160,49 @@ def test_drop_forgets_request():
     assert not view.is_restart
 
 
-def test_missing_input_batch_fields_yield_no_views():
+# ---------------------------------------------------------------------------
+# Runner surface: a missing row mapping is a hard error, never an empty pass
+# ---------------------------------------------------------------------------
+
+
+def test_missing_input_batch_raises_naming_the_runner_constraint():
     tracker = PositionTracker()
+    with pytest.raises(RuntimeError) as info:
+        build_pass_views(FakeV2ModelRunner(), FakeMetadata([0, 4]), tracker)
+    message = str(info.value)
+    assert "legacy GPU model runner" in message
+    assert "VLLM_USE_V2_MODEL_RUNNER=0" in message
+    # nothing was cached for the failed pass
+    assert tracker.pass_key is None
 
-    class BareRunner:
-        pass
 
-    assert build_pass_views(BareRunner(), FakeMetadata([0, 4]), tracker) == []
+def test_warmup_pass_stays_silent_even_without_the_surface():
+    # No query_start_loc means no rows to map; that early return must not
+    # be conflated with the missing-surface error.
+    assert build_pass_views(FakeV2ModelRunner(), {}, PositionTracker()) == []
+
+
+def test_require_runner_surface_accepts_legacy_shape():
+    require_runner_surface(FakeModelRunner(FakeInputBatch(["a"], [0], [4])))
+
+
+def test_require_runner_surface_rejects_v2_shape():
+    with pytest.raises(RuntimeError, match="FakeV2ModelRunner has no input_batch, requests"):
+        require_runner_surface(FakeV2ModelRunner())
+
+
+def test_require_runner_surface_names_partial_fields():
+    class HalfBatch:
+        req_ids = []
+
+    class Runner:
+        input_batch = HalfBatch()
+        requests = {}
+
+    with pytest.raises(
+        RuntimeError, match="has no input_batch.num_computed_tokens_cpu, input_batch.num_prompt_tokens;"
+    ):
+        require_runner_surface(Runner())
 
 
 # ---------------------------------------------------------------------------

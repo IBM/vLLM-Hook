@@ -25,4 +25,4 @@ jobs:
       - name: Import engine-free core
         run: python -c "import vllm_hook_plugins.core"
       - name: Run engine-free test suites
-        run: python -m pytest tests/core tests/workers -q
+        run: python -m pytest tests/core tests/workers tests/plugin -q

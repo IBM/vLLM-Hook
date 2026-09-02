@@ -74,6 +74,10 @@ pip install -r requirement.txt
 pip install -e vllm_hook_plugins
 ```
 
+The bare package is engine-free; `pip install -e "vllm_hook_plugins[engine]"` pulls in a supported vLLM (`>=0.26,<1.0`).
+
+> **Model runner.** The workers read vLLM's legacy GPU model runner internals (`model_runner.input_batch` / `requests`), which the V2 runner that vLLM 0.28+ selects by default does not expose. Whenever one of the plugin's workers is active — offline `LLM` and `vllm serve` alike — the plugin sets `VLLM_USE_V2_MODEL_RUNNER=0` before the engine config is built, unless the variable is already set. An explicit `VLLM_USE_V2_MODEL_RUNNER=1` is respected; the unified worker then fails the first steered request with a `RuntimeError` naming this constraint rather than running it unsteered.
+
 ---
 
 ## 📕 Notebook Setup 

@@ -5,9 +5,13 @@ passed in ``SamplingParams.extra_args``.
 
 Installed automatically via the ``vllm.general_plugins`` entry point
 (configured in setup.py). Patches ``EngineArgs.create_engine_config``
-to inject the worker extension and eager mode, and patches
-``AsyncLLM.generate`` and ``LLM.generate`` to retrieve per-request probe
-outputs for both online (async) and offline (sync) usage.
+to inject the worker extension, eager mode, and the legacy GPU model
+runner (every worker here reads ``model_runner.input_batch`` /
+``requests``, which vLLM's V2 runner — the default for common
+architectures since 0.28 — does not expose; see
+``_pin_legacy_model_runner``), and patches ``AsyncLLM.generate`` and
+``LLM.generate`` to retrieve per-request probe outputs for both online
+(async) and offline (sync) usage.
 
 For ``vllm serve``, also patches the OpenAI response builders so probe
 outputs are included in HTTP responses as ``response.probes``.
@@ -23,11 +27,15 @@ GET /v1/hook/capabilities is registered on the serving app.
 
 from __future__ import annotations
 
+import logging
+import os
 import pickle
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import zstandard as zstd
+
+logger = logging.getLogger("vllm_hook.plugin")
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -50,6 +58,15 @@ _WORKER_NAMES = {
     _WORKER_EXT_STEER: "steer",
     _WORKER_EXT_UNIFIED: "unified",
 }
+
+# Every worker_extension_cls this package provides lives under this prefix
+# (the env-selected workers above and the ones HookLLM resolves through
+# PluginRegistry); all of them read the legacy model runner's surface.
+_PLUGIN_WORKER_PREFIX = "vllm_hook_plugins."
+
+# vLLM's switch between its legacy (V1) and V2 GPU model runners. Unset
+# means "vLLM decides", which since 0.28 is V2 for common architectures.
+_V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 # Engine facts stashed at create_engine_config time; read by admission (the
 # cache-salt rule needs prefix_caching) and by discovery.
@@ -101,11 +118,47 @@ def _trim_probes(probes: dict, key: str, expected_len: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _pin_legacy_model_runner(worker_extension_cls: str) -> None:
+    """Select vLLM's legacy GPU model runner for a plugin worker.
+
+    The workers map batch rows to requests through
+    ``model_runner.input_batch`` / ``model_runner.requests``, which only
+    the legacy runner exposes. ``VllmConfig.use_v2_model_runner`` is a
+    read-only property that reads ``VLLM_USE_V2_MODEL_RUNNER`` live and is
+    consulted while the config is being built, so the variable must be in
+    the environment before the original ``create_engine_config`` runs;
+    the engine core and workers are spawned afterwards and inherit it.
+    This covers ``vllm serve`` — a process the operator launches and the
+    steerability toolkit cannot reach — as well as offline ``LLM``.
+
+    An explicit operator value is respected. When it selects V2, the
+    unified worker's ``install_hooks`` raises at the first steered
+    request naming this constraint rather than completing it unsteered.
+    """
+    if not (worker_extension_cls or "").startswith(_PLUGIN_WORKER_PREFIX):
+        return
+    explicit = os.environ.get(_V2_MODEL_RUNNER_ENV)
+    if explicit is None:
+        os.environ[_V2_MODEL_RUNNER_ENV] = "0"
+        logger.info(
+            "%s=0: vLLM-Hook worker %s requires the legacy GPU model runner",
+            _V2_MODEL_RUNNER_ENV, worker_extension_cls,
+        )
+    elif explicit.strip() != "0":
+        logger.warning(
+            "%s=%s was set explicitly; vLLM-Hook workers require the legacy GPU "
+            "model runner, and the unified worker fails at the first steered "
+            "request if the V2 runner is active",
+            _V2_MODEL_RUNNER_ENV, explicit,
+        )
+
+
 def _patched_create_engine_config(self, *args, **kwargs):
-    """Inject worker extension and force eager mode before VllmConfig is built."""
+    """Inject worker extension, eager mode, and the legacy model runner
+    before VllmConfig is built.
+    """
     if not self.worker_extension_cls:
         # Default to hidden states worker; users can override via env var.
-        import os
         worker_type = os.environ.get("VLLM_HOOK_WORKER", "hidden_states")
         if worker_type == "qk":
             self.worker_extension_cls = _WORKER_EXT_QK
@@ -116,6 +169,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
         else:
             self.worker_extension_cls = _WORKER_EXT_HS
     self.enforce_eager = True
+    _pin_legacy_model_runner(self.worker_extension_cls)
 
     assert _original_create_engine_config is not None
     config = _original_create_engine_config(self, *args, **kwargs)
@@ -473,8 +527,6 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
                 self.collective_rpc("clear_request", args=(req_id,))
 
     if needs_hooks:
-        import os
-
         # First pass: handle RPC (in-memory) requests immediately, and collect
         # disk-save requests grouped by run_id so all requests sharing the same
         # run_id are flushed together — preventing the second flush from
