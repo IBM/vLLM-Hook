@@ -6,15 +6,55 @@ Built from ``ForwardContext.attn_metadata`` (``get_query_metadata`` in
 ``_common`` handles the hybrid-model dict walk) plus
 ``input_batch.num_computed_tokens_cpu`` / ``num_prompt_tokens``, and
 cached by ``id(attn_metadata)`` — one build per forward step.
+
+The row-to-request mapping is read from vLLM's legacy GPU model runner
+(``model_runner.input_batch`` and ``model_runner.requests``). The V2
+runner, vLLM's default for common architectures since 0.28, exposes
+neither; ``require_runner_surface`` checks for the legacy surface once at
+hook-install time and ``build_pass_views`` raises rather than returning an
+empty view list when it is missing, so a mapping failure can never turn
+every hook into a silent identity.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 from vllm_hook_plugins.workers._common import get_query_metadata
 
-logger = logging.getLogger("vllm_hook.positions")
+# Fields of the legacy runner's persistent ``InputBatch`` consumed below.
+INPUT_BATCH_FIELDS = ("req_ids", "num_computed_tokens_cpu", "num_prompt_tokens")
+
+# Names the cause and the fix; appended to every runner-surface error.
+RUNNER_CONSTRAINT = (
+    "the vLLM-Hook unified worker requires vLLM's legacy GPU model runner: "
+    "it maps batch rows to requests through model_runner.input_batch and "
+    "model_runner.requests, which the V2 model runner does not expose. The "
+    "plugin sets VLLM_USE_V2_MODEL_RUNNER=0 when one of its workers is "
+    "selected, so reaching this error means an explicit "
+    "VLLM_USE_V2_MODEL_RUNNER override forced the V2 runner back on; unset "
+    "it (or set VLLM_USE_V2_MODEL_RUNNER=0) and restart the engine."
+)
+
+
+def require_runner_surface(model_runner) -> None:
+    """Raise ``RuntimeError`` unless ``model_runner`` exposes the legacy
+    row-mapping surface. Called once at hook-install time so an
+    unsupported runner fails the first steered request loudly instead of
+    completing it unsteered.
+    """
+    input_batch = getattr(model_runner, "input_batch", None)
+    if input_batch is None:
+        missing = ["input_batch"]
+    else:
+        missing = [
+            f"input_batch.{field}" for field in INPUT_BATCH_FIELDS if not hasattr(input_batch, field)
+        ]
+    if not hasattr(model_runner, "requests"):
+        missing.append("requests")
+    if missing:
+        raise RuntimeError(
+            f"{type(model_runner).__name__} has no {', '.join(missing)}; {RUNNER_CONSTRAINT}"
+        )
 
 
 @dataclass(frozen=True)
@@ -67,7 +107,8 @@ class PositionTracker:
 
 def build_pass_views(model_runner, attn_metadata, tracker: PositionTracker) -> list:
     """One view per request in this pass. Returns [] on warmup passes
-    (no ``query_start_loc``).
+    (no ``query_start_loc``); raises ``RuntimeError`` when the runner
+    lacks the row-mapping surface (see ``require_runner_surface``).
     """
     cache_key = id(attn_metadata)
     if tracker._views_key == cache_key and tracker._views_obj is attn_metadata:
@@ -83,8 +124,10 @@ def build_pass_views(model_runner, attn_metadata, tracker: PositionTracker) -> l
         num_computed = input_batch.num_computed_tokens_cpu
         num_prompt = input_batch.num_prompt_tokens
     except AttributeError as exc:
-        logger.warning("cannot build pass views; input_batch is missing %s", exc)
-        return []
+        # Unreachable once the worker ran require_runner_surface at install
+        # time; kept as a safety net that fails the pass rather than
+        # degrading every hook to an identity for it.
+        raise RuntimeError(f"cannot map batch rows to requests ({exc}); {RUNNER_CONSTRAINT}") from exc
 
     views = []
     num_reqs = min(len(query_start_loc) - 1, len(req_ids))

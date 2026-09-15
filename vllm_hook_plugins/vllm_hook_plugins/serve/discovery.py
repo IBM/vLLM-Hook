@@ -69,17 +69,21 @@ def _add_capabilities_route(app) -> None:
         global _capabilities_cache
         if _capabilities_cache is None:
             engine_client = raw_request.app.state.engine_client
+            detail = None
             try:
                 results = await engine_client.collective_rpc("hook_capabilities")
-            except Exception:
-                # Legacy workers have no hook_capabilities RPC method.
+            except Exception as exc:
+                # Legacy workers have no hook_capabilities RPC method; the
+                # unified worker raises here when its hooks cannot install
+                # (e.g. the V2 model runner is active), so keep the cause.
                 results = None
+                detail = str(exc)
             payload = next((r for r in results or () if r is not None), None)
             if payload is None:
-                return JSONResponse(
-                    {"error": "hook capabilities unavailable; is VLLM_HOOK_WORKER=unified set?"},
-                    status_code=503,
-                )
+                body = {"error": "hook capabilities unavailable; is VLLM_HOOK_WORKER=unified set?"}
+                if detail:
+                    body["detail"] = detail
+                return JSONResponse(body, status_code=503)
             _capabilities_cache = payload
         return JSONResponse(_capabilities_cache)
 

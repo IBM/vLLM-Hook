@@ -9,9 +9,9 @@ from typing import Literal
 import pytest
 
 # vLLM is only needed by tests/use_cases, tests/engine, and tests/serve;
-# their own conftests skip collection when it is absent. tests/core and
-# tests/workers run on the bare package (the CI isolation job relies on
-# this).
+# their own conftests skip collection when it is absent. tests/core,
+# tests/workers, and tests/plugin run on the bare package (the CI
+# isolation job relies on this).
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"

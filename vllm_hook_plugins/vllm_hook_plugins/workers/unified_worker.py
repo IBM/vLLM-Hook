@@ -8,6 +8,13 @@ remains ``hidden_states``. Legacy extra_args keys are not served here.
 Layer indices on this surface are the 0-based decoder-layer indices in
 model order (``model.layers.N`` is layer N), unlike the legacy
 ``output_hidden_states`` path which exposes 1-based numbers.
+
+The hooks map batch rows to requests through the legacy GPU model
+runner's ``input_batch`` / ``requests`` surface. The plugin pins that
+runner (``VLLM_USE_V2_MODEL_RUNNER=0``) when this worker is selected;
+``install_hooks`` verifies the surface once and raises when it is
+missing, so an operator override to the V2 runner fails the first
+steered request with the cause instead of completing it unsteered.
 """
 from __future__ import annotations
 
@@ -58,7 +65,11 @@ from vllm_hook_plugins.workers._common import (
     match_o_proj,
     save_safetensors_atomic,
 )
-from vllm_hook_plugins.workers.positions import PositionTracker, build_pass_views
+from vllm_hook_plugins.workers.positions import (
+    PositionTracker,
+    build_pass_views,
+    require_runner_surface,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ParallelConfig
@@ -182,17 +193,26 @@ class UnifiedHookWorker:
 
     def install_hooks(self):
         """Install layer hooks (and o_proj pre-hooks when TP==1).
-        Idempotent; called lazily by the plugin on first new-surface
-        request.
+        Idempotent once installed; called lazily by the plugin on the
+        first new-surface request.
+
+        Failures propagate — notably the ``RuntimeError`` raised when the
+        active model runner is not the legacy runner these hooks read —
+        so the caller's ``collective_rpc("install_hooks")`` fails with the
+        cause. A failed install leaves nothing behind and is retried (and
+        re-raises) on the next call rather than being remembered as done.
         """
         if self._hooks_installed:
             return
-        self._hooks_installed = True
         try:
             self._install_hooks()
-            logger.info("unified hooks installed")
-        except Exception as exc:
-            logger.exception("unified hook installation failed: %s", exc)
+        except Exception:
+            for handle in getattr(self, "_hooks", ()):
+                handle.remove()
+            self._hooks = []
+            raise
+        self._hooks_installed = True
+        logger.info("unified hooks installed")
 
     def prepare_requests(self, specs: dict) -> dict:
         """Validate and stage per-request state before scheduling.
@@ -622,8 +642,12 @@ class UnifiedHookWorker:
 
         model = getattr(self.model_runner, "model", None)
         if model is None:
-            logger.warning("no model; skip hooks")
-            return
+            raise RuntimeError(
+                f"{type(self.model_runner).__name__} has no loaded model; cannot install unified hooks"
+            )
+        # Fail here, once, rather than letting every hook find no rows to
+        # map and silently pass the batch through unsteered.
+        require_runner_surface(self.model_runner)
 
         cfg = model.config
         # Multimodal models (e.g. Qwen3.5) nest text config under text_config.
@@ -670,7 +694,10 @@ class UnifiedHookWorker:
 
     def _pass_views(self):
         """Views for the current forward pass, or [] when hooks should be
-        inert (warmup, CUDA-graph capture, no staged work possible).
+        inert (warmup, CUDA-graph capture, no staged work possible). A
+        runner without the row-mapping surface raises from
+        ``build_pass_views``; ``install_hooks`` checks for it up front so
+        that path is a backstop.
         """
         ctx = get_forward_context()
         metadata = getattr(ctx, "attn_metadata", None)
