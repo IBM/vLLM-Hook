@@ -71,10 +71,16 @@ def test_activation_steer_worker_lifecycle_cpu(tmp_path, monkeypatch):
     vector = torch.tensor([1.0, -2.0, 3.0, -4.0])
     torch.save({"dir": vector, "avg_proj": torch.tensor(0.0)}, vector_path)
 
+    class TupleLayer(torch.nn.Module):
+        """Production-shaped decoder layer: returns (hidden_states, residual)."""
+
+        def forward(self, hidden_states, residual):
+            return hidden_states, residual
+
     model = torch.nn.Module()
     model.model = torch.nn.Module()
     model.model.decoder = torch.nn.Module()
-    model.model.decoder.layers = torch.nn.ModuleList([torch.nn.Identity()])
+    model.model.decoder.layers = torch.nn.ModuleList([TupleLayer()])
     on = _steer_extra(vector_path, 2.0, layer=0)
     runner = SimpleNamespace(
         model=model,
@@ -91,22 +97,36 @@ def test_activation_steer_worker_lifecycle_cpu(tmp_path, monkeypatch):
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=metadata),
     )
-    prefill = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-    expected = prefill.clone()
-    expected[2] += 2 * vector
-    assert torch.equal(model.model.decoder.layers[0](prefill.clone()), expected)
+    def run_layer(hidden, residual):
+        return model.model.decoder.layers[0](hidden, residual.clone())
 
+    # prefill: steering writes the request's last residual row; hidden unchanged
+    hidden = -torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    residual = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    expected_residual = residual.clone()
+    expected_residual[2] += 2 * vector
+    out_hidden, out_residual = run_layer(hidden, residual)
+    assert torch.equal(out_hidden, hidden)
+    assert torch.equal(out_residual, expected_residual)
+
+    # decode: steering writes the single decode row the same way
     runner.requests["on"].output_token_ids = [7]
     metadata.query_start_loc = torch.tensor([0, 1, 2])
-    decode = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    expected = decode.clone()
-    expected[0] += 2 * vector
-    assert torch.equal(model.model.decoder.layers[0](decode.clone()), expected)
+    hidden = -torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    residual = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    expected_residual = residual.clone()
+    expected_residual[0] += 2 * vector
+    out_hidden, out_residual = run_layer(hidden, residual)
+    assert torch.equal(out_hidden, hidden)
+    assert torch.equal(out_residual, expected_residual)
 
+    # apply_at_all_positions=False: decode is a no-op on both components
     runner.requests["on"] = _request(
         {"steer": {**on["steer"], "apply_at_all_positions": False}}, [7]
     )
-    assert torch.equal(model.model.decoder.layers[0](decode.clone()), decode)
+    out_hidden, out_residual = run_layer(hidden, residual)
+    assert torch.equal(out_hidden, hidden)
+    assert torch.equal(out_residual, residual)
 
 
 COHERENCE_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -163,8 +183,8 @@ ANSWER_VARIANTS = (
 def _answer_token_families(tokenizer):
     """[[true ids...], [false ids...]] — last token per variant encoding, deduped.
 
-    Whitespace/case variants plus 1/0 capture the full answer mass; boundary
-    diagnostics are recorded separately and never narrow the family.
+    Whitespace/case variants plus 1/0 capture the full answer mass; the family
+    is never narrowed.
     """
     families = [
         list(dict.fromkeys(
@@ -175,22 +195,6 @@ def _answer_token_families(tokenizer):
     overlap = set(families[0]) & set(families[1])
     assert not overlap, f"answer token families overlap: {sorted(overlap)}"
     return families
-
-
-def _family_boundary_diagnostics(tokenizer, prompt):
-    """Per-variant record: does prompt+variant tokenize as prompt IDs + [id]?
-    Diagnostic evidence only; never narrows the family."""
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    rows = []
-    for family, words in ANSWER_VARIANTS:
-        for word in words:
-            token_id = tokenizer.encode(word, add_special_tokens=False)[-1]
-            extended = tokenizer.encode(prompt + word, add_special_tokens=False)
-            rows.append({
-                "family": family, "variant": word, "token_id": token_id,
-                "continues_as_single_token": extended == prompt_ids + [token_id],
-            })
-    return rows
 
 
 def _answer_logprobs(full_logprobs, families):
@@ -340,25 +344,6 @@ def test_answer_token_family_cpu_controls():
     with pytest.raises(AssertionError, match="omitted answer IDs"):
         _answer_logprobs({10: 0.0}, families)
 
-    # boundary diagnostics record tokenizer merges; the family is never filtered
-    class ConcatTokenizer:
-        # longest-match; "<p>true" merges to one id, "<p> true" does not
-        vocab = {**TOY_VOCAB, "<p>true": 99, "<p>": 1}
-
-        def encode(self, text, add_special_tokens=False):
-            ids = []
-            while text:
-                word = max((w for w in self.vocab if text.startswith(w)), key=len)
-                ids.append(self.vocab[word])
-                text = text[len(word):]
-            return ids
-
-    rows = _family_boundary_diagnostics(ConcatTokenizer(), "<p>")
-    by_variant = {row["variant"]: row for row in rows}
-    assert len(rows) == 16
-    assert by_variant["true"]["continues_as_single_token"] is False
-    assert by_variant[" true"]["continues_as_single_token"] is True
-
 
 def test_leading_object_json_and_cap_cpu_controls():
     assert _away_logratio(2.0, True) == -2.0
@@ -503,11 +488,6 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         "effect_metric": "boolean_family_logratio_away_from_sycophancy",
         "answer_contract": "ans=true or ans=false",
         "answer_token_families": answer_families,
-        "family_boundary_diagnostics": {
-            f"{s['fact']}_{s['condition']}": _family_boundary_diagnostics(
-                tokenizer, _chat_prefill(tokenizer, s["text"]))
-            for s in probe_specs
-        },
         "probes": probe_specs,
         "ducks_prompt": DUCKS_PROMPT,
     }
