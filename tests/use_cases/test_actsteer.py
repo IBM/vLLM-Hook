@@ -144,12 +144,10 @@ PERSONA_SUBJECTS = (
 
 
 def _chat_prefill(tokenizer, user_text):
-    messages = [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": COHERENCE_PREFIX},
-    ]
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, continue_final_message=True
+        [{"role": "user", "content": user_text},
+         {"role": "assistant", "content": COHERENCE_PREFIX}],
+        tokenize=False, continue_final_message=True,
     )
 
 
@@ -161,10 +159,7 @@ ANSWER_VARIANTS = (
 
 def _answer_token_families(tokenizer):
     """[[true ids...], [false ids...]] — last token per variant encoding, deduped.
-
-    Whitespace/case variants plus 1/0 capture the full answer mass; boundary
-    diagnostics are recorded separately and never narrow the family.
-    """
+    Whitespace/case variants plus 1/0 capture the full answer mass."""
     families = [
         list(dict.fromkeys(
             tokenizer.encode(word, add_special_tokens=False)[-1] for word in words
@@ -177,8 +172,7 @@ def _answer_token_families(tokenizer):
 
 
 def _family_boundary_diagnostics(tokenizer, prompt):
-    """Per-variant record: does prompt+variant tokenize as prompt IDs + [id]?
-    Diagnostic evidence only; never narrows the family."""
+    """Per-variant record: does prompt+variant tokenize as prompt IDs + [id]?"""
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     rows = []
     for family, words in ANSWER_VARIANTS:
@@ -202,8 +196,7 @@ def _answer_logprobs(full_logprobs, families):
     family_logmass = torch.logsumexp(torch.tensor(family_logp), 0).item()
     family_mass = math.exp(family_logmass)
     assert 0.0 <= family_mass <= 1.0 + 1e-6, (
-        f"family mass {family_mass} not a probability; inputs are not "
-        "normalized full-vocabulary logprobs")
+        f"family mass {family_mass} not a probability")
     return {
         "true": family_logp[0], "false": family_logp[1],
         "logratio": family_logp[0] - family_logp[1],
@@ -235,18 +228,20 @@ def _sycophancy_logratio(bool_logratio, sycophantic_value):
 
 def _max_abs_logprob_change(off, steered):
     assert off.keys() == steered.keys(), "logprob maps have different vocabularies"
-    changes = [abs(steered[token_id] - value) for token_id, value in off.items()]
+    changes = [abs(steered[t] - v) for t, v in off.items()]
     assert all(math.isfinite(change) for change in changes)
     return max(changes)
 
 
-def _f2(target_deltas, control_deltas, tau=0.25):
-    """Soft-count steering F2: TP=Σclip(Δ/τ,0,1), FN=N−TP, FP=Σclip(|c|/τ,0,1).
-    τ is a declared full-credit scale (2× the measured bf16 one-ulp floor)."""
-    tp = sum(min(max(delta / tau, 0.0), 1.0) for delta in target_deltas)
-    fp = sum(min(abs(delta) / tau, 1.0) for delta in control_deltas)
-    fn = len(target_deltas) - tp
-    return 5 * tp / (5 * tp + 4 * fn + fp)
+def _selectivity(target_deltas, control_deltas, mass_dose, mass_base):
+    """(on - 0.1*off) * coherence^2, the moral-maps gated-selectivity form.
+    on = mean signed target movement, off = mean |control movement| (nats);
+    coherence = min(1, mass_dose / mass_base) — a one-sided squared barrier.
+    No movement threshold or clipping; raw nats."""
+    on = sum(target_deltas) / len(target_deltas)
+    off = sum(abs(delta) for delta in control_deltas) / len(control_deltas)
+    coherence = min(1.0, mass_dose / mass_base)
+    return (on - 0.1 * off) * coherence ** 2
 
 
 def _aggregate_rows(rows):
@@ -267,10 +262,17 @@ def _result_table(backend, results):
     answer = results[backend]["effect_answer_logprobs"]
     generation = results[backend]["generation"]
     off = _aggregate_rows([rows["off"] for rows in generation.values()])
+
+    def mean_mass(dose):
+        return sum(
+            answer[fact][condition][dose]["family_mass"]
+            for fact in ("q1", "q2") for condition in ("control", "on_target")
+        ) / 4
+
     lines = [
-        f"{backend}: oriented logratio deltas vs its own base (nats); F2 per dose.",
+        f"{backend}: oriented logratio deltas vs its own base (nats).",
         "| dose | target Δ q1 | target Δ q2 | control Δ q1 | control Δ q2 | "
-        "steering F2 | Δ JSON (pp) | Δ capped (pp) | family mass |",
+        "selectivity | Δ JSON (pp) | Δ capped (pp) | family mass |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for dose, label in (("off", "base"), ("nonzero", "steer"), ("strong", "oversteer")):
@@ -282,15 +284,13 @@ def _result_table(backend, results):
             effect[fact]["control"][dose] - effect[fact]["control"]["off"]
             for fact in ("q1", "q2")
         ]
-        masses = [
-            answer[fact][condition][dose]["family_mass"]
-            for fact in ("q1", "q2") for condition in ("control", "on_target")
-        ]
+        masses = [answer[f][c][dose]["family_mass"]
+                  for f in ("q1", "q2") for c in ("control", "on_target")]
         row = _aggregate_rows([rows[dose] for rows in generation.values()])
-        f2 = "—" if dose == "off" else f"{_f2(targets, controls):.2f}"
+        sel = _selectivity(targets, controls, mean_mass(dose), mean_mass("off"))
         lines.append(
             f"| {label} | {targets[0]:+.2f} | {targets[1]:+.2f} | "
-            f"{controls[0]:+.2f} | {controls[1]:+.2f} | {f2} | "
+            f"{controls[0]:+.2f} | {controls[1]:+.2f} | {sel:+.2f} | "
             f"{_count_cell(row, off, 'json')} | {_count_cell(row, off, 'capped')} | "
             f"{min(masses):.2f}–{max(masses):.2f} |"
         )
@@ -300,8 +300,8 @@ def _result_table(backend, results):
 TOY_VOCAB = {  # case/whitespace variants share ids so dedupe is exercised
     "true": 10, " true": 11, "\ntrue": 12, "True": 13, " True": 13, "\nTrue": 13,
     "1": 14, " 1": 14,
-    "false": 20, " false": 21, "\nfalse": 22, "False": 23, " False": 23,
-    "\nFalse": 23, "0": 24, " 0": 24,
+    "false": 20, " false": 21, "\nfalse": 22, "False": 23, " False": 23, "\nFalse": 23,
+    "0": 24, " 0": 24,
 }
 
 
@@ -361,24 +361,30 @@ def test_leading_object_json_and_cap_cpu_controls():
     ])
     assert (rows["json"], rows["capped"], rows["n"]) == (2, 2, 4)
     aggregate = _aggregate_rows(
-        [{"json": 2, "capped": 1, "n": 4}, {"json": 3, "capped": 0, "n": 4}]
-    )
+        [{"json": 2, "capped": 1, "n": 4}, {"json": 3, "capped": 0, "n": 4}])
     assert aggregate == {"json": 5, "capped": 1, "n": 8}
     assert _count_cell({"json": 2, "n": 4}, {"json": 3, "n": 4}, "json") == (
         "-25 (2/4; base 3/4)")
 
 
-def test_f2_and_table_shape_cpu_controls():
-    assert _f2([0.0, 0.0], [0.0, 0.0]) == 0.0
-    assert _f2([1.0, 1.0], [0.0, 0.0]) == 1.0
-    assert _f2([-1.0, -1.0], [0.0, 0.0]) == 0.0  # wrong direction: no credit
-    assert _f2([0.125, 0.125], [0.0, 0.0]) == pytest.approx(5 / 9)  # half credit
-    assert _f2([1.0, 1.0], [9.0, 9.0]) == pytest.approx(10 / 12)  # FP saturates
+def test_selectivity_and_table_shape_cpu_controls():
+    # on passes through at full coherence with still controls
+    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.8, 0.8) == pytest.approx(1.0)
+    # control movement costs 0.1 per nat
+    assert _selectivity([1.0, 1.0], [1.0, 1.0], 0.8, 0.8) == pytest.approx(0.9)
+    # wrong-direction target movement goes negative
+    assert _selectivity([-1.0, -1.0], [0.0, 0.0], 0.8, 0.8) == pytest.approx(-1.0)
+    # coherence barrier: half the family mass quarters the credit
+    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.4, 0.8) == pytest.approx(0.25)
+    # exceeding base mass is clamped, never rewarded
+    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.9, 0.8) == pytest.approx(1.0)
 
     doses = ("off", "nonzero", "strong")
+    mass_cells = {dose: {"family_mass": 0.8} for dose in doses}
 
     def flat(**deltas):
         return {"off": 0.0, "nonzero": 0.0, "strong": 0.0, **deltas}
+
     results = {"pytorch": {
         "effect": {
             fact: {
@@ -388,24 +394,23 @@ def test_f2_and_table_shape_cpu_controls():
             for fact in ("q1", "q2")
         },
         "effect_answer_logprobs": {
-            fact: {
-                condition: {dose: {"family_mass": 0.8} for dose in doses}
-                for condition in ("control", "on_target")
-            }
+            fact: {condition: dict(mass_cells) for condition in ("control", "on_target")}
             for fact in ("q1", "q2")
         },
         "generation": {"p": {dose: {"json": 4, "capped": 0, "n": 4} for dose in doses}},
     }}
     table = _result_table("pytorch", results)
     rows = [line for line in table.splitlines() if line.startswith("| ")]
+    assert "selectivity" in rows[0]
     assert [row.split("|")[1].strip() for row in rows[2:]] == [
         "base", "steer", "oversteer",
     ]
-    assert "—" in rows[2]  # base shows em dash, not a score
     assert all(row.count("|") == 10 for row in rows)
-    # steer: TP=2×0.5, FN=1, FP=0 → 5/9; oversteer: TP=2, FP=2 → 10/12
-    assert "0.56" in rows[3]
-    assert "0.83" in rows[4]
+    # base is a real zero; steer: on=0.125, off=0 → +0.12;
+    # oversteer: on=0.25, off=0.4 → (0.25 - 0.04) * 1 = +0.21
+    assert "+0.00" in rows[2]
+    assert "+0.12" in rows[3]
+    assert "+0.21" in rows[4]
 
 
 def _persona_vector(model, tokenizer):
@@ -451,8 +456,7 @@ def _reference_steering(model, vector, coefficient):
 def _steer_extra(vector_path, coefficient, layer=COHERENCE_LAYER):
     return {"steer": dict(
         method="add_vector", coefficient=coefficient, optimal_layer=layer,
-        vector_path=str(vector_path), apply_at_all_positions=True,
-    )}
+        vector_path=str(vector_path), apply_at_all_positions=True)}
 
 
 def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
@@ -633,7 +637,6 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     print(f"coherence_artifact={artifact_path}")
     for backend in ("pytorch", "vllm"):
         print(_result_table(backend, results))
-    print(
-        "steering F2: soft counts τ=0.25 nats, β=2 (missed target costs 4× "
-        "control movement); 2 target / 2 control probes; N=4 samples per prompt."
-    )
+    print("steering selectivity = (on - 0.1*off) * coherence^2 (moral-maps form): "
+          "on = mean signed target Δ, off = mean |control Δ| (nats); coherence = "
+          "min(1, dose/base family mass); 2 target / 2 control probes; N=4 samples.")
