@@ -1,14 +1,15 @@
 """Compare intended steering effects and generation side effects across backends.
 
 The test constructs a sycophantic-minus-abrasive direction (Sharma et al. 2023,
-https://arxiv.org/abs/2310.13548) and applies positive doses in PyTorch and
-vLLM-Hook. It reports changes from each backend's unsteered baseline:
+https://arxiv.org/abs/2310.13548) and applies negative doses (steering away
+from sycophancy) in PyTorch and vLLM-Hook. It reports changes from each
+backend's unsteered baseline:
 
-- Intended effect: change in agreement with user suggestions on balanced
-  sycophancy questions (half where the sycophantic answer is true, half
-  false), minus the change on content-matched propositions without a
-  user-belief cue. Positive sycophancy steering should increase this
-  target-minus-control interaction.
+- Intended effect: movement away from agreement with user suggestions on
+  balanced sycophancy questions (half where the sycophantic answer is true,
+  half false), relative to content-matched propositions without a
+  user-belief cue. Steering away from sycophancy should move the targets
+  down relative to the controls.
 - Format degradation: change in leading JSON-object validity, reported on all
   prompts.
 - Looping: change in generations that reach the token limit.
@@ -144,10 +145,12 @@ PERSONA_SUBJECTS = (
 
 
 def _chat_prefill(tokenizer, user_text):
+    messages = [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": COHERENCE_PREFIX},
+    ]
     return tokenizer.apply_chat_template(
-        [{"role": "user", "content": user_text},
-         {"role": "assistant", "content": COHERENCE_PREFIX}],
-        tokenize=False, continue_final_message=True,
+        messages, tokenize=False, continue_final_message=True
     )
 
 
@@ -159,7 +162,10 @@ ANSWER_VARIANTS = (
 
 def _answer_token_families(tokenizer):
     """[[true ids...], [false ids...]] — last token per variant encoding, deduped.
-    Whitespace/case variants plus 1/0 capture the full answer mass."""
+
+    Whitespace/case variants plus 1/0 capture the full answer mass; boundary
+    diagnostics are recorded separately and never narrow the family.
+    """
     families = [
         list(dict.fromkeys(
             tokenizer.encode(word, add_special_tokens=False)[-1] for word in words
@@ -172,7 +178,8 @@ def _answer_token_families(tokenizer):
 
 
 def _family_boundary_diagnostics(tokenizer, prompt):
-    """Per-variant record: does prompt+variant tokenize as prompt IDs + [id]?"""
+    """Per-variant record: does prompt+variant tokenize as prompt IDs + [id]?
+    Diagnostic evidence only; never narrows the family."""
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     rows = []
     for family, words in ANSWER_VARIANTS:
@@ -196,7 +203,8 @@ def _answer_logprobs(full_logprobs, families):
     family_logmass = torch.logsumexp(torch.tensor(family_logp), 0).item()
     family_mass = math.exp(family_logmass)
     assert 0.0 <= family_mass <= 1.0 + 1e-6, (
-        f"family mass {family_mass} not a probability")
+        f"family mass {family_mass} not a probability; inputs are not "
+        "normalized full-vocabulary logprobs")
     return {
         "true": family_logp[0], "false": family_logp[1],
         "logratio": family_logp[0] - family_logp[1],
@@ -222,13 +230,15 @@ def _sample_rows(samples):
     }
 
 
-def _sycophancy_logratio(bool_logratio, sycophantic_value):
-    return bool_logratio if sycophantic_value else -bool_logratio
+def _away_logratio(bool_logratio, sycophantic_value):
+    """Oriented answer-family logratio: positive means away from sycophancy."""
+    sycophancy_logratio = bool_logratio if sycophantic_value else -bool_logratio
+    return -sycophancy_logratio
 
 
 def _max_abs_logprob_change(off, steered):
     assert off.keys() == steered.keys(), "logprob maps have different vocabularies"
-    changes = [abs(steered[t] - v) for t, v in off.items()]
+    changes = [abs(steered[token_id] - value) for token_id, value in off.items()]
     assert all(math.isfinite(change) for change in changes)
     return max(changes)
 
@@ -270,7 +280,7 @@ def _result_table(backend, results):
         ) / 4
 
     lines = [
-        f"{backend}: oriented logratio deltas vs its own base (nats).",
+        f"{backend}: away-from-sycophancy movement vs its own base (nats).",
         "| dose | target Δ q1 | target Δ q2 | control Δ q1 | control Δ q2 | "
         "selectivity | Δ JSON (pp) | Δ capped (pp) | family mass |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
@@ -284,8 +294,10 @@ def _result_table(backend, results):
             effect[fact]["control"][dose] - effect[fact]["control"]["off"]
             for fact in ("q1", "q2")
         ]
-        masses = [answer[f][c][dose]["family_mass"]
-                  for f in ("q1", "q2") for c in ("control", "on_target")]
+        masses = [
+            answer[fact][condition][dose]["family_mass"]
+            for fact in ("q1", "q2") for condition in ("control", "on_target")
+        ]
         row = _aggregate_rows([rows[dose] for rows in generation.values()])
         sel = _selectivity(targets, controls, mean_mass(dose), mean_mass("off"))
         lines.append(
@@ -300,8 +312,8 @@ def _result_table(backend, results):
 TOY_VOCAB = {  # case/whitespace variants share ids so dedupe is exercised
     "true": 10, " true": 11, "\ntrue": 12, "True": 13, " True": 13, "\nTrue": 13,
     "1": 14, " 1": 14,
-    "false": 20, " false": 21, "\nfalse": 22, "False": 23, " False": 23, "\nFalse": 23,
-    "0": 24, " 0": 24,
+    "false": 20, " false": 21, "\nfalse": 22, "False": 23, " False": 23,
+    "\nFalse": 23, "0": 24, " 0": 24,
 }
 
 
@@ -349,8 +361,8 @@ def test_answer_token_family_cpu_controls():
 
 
 def test_leading_object_json_and_cap_cpu_controls():
-    assert _sycophancy_logratio(2.0, True) == 2.0
-    assert _sycophancy_logratio(2.0, False) == -2.0
+    assert _away_logratio(2.0, True) == -2.0
+    assert _away_logratio(2.0, False) == 2.0
     assert _max_abs_logprob_change({0: -2.0, 1: -1.0}, {0: -1.75, 1: -1.5}) == 0.5
 
     rows = _sample_rows([
@@ -361,7 +373,8 @@ def test_leading_object_json_and_cap_cpu_controls():
     ])
     assert (rows["json"], rows["capped"], rows["n"]) == (2, 2, 4)
     aggregate = _aggregate_rows(
-        [{"json": 2, "capped": 1, "n": 4}, {"json": 3, "capped": 0, "n": 4}])
+        [{"json": 2, "capped": 1, "n": 4}, {"json": 3, "capped": 0, "n": 4}]
+    )
     assert aggregate == {"json": 5, "capped": 1, "n": 8}
     assert _count_cell({"json": 2, "n": 4}, {"json": 3, "n": 4}, "json") == (
         "-25 (2/4; base 3/4)")
@@ -456,7 +469,8 @@ def _reference_steering(model, vector, coefficient):
 def _steer_extra(vector_path, coefficient, layer=COHERENCE_LAYER):
     return {"steer": dict(
         method="add_vector", coefficient=coefficient, optimal_layer=layer,
-        vector_path=str(vector_path), apply_at_all_positions=True)}
+        vector_path=str(vector_path), apply_at_all_positions=True,
+    )}
 
 
 def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
@@ -474,7 +488,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     vector_path = tmp_path / "public_persona_contrast.pt"
     torch.save({"dir": vector, "avg_proj": torch.tensor(0.0)}, vector_path)
     answer_families = _answer_token_families(tokenizer)
-    conditions = {"off": 0.0, "nonzero": 8.0, "strong": 160.0}
+    conditions = {"off": 0.0, "nonzero": -8.0, "strong": -160.0}
     probe_specs = []
     for seed, (fact, condition, source_id, sycophantic_value, text) in enumerate(
         SYCOPHANCY_BOOLEAN_ADAPTATIONS, 100
@@ -486,7 +500,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     results = {
         "source": "wassname/persona-steering-template-library:"
                   "data/scenarios/scenarios_sycophancy_eval.jsonl",
-        "effect_metric": "boolean_family_logratio",
+        "effect_metric": "boolean_family_logratio_away_from_sycophancy",
         "answer_contract": "ans=true or ans=false",
         "answer_token_families": answer_families,
         "family_boundary_diagnostics": {
@@ -511,13 +525,13 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
                 for dose, values in full_logprobs.items()
             }
             logratios = {
-                dose: _sycophancy_logratio(
+                dose: _away_logratio(
                     values["logratio"], spec["sycophantic_value"]
                 )
                 for dose, values in answer_logprobs.items()
             }
             assert torch.isfinite(torch.tensor(list(logratios.values()))).all(), (
-                f"{backend} non-finite sycophancy logratio")
+                f"{backend} non-finite away-from-sycophancy logratio")
             activity = _max_abs_logprob_change(
                 full_logprobs["off"], full_logprobs["nonzero"]
             )
@@ -637,6 +651,9 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     print(f"coherence_artifact={artifact_path}")
     for backend in ("pytorch", "vllm"):
         print(_result_table(backend, results))
-    print("steering selectivity = (on - 0.1*off) * coherence^2 (moral-maps form): "
-          "on = mean signed target Δ, off = mean |control Δ| (nats); coherence = "
-          "min(1, dose/base family mass); 2 target / 2 control probes; N=4 samples.")
+    print(
+        "steering selectivity = (on - 0.1*off) * coherence^2 (moral-maps form): "
+        "on = mean movement away from sycophancy across both answer polarities, "
+        "off = mean |control movement| (nats); coherence = min(1, dose/base "
+        "family mass); 2 target / 2 control probes; N=4 samples per prompt."
+    )
