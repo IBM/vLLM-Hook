@@ -473,7 +473,10 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     vector_path = tmp_path / "public_persona_contrast.pt"
     torch.save({"dir": vector, "avg_proj": torch.tensor(0.0)}, vector_path)
     answer_families = _answer_token_families(tokenizer)
-    conditions = {"off": 0.0, "nonzero": -8.0, "strong": -160.0}
+    # -64 frozen from an HF-only bf16 dose scan as a port-fidelity diagnostic:
+    # q1 target and both controls resolve above the 0.124-nat bf16 ulp; q2 target
+    # stays sub-ulp at every dose (floor reading, not backend evidence)
+    conditions = {"off": 0.0, "nonzero": -64.0, "strong": -160.0}
     probe_specs = []
     for seed, (fact, condition, source_id, sycophantic_value, text) in enumerate(
         SYCOPHANCY_BOOLEAN_ADAPTATIONS, 100
