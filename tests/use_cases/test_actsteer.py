@@ -18,7 +18,8 @@ Both engines run fp32: bf16 quantization/path differences caused an apparent
 backend mismatch (base gap 0.248 nats bf16 vs 0.00110 fp32; divergence
 begins at layer 0, before any intervention). A deterministic gate requires
 the four ordinary-dose baseline-relative effect cells to differ by at most
-0.1 nats. This is a provisional user-chosen portability tolerance, not an
+0.1 nats. That bounds the odds-effect multiplier ratio to exp(±0.1), or about
+0.905–1.105. This is a provisional user-chosen portability tolerance, not an
 empirically derived equivalence threshold; failures print every cell gap.
 Generation health stays a non-gating reported column.
 
@@ -108,33 +109,58 @@ def test_activation_steer_worker_lifecycle_cpu(tmp_path, monkeypatch):
     def run_layer(hidden, residual):
         return model.model.decoder.layers[0](hidden, residual.clone())
 
+    def assert_hidden_unchanged(hidden, hidden_before, out_hidden):
+        assert torch.equal(hidden, hidden_before)
+        assert torch.equal(out_hidden, hidden_before)
+
     # prefill: steering writes the request's last residual row; hidden unchanged
     hidden = -torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    hidden_before = hidden.clone()
     residual = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     expected_residual = residual.clone()
     expected_residual[2] += 2 * vector
     out_hidden, out_residual = run_layer(hidden, residual)
-    assert torch.equal(out_hidden, hidden)
+    assert_hidden_unchanged(hidden, hidden_before, out_hidden)
     assert torch.equal(out_residual, expected_residual)
 
     # decode: steering writes the single decode row the same way
     runner.requests["on"].output_token_ids = [7]
     metadata.query_start_loc = torch.tensor([0, 1, 2])
     hidden = -torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    hidden_before = hidden.clone()
     residual = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     expected_residual = residual.clone()
     expected_residual[0] += 2 * vector
     out_hidden, out_residual = run_layer(hidden, residual)
-    assert torch.equal(out_hidden, hidden)
+    assert_hidden_unchanged(hidden, hidden_before, out_hidden)
     assert torch.equal(out_residual, expected_residual)
 
     # apply_at_all_positions=False: decode is a no-op on both components
     runner.requests["on"] = _request(
         {"steer": {**on["steer"], "apply_at_all_positions": False}}, [7]
     )
+    hidden_before = hidden.clone()
     out_hidden, out_residual = run_layer(hidden, residual)
-    assert torch.equal(out_hidden, hidden)
+    assert_hidden_unchanged(hidden, hidden_before, out_hidden)
     assert torch.equal(out_residual, residual)
+
+    # A stray in-place hidden write must fail even when the residual is correct.
+    runner.requests["on"] = _request(on, [7])
+    def corrupt_hidden(_, __, output):
+        output[0].add_(1)
+        return output
+    handle = model.model.decoder.layers[0].register_forward_hook(corrupt_hidden)
+    try:
+        hidden = -torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        hidden_before = hidden.clone()
+        expected_residual = residual.clone()
+        expected_residual[0] += 2 * vector
+        out_hidden, out_residual = run_layer(hidden, residual)
+        assert torch.equal(out_residual, expected_residual)
+        with pytest.raises(AssertionError):
+            assert_hidden_unchanged(hidden, hidden_before, out_hidden)
+    finally:
+        handle.remove()
 
 
 COHERENCE_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -331,23 +357,25 @@ def _result_table(backend, results):
 CROSS_BACKEND_GAP_LIMIT = 0.1  # nats; provisional user-chosen tolerance
 
 
-def _cross_backend_gap_check(results, limit=CROSS_BACKEND_GAP_LIMIT):
-    """Gate ordinary-dose effects by a provisional per-cell portability tolerance.
-
-    This is not an empirically derived equivalence threshold. It compares the
-    four baseline-relative q1/q2 control/on-target cells and prints every gap.
-    Generation health and selectivity remain reported, not gated.
-    """
+def _cross_backend_gaps(results):
+    """Return four ordinary baseline-relative PyTorch/vLLM effect gaps."""
     gaps = {}
     for fact in ("q1", "q2"):
         for condition in ("control", "on_target"):
+            pytorch = results["pytorch"]["effect"][fact][condition]
+            vllm = results["vllm"]["effect"][fact][condition]
             gaps[f"{fact}_{condition}"] = abs(
-                results["pytorch"]["effect"][fact][condition]["nonzero"]
-                - results["vllm"]["effect"][fact][condition]["nonzero"])
-    worst = max(gaps.values())
+                (pytorch["nonzero"] - pytorch["off"])
+                - (vllm["nonzero"] - vllm["off"]))
+    return max(gaps.values()), gaps
+
+
+def _cross_backend_gap_check(results, limit=CROSS_BACKEND_GAP_LIMIT):
+    """Assert the provisional per-cell portability tolerance after reporting."""
+    worst, gaps = _cross_backend_gaps(results)
     rendered_gaps = ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items()))
     assert worst <= limit, (
-        f"cross-backend max effect-cell gap {worst:.4f} nats > {limit}: {rendered_gaps}")
+        f"cross-backend baseline-relative max effect-cell gap {worst:.4f} nats > {limit}: {rendered_gaps}")
     return worst, gaps
 
 
@@ -452,15 +480,23 @@ def test_selectivity_and_table_shape_cpu_controls():
     assert "+0.21" in rows[4]
 
 
-def _synthetic_results(pytorch_cells, vllm_cells):
-    """Build a minimal measurement-shaped result for deterministic gate checks."""
+def _synthetic_results(pytorch_deltas, vllm_deltas, pytorch_off=None, vllm_off=None):
+    """Build measurement-shaped effects from deltas and optional raw baselines."""
+    if pytorch_off is None:
+        pytorch_off = {name: 0.0 for name in pytorch_deltas}
+    if vllm_off is None:
+        vllm_off = {name: 0.0 for name in vllm_deltas}
     out = {}
-    for backend, cells in (("pytorch", pytorch_cells), ("vllm", vllm_cells)):
+    for backend, deltas, baselines in (
+        ("pytorch", pytorch_deltas, pytorch_off),
+        ("vllm", vllm_deltas, vllm_off),
+    ):
         out[backend] = {"effect": {}}
-        for name, delta in cells.items():
+        for name, delta in deltas.items():
             fact, condition = name.split("_", 1)
+            off = baselines[name]
             out[backend]["effect"].setdefault(fact, {})[condition] = {
-                "off": 0.0, "nonzero": delta, "strong": delta}
+                "off": off, "nonzero": off + delta, "strong": off + delta}
     return out
 
 
@@ -470,12 +506,21 @@ def test_cross_backend_gate_cpu_controls():
         "q2_control": -0.2, "q2_on_target": -0.1,
     }
 
-    def check(vllm_cells):
-        return _cross_backend_gap_check(_synthetic_results(ordinary, vllm_cells))
+    def check(vllm_deltas, pytorch_off=None, vllm_off=None):
+        return _cross_backend_gap_check(
+            _synthetic_results(ordinary, vllm_deltas, pytorch_off, vllm_off))
 
     worst, gaps = check({name: value + 0.02 for name, value in ordinary.items()})
     assert worst == pytest.approx(0.02)
     assert set(gaps) == set(ordinary)
+
+    shifted_baseline = {name: 0.2 for name in ordinary}
+    # Equal deltas pass even though raw nonzero cells differ by 0.2 (old false fail).
+    assert check(ordinary, vllm_off=shifted_baseline)[0] == pytest.approx(0.0)
+    # Equal raw nonzero cells hide 0.2 delta gaps (old false pass).
+    with pytest.raises(AssertionError, match="baseline-relative max effect-cell gap 0.2000"):
+        check({name: value - 0.2 for name, value in ordinary.items()},
+              vllm_off=shifted_baseline)
 
     # Exact lifecycle tests cover hook write faults; this gate detects their effects.
     for bad in (
@@ -485,7 +530,7 @@ def test_cross_backend_gate_cpu_controls():
         {"q1_control": +0.9, "q1_on_target": +0.5,
          "q2_control": -0.7, "q2_on_target": +0.2},  # oversteer substitution
     ):
-        with pytest.raises(AssertionError, match="cross-backend max effect-cell gap") as exc:
+        with pytest.raises(AssertionError, match="baseline-relative max effect-cell gap") as exc:
             check(bad)
         for name in ordinary:
             assert f"{name}=" in str(exc.value)
@@ -708,10 +753,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         ]
 
     measure("vllm", vllm_score, vllm_samples)
-    worst_gap, gaps = _cross_backend_gap_check(results)
-    print("provisional cross-backend portability gate: "
-        f"max_gap={worst_gap:.4f} nats <= {CROSS_BACKEND_GAP_LIMIT}; "
-        + ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items())))
+    worst_gap, gaps = _cross_backend_gaps(results)
     del llm
     torch.cuda.empty_cache()
     elapsed_s = time.monotonic() - started
@@ -721,9 +763,15 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     print(f"coherence_artifact={artifact_path}")
     for backend in ("pytorch", "vllm"):
         print(_result_table(backend, results))
+    print("provisional baseline-relative cross-backend portability gate: "
+        f"max_gap={worst_gap:.4f} nats <= {CROSS_BACKEND_GAP_LIMIT} "
+        f"(odds-effect ratio {math.exp(-CROSS_BACKEND_GAP_LIMIT):.3f}–"
+        f"{math.exp(CROSS_BACKEND_GAP_LIMIT):.3f}); "
+        + ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items())))
     print(
         "steering selectivity = (on - 0.1*off) * coherence^2 (moral-maps form): "
         "on = mean movement away from sycophancy across both answer polarities, "
         "off = mean |control movement| (nats); coherence = min(1, dose/base "
         "family mass); 2 target / 2 control probes; N=4 samples per prompt."
     )
+    _cross_backend_gap_check(results)
