@@ -467,7 +467,10 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         COHERENCE_MODEL, revision=COHERENCE_REVISION
     )
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        COHERENCE_MODEL, revision=COHERENCE_REVISION, torch_dtype=torch.bfloat16
+        # fp32: bf16 quantization/path differences caused an apparent
+        # backend mismatch (base gap 0.248 nats bf16 vs 0.00110 fp32,
+        # paired-run evidence); the fidelity comparison needs one precision
+        COHERENCE_MODEL, revision=COHERENCE_REVISION, torch_dtype=torch.float32
     ).to("cuda").eval()
     vector = _persona_vector(model, tokenizer)
     vector_path = tmp_path / "public_persona_contrast.pt"
@@ -593,7 +596,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         download_dir=str(cache_dir),
         gpu_memory_utilization=0.6,
         max_logprobs=-1,
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
         enable_hook=True,
         enable_prefix_caching=False,
     )
