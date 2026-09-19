@@ -42,14 +42,21 @@ def load_points(results_dir: Path, task: str, metric: str) -> List[Dict[str, Any
     points = []
     files = sorted(results_dir.glob("*.json"))
     for path in files:
-        if path.name == "sweep_summary.json":
+        if path.name in {"sweep_summary.json", "pareto_points.json"}:
             continue
         data = json.loads(path.read_text())
         cfg = data.get("config") or {}
         stats = data.get("exit_stats") or {}
-        r_bar = stats.get("mean_effective_r")
+        # Adaptive exit is decode-only, so decode recurrence is the honest axis;
+        # older result files only carry the all-token mean.
+        r_bar = stats.get("mean_effective_r_decode")
+        cost_basis = "decode"
+        if r_bar is None:
+            r_bar = stats.get("mean_effective_r")
+            cost_basis = "all_tokens"
         if r_bar is None and cfg.get("rho", 0) == 0 and cfg.get("num_steps") is not None:
             r_bar = float(cfg["num_steps"])
+            cost_basis = "configured"
         quality = _metric_from_results(data.get("results") or {}, task, metric)
         if r_bar is None or quality is None:
             continue
@@ -62,6 +69,9 @@ def load_points(results_dir: Path, task: str, metric: str) -> List[Dict[str, Any
                 "rho": cfg.get("rho"),
                 "num_steps": cfg.get("num_steps"),
                 "mean_effective_r": float(r_bar),
+                "cost_basis": cost_basis,
+                "mlp_token_steps": stats.get("mlp_token_steps"),
+                "attn_token_steps": stats.get("attn_token_steps"),
                 "quality": float(quality),
                 "metric": metric,
                 "task": task,
@@ -85,7 +95,7 @@ def plot(points: List[Dict[str, Any]], out: Path, title: str) -> None:
             [p["quality"] for p in fixed],
             marker="o",
             linestyle="-",
-            label="Fixed depth (ρ=0)",
+            label="Fixed Depth (ρ = 0)",
             color="#1f4e79",
         )
     if adaptive:
@@ -94,10 +104,16 @@ def plot(points: List[Dict[str, Any]], out: Path, title: str) -> None:
             [p["quality"] for p in adaptive],
             marker="s",
             linestyle="--",
-            label="Adaptive exit (ρ sweep)",
+            label="Adaptive Exit (ρ Sweep)",
             color="#c45c26",
         )
-    ax.set_xlabel(r"Mean effective recurrence $\bar{r}$")
+    basis = {p.get("cost_basis") for p in points}
+    label = (
+        r"Mean decode recurrence $\bar{r}_{\mathrm{decode}}$"
+        if basis == {"decode"}
+        else r"Mean effective recurrence $\bar{r}$"
+    )
+    ax.set_xlabel(label)
     ax.set_ylabel("Quality")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
