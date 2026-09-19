@@ -45,7 +45,7 @@ class RecurrentConvergenceAnalyzer:
         if state.iteration >= self.min_steps:
             exit_mask = self._contraction_exit(state, ctrl)
 
-        # Advance prev_delta after the decision so the next r̂ uses ‖Δx_{t-1}‖.
+        # Advance prev_delta after the decision so the next r̂ uses ‖Δx_{t}‖
         ctrl.prev_delta = state.hidden_delta.detach()
 
         steer_gate = torch.zeros(B, S, dtype=state.hidden_delta.dtype, device=device)

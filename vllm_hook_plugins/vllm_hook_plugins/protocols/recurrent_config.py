@@ -10,6 +10,13 @@ import importlib
 from dataclasses import dataclass, field, fields
 from typing import Any, List, Optional
 
+from vllm_hook_plugins.protocols.recurrent_policy import (
+    MetricCondition,
+    PREDICTION_READOUTS,
+    Readout,
+    StoppingPolicyConfig,
+)
+
 # Keys in a ``recurrent_depth`` dict that name classes, not config knobs.
 _CLASS_PATH_KEYS = frozenset({"worker", "analyzer"})
 
@@ -18,8 +25,9 @@ _CLASS_PATH_KEYS = frozenset({"worker", "analyzer"})
 class RecurrentDepthConfig:
     """Knobs for :class:`RecurrentDepthWorker` / :class:`RecurrentConvergenceAnalyzer`.
 
-    Exit uses the training-free contraction criterion only. Safety steering is
-    independent (Stage 2) and optional.
+    ``policy`` is the model-neutral stopping policy. ``rho`` and ``min_steps``
+    remain as backwards-compatible aliases for the implemented contraction
+    policy. Safety steering is independent and optional.
 
     Unknown keys (e.g. a custom analyzer's ``kl_threshold``) land in ``extra``
     and are also set as attributes so ``getattr(cfg, "kl_threshold", …)`` works.
@@ -33,6 +41,9 @@ class RecurrentDepthConfig:
     min_steps: int = 1  # never exit before this many recurrence steps
     compute_kl: bool = False  # opt-in metric; adapter supplies predict_from_latents
     compute_colsum: bool = False  # Stage 2 (steering); needs Q/K capture
+    compute_prediction_metrics: bool = False
+    capture_trajectory: bool = False
+    policy: Optional[StoppingPolicyConfig] = None
 
     # ---- Stage 2 scaffolding (optional; unused for exit) ----
     enable_steering: bool = False
@@ -41,6 +52,16 @@ class RecurrentDepthConfig:
 
     # Out-of-tree / custom analyzer knobs that are not first-class fields.
     extra: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.policy is not None and self.policy.enabled:
+            if (
+                len(self.policy.conditions) == 1
+                and not self.policy.confirmation_conditions
+                and self.policy.conditions[0].readout is Readout.CONTRACTION
+            ):
+                self.rho = self.policy.conditions[0].threshold
+                self.min_steps = self.policy.min_steps
 
     @staticmethod
     def from_dict(d: Optional[dict]) -> "RecurrentDepthConfig":
@@ -55,13 +76,38 @@ class RecurrentDepthConfig:
                 raise TypeError(f"recurrent_depth must be a mapping, got {type(d).__name__}")
         known = {f.name for f in fields(RecurrentDepthConfig)} - {"extra"}
         extra = {k: v for k, v in d.items() if k not in known and k not in _CLASS_PATH_KEYS}
+        policy = d.get("policy")
+        if policy is not None and not isinstance(policy, StoppingPolicyConfig):
+            policy = StoppingPolicyConfig.from_dict(policy)
+        values = {k: v for k, v in d.items() if k in known and k != "policy"}
         cfg = RecurrentDepthConfig(
-            **{k: v for k, v in d.items() if k in known},
+            **values,
+            policy=policy,
             extra=extra,
         )
         for k, v in extra.items():
             setattr(cfg, k, v)
         return cfg
+
+    def resolved_policy(self) -> StoppingPolicyConfig:
+        """Return the explicit policy or a policy equivalent to legacy ``rho``."""
+        if self.policy is not None:
+            return self.policy
+        return StoppingPolicyConfig(
+            enabled=self.rho > 0,
+            conditions=(
+                MetricCondition(Readout.CONTRACTION, self.rho),
+            ),
+            min_steps=self.min_steps,
+        )
+
+    def needs_prediction_metrics(self) -> bool:
+        policy = self.resolved_policy()
+        return (
+            self.compute_prediction_metrics
+            or self.compute_kl
+            or bool(policy.readouts & PREDICTION_READOUTS)
+        )
 
 
 def load_cls(path: str) -> type:

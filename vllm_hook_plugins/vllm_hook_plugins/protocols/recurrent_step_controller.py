@@ -16,8 +16,10 @@ Shape bridging (the only new concern vs. the HF adapter):
     with a single ``unsqueeze(1)`` / ``squeeze(1)``. The HF path keeps passing
     real ``[B, S, D]`` and is unaffected.
 
-Stage 1 uses the training-free contraction criterion only. Steering
-(``steer``) is a no-op until Stage 2 enables it via the config.
+The stock worker/analyzer currently implements the training-free contraction
+readout. Adapters declare additional readout capabilities explicitly; the
+controller rejects policies that the selected adapter cannot provide.
+Steering (``steer``) remains independent and opt-in.
 
 vLLM executors should construct this via :meth:`from_config` so a
 ``recurrent_depth`` dict (including import-string ``worker`` / ``analyzer``)
@@ -36,6 +38,10 @@ from vllm_hook_plugins.protocols.exit_controller import AnalyzerDecision, ExitCo
 from vllm_hook_plugins.protocols.recurrent_config import (
     RecurrentDepthConfig,
     build_recurrent_stack,
+)
+from vllm_hook_plugins.protocols.recurrent_policy import (
+    CONTRACTION_CAPABILITIES,
+    RecurrentAdapterCapabilities,
 )
 from vllm_hook_plugins.workers.recurrent_depth_worker import RecurrentDepthWorker
 
@@ -63,8 +69,12 @@ class RecurrentStepController:
         *,
         worker: Optional[RecurrentDepthWorker] = None,
         analyzer: Optional[RecurrentConvergenceAnalyzer] = None,
+        capabilities: Optional[RecurrentAdapterCapabilities] = None,
     ) -> None:
         self.cfg = cfg or RecurrentDepthConfig()
+        self.policy = self.cfg.resolved_policy()
+        self.capabilities = capabilities or CONTRACTION_CAPABILITIES
+        self.capabilities.validate(self.policy)
         self.worker = worker or RecurrentDepthWorker(model, self.cfg)
         self.analyzer = analyzer or RecurrentConvergenceAnalyzer(self.cfg)
         self.ctrl: Optional[ExitController] = None
@@ -77,6 +87,7 @@ class RecurrentStepController:
         *,
         worker: Any = None,
         analyzer: Any = None,
+        capabilities: Optional[RecurrentAdapterCapabilities] = None,
     ) -> "RecurrentStepController":
         """Build a controller from a ``recurrent_depth`` dict.
 
@@ -84,12 +95,19 @@ class RecurrentStepController:
 
         ``worker`` / ``analyzer`` keys may be import strings (``pkg.mod:Class``),
         classes, or instances. Omitted → stock :class:`RecurrentDepthWorker` /
-        :class:`RecurrentConvergenceAnalyzer`.
+        :class:`RecurrentConvergenceAnalyzer`. ``capabilities`` comes from the
+        architecture adapter and is validated against the configured policy.
         """
         cfg, worker_obj, analyzer_obj = build_recurrent_stack(
             model, recur_dict, worker=worker, analyzer=analyzer
         )
-        return cls(model, cfg, worker=worker_obj, analyzer=analyzer_obj)
+        return cls(
+            model,
+            cfg,
+            worker=worker_obj,
+            analyzer=analyzer_obj,
+            capabilities=capabilities,
+        )
 
     # ------------------------------------------------------------------ #
     # Per-forward lifecycle
@@ -105,7 +123,15 @@ class RecurrentStepController:
     # End-of-step protocol call
     # ------------------------------------------------------------------ #
 
-    def step(self, hidden_states: Tensor, prev_hidden_states: Tensor, recurrent_step: int) -> AnalyzerDecision:
+    def step(
+        self,
+        hidden_states: Tensor,
+        prev_hidden_states: Tensor,
+        recurrent_step: int,
+        *,
+        prediction_inputs: Optional[dict] = None,
+        phase_mask: Optional[Tensor] = None,
+    ) -> AnalyzerDecision:
         """Run worker metrics + analyzer for one step.
 
         ``hidden_states`` / ``prev_hidden_states`` are pre-steering flattened latents ``[T, D]``.
@@ -114,9 +140,19 @@ class RecurrentStepController:
         if self.ctrl is None:
             raise RuntimeError("RecurrentStepController.reset() must precede step().")
         state = self.worker.build_state(
-            hidden_states.unsqueeze(1), prev_hidden_states.unsqueeze(1), recurrent_step
+            hidden_states.unsqueeze(1),
+            prev_hidden_states.unsqueeze(1),
+            recurrent_step,
+            aux_inputs=prediction_inputs,
+            phase_mask=None if phase_mask is None else phase_mask.unsqueeze(1),
         )
         return self.analyzer.analyze(state, self.ctrl)
+
+    def reset_trajectory_samples(self) -> None:
+        self.worker.reset_trajectory_samples()
+
+    def pop_trajectory_samples(self) -> list[dict[str, Any]]:
+        return self.worker.pop_trajectory_samples()
 
     def apply(self, decision: AnalyzerDecision, recurrent_step: int) -> Tensor:
         """Record exits and return the updated ``[T]`` active mask."""

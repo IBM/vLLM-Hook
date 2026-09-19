@@ -9,8 +9,8 @@ Slicing for active tokens to avoid redundant forward passes isenabled for decode
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 
 import torch
 from torch import Tensor
@@ -18,20 +18,38 @@ from torch import Tensor
 
 @dataclass
 class ConvergenceState:
-    """Cheap per-iteration signals produced by the worker.
-
-    Absolute ``hidden_delta`` and ``h_norm`` drive the contraction-rate exit.
-    ``rel_delta`` is logged / available to adapters for baseline comparisons.
-    Optional fields stay ``None`` until enabled.
-    """
+    """Single-source per-iteration metric values produced by the worker."""
 
     iteration: int
-    hidden_delta: Tensor  # [B, S] ||x_t - x_{t-1}||
-    h_norm: Tensor  # [B, S] ||x_t||
-    rel_delta: Tensor  # [B, S] ||Δx|| / ||x||
-    kl_divergence: Optional[Tensor] = None  # [B, S]
-    colsum_concentration: Optional[Tensor] = None  # [B, S] ∈ [0, 1]
-    safety_margin: Optional[Tensor] = None  # [B, S] Stage 2 only
+    metrics: Dict[str, Tensor]
+    valid_metrics: Dict[str, Tensor] = field(default_factory=dict)
+    eligible_mask: Optional[Tensor] = None
+
+    def require_metric(self, name: str) -> Tensor:
+        try:
+            return self.metrics[name]
+        except KeyError as exc:
+            raise ValueError(f"required recurrent metric {name!r} is unavailable") from exc
+
+    def metric_valid(self, name: str) -> Tensor:
+        value = self.require_metric(name)
+        return self.valid_metrics.get(name, torch.ones_like(value, dtype=torch.bool))
+
+    @property
+    def hidden_delta(self) -> Tensor:
+        return self.require_metric("hidden_delta")
+
+    @property
+    def h_norm(self) -> Tensor:
+        return self.require_metric("hidden_norm")
+
+    @property
+    def rel_delta(self) -> Tensor:
+        return self.require_metric("normalized_displacement")
+
+    @property
+    def kl_divergence(self) -> Optional[Tensor]:
+        return self.metrics.get("predictive_kl")
 
 
 @dataclass
@@ -51,6 +69,7 @@ class ExitController:
         self.M_initial: Optional[Tensor] = None  # Stage 2 drift reference
         self.nonconverging = torch.zeros(B, S, dtype=torch.bool, device=device)
         self.exit_iteration = torch.full((B, S), -1, dtype=torch.long, device=device)
+        self.hit_count = torch.zeros(B, S, dtype=torch.long, device=device)
 
     def apply(self, decision: AnalyzerDecision, iteration: int) -> Tensor:
         newly = decision.exit_mask & self.active
