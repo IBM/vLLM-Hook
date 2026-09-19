@@ -17,9 +17,10 @@ backend's unsteered baseline:
 Both engines run fp32: bf16 quantization/path differences caused an apparent
 backend mismatch (base gap 0.248 nats bf16 vs 0.00110 fp32; divergence
 begins at layer 0, before any intervention). A deterministic gate requires
-the four ordinary-dose baseline-relative effect cells to agree across
-backends within 0.01 nats (observed max 0.0005); failures print per-cell
-gaps. Generation health stays a non-gating reported column.
+the four ordinary-dose baseline-relative effect cells to differ by at most
+0.1 nats. This is a provisional user-chosen portability tolerance, not an
+empirically derived equivalence threshold; failures print every cell gap.
+Generation health stays a non-gating reported column.
 
 Rates are reported as percentage-point changes with raw counts retained.
 """
@@ -327,15 +328,15 @@ def _result_table(backend, results):
     return "\n".join(lines)
 
 
-CROSS_BACKEND_GAP_LIMIT = 0.01  # nats; observed max gap 0.0005 (20x margin)
+CROSS_BACKEND_GAP_LIMIT = 0.1  # nats; provisional user-chosen tolerance
 
 
 def _cross_backend_gap_check(results, limit=CROSS_BACKEND_GAP_LIMIT):
-    """Deterministic gate on the 4 ordinary-dose baseline-relative cells.
+    """Gate ordinary-dose effects by a provisional per-cell portability tolerance.
 
-    Compares each backend to the same prefilled prompts at dose -64:
-    q1/q2 x control/on_target. Raises with per-cell gaps on disagreement.
-    Generation health stays non-gating; selectivity is not gated alone.
+    This is not an empirically derived equivalence threshold. It compares the
+    four baseline-relative q1/q2 control/on-target cells and prints every gap.
+    Generation health and selectivity remain reported, not gated.
     """
     gaps = {}
     for fact in ("q1", "q2"):
@@ -344,10 +345,10 @@ def _cross_backend_gap_check(results, limit=CROSS_BACKEND_GAP_LIMIT):
                 results["pytorch"]["effect"][fact][condition]["nonzero"]
                 - results["vllm"]["effect"][fact][condition]["nonzero"])
     worst = max(gaps.values())
+    rendered_gaps = ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items()))
     assert worst <= limit, (
-        f"cross-backend effect-cell gap {worst:.4f} nats > {limit}: "
-        + ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items())))
-    return gaps
+        f"cross-backend max effect-cell gap {worst:.4f} nats > {limit}: {rendered_gaps}")
+    return worst, gaps
 
 
 TOY_VOCAB = {  # case/whitespace variants share ids so dedupe is exercised
@@ -451,21 +452,12 @@ def test_selectivity_and_table_shape_cpu_controls():
     assert "+0.21" in rows[4]
 
 
-# job 1766's executed fp32 steer-row values (away orientation, nats)
-PT_STEER = {"q1_control": +0.3372, "q1_on_target": +0.2789,
-            "q2_control": -0.2225, "q2_on_target": -0.0326}
-PT_OVERSTEER = {"q1_control": +0.7970, "q1_on_target": +0.3265,
-                "q2_control": -0.7430, "q2_on_target": +0.0639}
-
-
-def _synthetic_results(vllm_cells):
-    """results-dict shaped as measure() builds it, with job-1766 pytorch rows."""
-    def cells(deltas):
-        return {"off": 0.0, "nonzero": deltas, "strong": deltas}
+def _synthetic_results(pytorch_cells, vllm_cells):
+    """Build a minimal measurement-shaped result for deterministic gate checks."""
     out = {}
-    for backend, steer_cells in (("pytorch", PT_STEER), ("vllm", vllm_cells)):
+    for backend, cells in (("pytorch", pytorch_cells), ("vllm", vllm_cells)):
         out[backend] = {"effect": {}}
-        for name, delta in steer_cells.items():
+        for name, delta in cells.items():
             fact, condition = name.split("_", 1)
             out[backend]["effect"].setdefault(fact, {})[condition] = {
                 "off": 0.0, "nonzero": delta, "strong": delta}
@@ -473,32 +465,30 @@ def _synthetic_results(vllm_cells):
 
 
 def test_cross_backend_gate_cpu_controls():
-    # known-good: the executed vllm steer row passes with 20x margin
-    good = _synthetic_results({
-        "q1_control": +0.3373, "q1_on_target": +0.2794,
-        "q2_control": -0.2225, "q2_on_target": -0.0330})
-    gaps = _cross_backend_gap_check(good)
-    assert max(gaps.values()) <= 0.0006
+    ordinary = {
+        "q1_control": +0.4, "q1_on_target": +0.3,
+        "q2_control": -0.2, "q2_on_target": -0.1,
+    }
 
-    # synthetic bad ports fail the same gate, with per-cell gaps printed
-    def expect_fail(cells, why):
-        with pytest.raises(AssertionError, match=why):
-            _cross_backend_gap_check(_synthetic_results(cells))
+    def check(vllm_cells):
+        return _cross_backend_gap_check(_synthetic_results(ordinary, vllm_cells))
 
-    noop = {name: 0.0 for name in PT_STEER}          # write never lands
-    expect_fail(noop, "cross-backend effect-cell gap 0.3372")
-    wrong_sign = {name: -d for name, d in PT_STEER.items()}
-    expect_fail(wrong_sign, "cross-backend effect-cell gap 0.6744")
-    wrong_scale = {name: 0.5 * d for name, d in PT_STEER.items()}
-    expect_fail(wrong_scale, "cross-backend effect-cell gap 0.1686")
-    # steer row displaced by the oversteer row (a real displacement table)
-    expect_fail(PT_OVERSTEER, "cross-backend effect-cell gap 0.5205")
-    # the error message prints every cell's gap
-    with pytest.raises(AssertionError) as exc:
-        _cross_backend_gap_check(_synthetic_results(noop))
-    msg = str(exc.value)
-    for name in PT_STEER:
-        assert f"{name}=" in msg, f"per-cell gap {name} missing from error"
+    worst, gaps = check({name: value + 0.02 for name, value in ordinary.items()})
+    assert worst == pytest.approx(0.02)
+    assert set(gaps) == set(ordinary)
+
+    # Exact lifecycle tests cover hook write faults; this gate detects their effects.
+    for bad in (
+        {name: 0.0 for name in ordinary},              # no-op
+        {name: -value for name, value in ordinary.items()},  # wrong sign
+        {name: 0.5 * value for name, value in ordinary.items()},  # half scale
+        {"q1_control": +0.9, "q1_on_target": +0.5,
+         "q2_control": -0.7, "q2_on_target": +0.2},  # oversteer substitution
+    ):
+        with pytest.raises(AssertionError, match="cross-backend max effect-cell gap") as exc:
+            check(bad)
+        for name in ordinary:
+            assert f"{name}=" in str(exc.value)
 
 
 def _persona_vector(model, tokenizer):
@@ -718,10 +708,10 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         ]
 
     measure("vllm", vllm_score, vllm_samples)
-    gaps = _cross_backend_gap_check(results)
-    print("cross-backend gate: " + ", ".join(
-        f"{k}={v:.4f}" for k, v in sorted(gaps.items()))
-        + f" (limit {CROSS_BACKEND_GAP_LIMIT})")
+    worst_gap, gaps = _cross_backend_gap_check(results)
+    print("provisional cross-backend portability gate: "
+        f"max_gap={worst_gap:.4f} nats <= {CROSS_BACKEND_GAP_LIMIT}; "
+        + ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items())))
     del llm
     torch.cuda.empty_cache()
     elapsed_s = time.monotonic() - started
