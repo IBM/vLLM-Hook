@@ -1,12 +1,8 @@
-"""Convergence analyzer for recurrent-depth adaptive exit.
-
-Model-agnostic: contraction-rate exit only. Family-specific baselines
-(Huginn latent-diff / KL / …) live in the corresponding adapter.
-"""
+"""Model-neutral metric policies for recurrent-depth adaptive exit."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -17,41 +13,105 @@ from vllm_hook_plugins.protocols.exit_controller import (
     ExitController,
 )
 from vllm_hook_plugins.protocols.recurrent_config import RecurrentDepthConfig
+from vllm_hook_plugins.protocols.recurrent_policy import (
+    READOUT_METRICS,
+    MetricCondition,
+    Readout,
+)
 
 
 class RecurrentConvergenceAnalyzer:
-    """Per-position exit via predictive contraction rate::
-
-        r̂ = ‖Δx_t‖ / ‖Δx_{t-1}‖          # consecutive steps, not vs first
-        remaining ≈ ‖Δx_t‖ · r̂ / (1 − r̂)
-        exit when remaining / ‖x_t‖ < ρ  AND  r̂ < 1
-
-    ``r̂ ≥ 1`` marks non-converging orbit/slider tokens (discussed in papers
-    like Blayney et al. 2024, Han et al. 2025) for logging.
-    Native Huginn criteria are available for A/B comparison at per-position grain.
-    Stage 1 (exit) only reads convergence signals (not margin, which is used only for steering).
-    """
+    """Evaluate calibrated single or composite per-position exit policies."""
 
     def __init__(self, cfg: Optional[RecurrentDepthConfig] = None):
         self.cfg = cfg or RecurrentDepthConfig()
-        self.rho = float(self.cfg.rho)
-        self.min_steps = int(self.cfg.min_steps)
+        self.policy = self.cfg.resolved_policy()
 
     def analyze(self, state: ConvergenceState, ctrl: ExitController) -> AnalyzerDecision:
-        device = state.hidden_delta.device
-        B, S = state.hidden_delta.shape
-        exit_mask = torch.zeros(B, S, dtype=torch.bool, device=device)
+        eligible = ctrl.active
+        if state.eligible_mask is not None:
+            eligible = eligible & state.eligible_mask
 
-        if state.iteration >= self.min_steps:
-            exit_mask = self._contraction_exit(state, ctrl)
+        hit = torch.zeros_like(ctrl.active)
+        if (
+            self.policy.enabled
+            and state.iteration >= self.policy.min_steps
+            and bool(eligible.any())
+        ):
+            hit = self._evaluate_group(
+                state,
+                ctrl,
+                self.policy.conditions,
+                self.policy.combine,
+            )
+            if self.policy.confirmation_conditions:
+                hit &= self._evaluate_group(
+                    state,
+                    ctrl,
+                    self.policy.confirmation_conditions,
+                    self.policy.confirmation_combine,
+                )
+            hit &= eligible
 
-        # Advance prev_delta after the decision so the next r̂ uses ‖Δx_{t}‖
+        ctrl.hit_count = torch.where(
+            hit,
+            ctrl.hit_count + 1,
+            torch.zeros_like(ctrl.hit_count),
+        )
+        exit_mask = hit & (ctrl.hit_count >= self.policy.patience)
+
+        # Advance after the decision so contraction sees the preceding delta.
         ctrl.prev_delta = state.hidden_delta.detach()
-
-        steer_gate = torch.zeros(B, S, dtype=state.hidden_delta.dtype, device=device)
+        steer_gate = torch.zeros_like(state.hidden_delta)
         return AnalyzerDecision(exit_mask=exit_mask, steer_gate=steer_gate)
 
-    def _contraction_exit(self, state: ConvergenceState, ctrl: ExitController) -> Tensor:
+    def _evaluate_group(
+        self,
+        state: ConvergenceState,
+        ctrl: ExitController,
+        conditions: Sequence[MetricCondition],
+        combine: Literal["all", "any"],
+    ) -> Tensor:
+        result = (
+            torch.ones_like(ctrl.active)
+            if combine == "all"
+            else torch.zeros_like(ctrl.active)
+        )
+        for condition in conditions:
+            condition_hit = self._evaluate_condition(state, ctrl, condition)
+            if combine == "all":
+                result &= condition_hit
+            else:
+                result |= condition_hit
+        return result
+
+    def _evaluate_condition(
+        self,
+        state: ConvergenceState,
+        ctrl: ExitController,
+        condition: MetricCondition,
+    ) -> Tensor:
+        if condition.readout is Readout.CONTRACTION:
+            return self._contraction_hit(state, ctrl, condition.threshold)
+
+        try:
+            metric_name, comparison = READOUT_METRICS[condition.readout]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported recurrent readout {condition.readout.value!r}"
+            ) from exc
+        value = state.require_metric(metric_name)
+        valid = state.metric_valid(metric_name)
+        if comparison == "lt":
+            return (value < condition.threshold) & valid & ctrl.active
+        return (value >= condition.threshold) & valid & ctrl.active
+
+    def _contraction_hit(
+        self,
+        state: ConvergenceState,
+        ctrl: ExitController,
+        threshold: float,
+    ) -> Tensor:
         if ctrl.prev_delta is None:
             return torch.zeros_like(ctrl.active)
 
@@ -62,9 +122,4 @@ class RecurrentConvergenceAnalyzer:
         r_safe = r_hat.clamp(max=0.999)
         remaining = state.hidden_delta * r_safe / (1.0 - r_safe)
         rel_remaining = remaining / state.h_norm.clamp(min=1e-9)
-
-        # ρ = 0 → never exit (exact-match validation).
-        if self.rho <= 0.0:
-            return torch.zeros_like(ctrl.active)
-
-        return (rel_remaining < self.rho) & converging & ctrl.active
+        return (rel_remaining < threshold) & converging & ctrl.active
