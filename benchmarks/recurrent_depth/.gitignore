@@ -1,1 +1,4 @@
-results/
+results/**
+!results/**/
+!results/**/pareto_*.png
+!results/**/pareto_*.pdf

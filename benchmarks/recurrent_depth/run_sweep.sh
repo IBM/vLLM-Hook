@@ -2,10 +2,60 @@
 # Calibrate on 64 GSM8K examples, then plot fixed vs adaptive on LIMIT examples.
 # Adaptive = calibration winner (margin AND top1_stability), sweep threshold T only.
 # Requires: conda env with vllm + lm_eval + GPU.
+#
+# Usage:
+#   bash benchmarks/recurrent_depth/run_sweep.sh
+#   bash benchmarks/recurrent_depth/run_sweep.sh vllm_math
+#   bash benchmarks/recurrent_depth/run_sweep.sh --out-dir vllm_cal
+#   LIMIT=128 bash benchmarks/recurrent_depth/run_sweep.sh --out-dir /tmp/raven_out
+#   OUT=benchmarks/recurrent_depth/results/hf bash benchmarks/recurrent_depth/run_sweep.sh
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: $0 [--out-dir NAME_OR_PATH] [--limit N]"
+  echo "  --out-dir  directory name under results/ (default: vllm_cal), or a full path"
+  echo "  --limit    lm-eval eval size (default: 256, or LIMIT env)"
+  echo "  OUT=...    if set, used as the output directory and --out-dir is ignored"
+}
+
+OUT_NAME="vllm_cal"
+LIMIT="${LIMIT:-256}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out-dir|-o)
+      OUT_NAME="${2:?--out-dir requires a value}"
+      shift 2
+      ;;
+    --limit)
+      LIMIT="${2:?--limit requires a value}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      OUT_NAME="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${OUT:-}" ]]; then
+  if [[ "$OUT_NAME" == /* || "$OUT_NAME" == */* ]]; then
+    OUT="$OUT_NAME"
+  else
+    OUT="benchmarks/recurrent_depth/results/$OUT_NAME"
+  fi
+fi
 
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-OUT=benchmarks/recurrent_depth/results/vllm_cal
-LIMIT="${LIMIT:-256}"
 mkdir -p "$OUT/trajectories"
 
 # 1. Calibration trajectory (~1–1.5 hr for limit 64)

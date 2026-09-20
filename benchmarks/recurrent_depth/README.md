@@ -1,6 +1,6 @@
 # Recurrent-depth lm-eval (fixed vs adaptive Raven)
 
-Paper-oriented evaluation of **fixed recurrence** vs **adaptive early exit** via
+Evaluation of **fixed recurrence** vs **adaptive early exit** via
 [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness).
 
 **Default / production path:** `--backend vllm` → `AdaptiveRavenForvLLM` under
@@ -126,16 +126,17 @@ Fixed and ρ sweeps can run in **one** invocation.
 python benchmarks/recurrent_depth/run_lm_eval.py --backend vllm \
   --tasks gsm8k --num-fewshot 5 --limit 32 --rho 0 --num-steps 32
 
-# Publication sweep + plot
+# Publication sweep + plot (writes results/vllm_cal by default)
 bash benchmarks/recurrent_depth/run_sweep.sh
-# or with a limit first:
+# other output folder name under results/, or a smaller eval set:
+bash benchmarks/recurrent_depth/run_sweep.sh --out-dir vllm_math --limit 128
 LIMIT=100 bash benchmarks/recurrent_depth/run_sweep.sh
 ```
 
 HF reference curve:
 
 ```bash
-BACKEND=hf OUT=benchmarks/recurrent_depth/results/hf \
+OUT=benchmarks/recurrent_depth/results/hf \
   bash benchmarks/recurrent_depth/run_sweep.sh
 ```
 
