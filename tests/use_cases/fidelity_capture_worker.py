@@ -16,7 +16,8 @@ class FidelityCaptureWorker(SteerHookActWorker):
         self._fidelity_final_norm_states = []
 
         def capture_final_norm(_module, _inputs, output):
-            assert isinstance(output, torch.Tensor)
+            hidden = output[0] if isinstance(output, tuple) else output
+            assert isinstance(hidden, torch.Tensor)
             metadata = get_forward_context().attn_metadata
             query_start_loc, _ = get_query_metadata(metadata)
             assert query_start_loc is not None
@@ -27,7 +28,7 @@ class FidelityCaptureWorker(SteerHookActWorker):
                 if extra.get("fidelity_capture"):
                     end = int(query_start_loc[i + 1].item())
                     self._fidelity_final_norm_states.append(
-                        output[end - 1].detach().cpu()
+                        hidden[end - 1].detach().cpu()
                     )
             return output
 

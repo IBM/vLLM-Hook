@@ -617,9 +617,17 @@ def test_fidelity_capture_worker_uses_final_norm_boundary_cpu(monkeypatch):
             return hidden, residual
 
     model = torch.nn.Module()
+    class TupleNorm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = torch.nn.RMSNorm(3)
+
+        def forward(self, hidden, residual):
+            return self.norm(hidden), residual
+
     model.model = torch.nn.Module()
     model.model.layers = torch.nn.ModuleList([Layer()])
-    model.model.norm = torch.nn.RMSNorm(3)
+    model.model.norm = TupleNorm()
     worker = FidelityCaptureWorker()
     worker.model_runner = SimpleNamespace(
         model=model,
@@ -638,10 +646,10 @@ def test_fidelity_capture_worker_uses_final_norm_boundary_cpu(monkeypatch):
         lambda: SimpleNamespace(attn_metadata=metadata),
     )
     assert worker._fidelity_final_norm_states == []
-    normalized = model.model.norm(hidden)
+    normalized, _ = model.model.norm(hidden, hidden)
     assert torch.equal(worker.pop_final_norm_last_token(), normalized[-1])
     worker.model_runner.requests["score"] = _request(None)
-    model.model.norm(hidden)
+    model.model.norm(hidden, hidden)
     with pytest.raises(RuntimeError, match="captured 0"):
         worker.pop_final_norm_last_token()
 
