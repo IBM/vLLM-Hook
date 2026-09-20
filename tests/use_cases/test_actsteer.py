@@ -3,33 +3,36 @@
 The existing smoke tests check that the vLLM hook runs. This test also checks
 that PyTorch and vLLM apply the same steering effect. Both transformers and
 native sampled generation use bf16. Deterministic fidelity scoring captures
-each backend's post-final-RMSNorm last-token state and applies one shared
-checkpoint lm_head plus answer-family logsumexp in fp32. This does not establish
+each backend's post-final-RMSNorm last-token state and applies the HF-loaded
+bf16 checkpoint lm_head weights cast to fp32, plus answer-family logsumexp in
+fp32. This does not establish
 native bf16 output-probability equivalence. The full test file takes about 200
 seconds on an RTX 3090.
 
 The test extracts one public sycophancy direction, then applies the same vector,
 layer, and three doses in both backends. Two target questions include a user's
 belief; matched controls omit it. Their sycophantic answers have opposite
-True/False polarities, so a generic answer-token bias cannot pass. Tables show
+True/False polarities, which makes a generic answer-token bias visible in the
+per-question diagnostics. Target direction remains non-gating. Tables show
 each change from that backend's base in signed nats toward sycophancy: negative
 target values are the intended direction, while controls should tend to zero.
 
 The ordinary dose measures useful behavior. Oversteer is an intentionally
 excessive dose used as a negative control: it should reduce valid answer-family
-mass and worsen JSON/cap behavior, showing that the degradation measures detect
-breakdown. Matching on collapse is not evidence of a good port, so oversteer is
+mass and worsen leading-JSON-object/cap behavior, showing that the degradation
+measurements detect breakdown. Matching on collapse is not evidence of a good port, so oversteer is
 not part of the backend-fidelity comparison.
 
 The deterministic pass criteria are exact lifecycle writes, nonzero common-head
 logprob activity, at most 0.1 nat difference between the four ordinary
 baseline-relative backend effects, and lower common-head answer-family mass
-under oversteer. Target direction and native bf16 sampled JSON/cap rates are
-printed for diagnosis rather than used as brittle gates. CPU controls verify
+under oversteer. Target direction and native bf16 sampled
+leading-JSON-object/cap rates are printed for diagnosis rather than used as brittle gates. CPU controls verify
 that no-op, wrong-sign, half-scale, and substituted oversteer effects fail the
 portability check.
 """
 
+import gc
 import json
 import math
 import time
@@ -328,7 +331,7 @@ def _result_table(backend, results):
         f"{backend}: signed Δ log-odds toward sycophancy from its own base (nats); "
         "negative targets are desired, controls tend to 0.",
         "| dose | selectivity↑ | target q1↓ | target q2↓ | control q1→0 "
-        "| control q2→0 | JSON↑ | capped↓ | mass↑ | notes |",
+        "| control q2→0 | leading JSON object↑ | capped↓ | mass↑ | notes |",
         "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         ":--- |",
     ]
@@ -616,55 +619,47 @@ def test_fidelity_capture_worker_uses_final_norm_boundary_cpu(monkeypatch):
         def forward(self, hidden, residual):
             return hidden, residual
 
-    model = torch.nn.Module()
     class TupleNorm(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.norm = torch.nn.RMSNorm(3)
 
         def forward(self, hidden, residual):
-            return self.norm(hidden), residual
+            return self.norm(hidden + residual), residual
 
+    model = torch.nn.Module()
     model.model = torch.nn.Module()
     model.model.layers = torch.nn.ModuleList([Layer()])
     model.model.norm = TupleNorm()
     worker = FidelityCaptureWorker()
     worker.model_runner = SimpleNamespace(
         model=model,
-        input_batch=SimpleNamespace(req_ids=["native", "score"]),
+        input_batch=SimpleNamespace(req_ids=["score", "native", "trailing"]),
         requests={
-            "native": _request(None),
             "score": _request({"fidelity_capture": True}),
+            "native": _request(None),
+            "trailing": _request(None),
         },
     )
     worker._install_hooks()
-    hidden = torch.tensor([[1.0, 2.0, 3.0], [2.0, 4.0, 8.0]])
-    metadata = SimpleNamespace(query_start_loc=torch.tensor([0, 1, 2]))
+    hidden = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+    residual = 100 + 2 * torch.arange(18, dtype=torch.float32).reshape(6, 3)
+    metadata = SimpleNamespace(query_start_loc=torch.tensor([0, 2, 5, 6]))
     monkeypatch.setattr(
         fidelity_capture_worker,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=metadata),
     )
-    assert worker._fidelity_final_norm_states == []
-    normalized, _ = model.model.norm(hidden, hidden)
-    assert torch.equal(
-        torch.tensor(worker.pop_final_norm_last_token()), normalized[-1]
-    )
+    normalized, returned_residual = model.model.norm(hidden, residual)
+    captured = torch.tensor(worker.pop_final_norm_last_token())
+    assert torch.equal(captured, normalized[1])
+    assert not torch.equal(captured, normalized[-1])
+    assert not torch.equal(captured, normalized[0])
+    assert not torch.equal(captured, returned_residual[1])
     worker.model_runner.requests["score"] = _request(None)
-    model.model.norm(hidden, hidden)
+    model.model.norm(hidden, residual)
     with pytest.raises(RuntimeError, match="captured 0"):
         worker.pop_final_norm_last_token()
-
-
-def test_common_head_scoring_does_not_replace_native_generation_cpu():
-    hidden = torch.tensor([1.0, 0.0])
-    weight = torch.eye(2)
-    native_rows = [{"text": "native bf16 sample", "finish_reason": "stop", "tokens": 3}]
-    scores = _common_head_logprobs(hidden, weight)
-    assert scores[0] > scores[1]
-    assert native_rows == [
-        {"text": "native bf16 sample", "finish_reason": "stop", "tokens": 3}
-    ]
 
 
 def _persona_vector(model, tokenizer):
@@ -722,13 +717,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         COHERENCE_MODEL, revision=COHERENCE_REVISION
     )
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        COHERENCE_MODEL, revision=COHERENCE_REVISION, torch_dtype=torch.bfloat16
-    ).to("cuda").eval()
-    vector = _persona_vector(model, tokenizer)
-    shared_lm_head_weight = model.lm_head.weight.detach().float().cpu()
     vector_path = tmp_path / "public_persona_contrast.pt"
-    torch.save({"dir": vector, "avg_proj": torch.tensor(0.0)}, vector_path)
     answer_families = _answer_token_families(tokenizer)
     # -64 was frozen from an HF-only scan before vLLM agreement was inspected:
     # q1 and both controls resolve without the generation collapse seen at -160.
@@ -747,7 +736,8 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         "effect_metric": "boolean_family_logratio_toward_sycophancy",
         "deterministic_score_path": (
             "backend bf16 transformer/steering -> post-final-RMSNorm last-token "
-            "hidden -> one shared checkpoint lm_head and family logsumexp in fp32"
+            "hidden -> HF-loaded bf16 checkpoint lm_head weights cast to fp32 "
+            "for projection, then family logsumexp in fp32"
         ),
         "generation_path": "each backend's native bf16 sampled generation",
         "answer_contract": "ans=true or ans=false",
@@ -814,93 +804,137 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
             "generation": generation,
         }
 
-    def reference_score(prompt, coefficient, _seed):
-        tokens = tokenizer(prompt, return_tensors="pt").to("cuda")
-        captured = []
-
-        def capture_final_norm(_module, _inputs, output):
-            captured.append(output[0, -1].detach().cpu())
-            return output
-
-        handle = model.model.norm.register_forward_hook(capture_final_norm)
+    def run_pytorch_phase():
+        model = None
         try:
-            with _reference_steering(model, vector, coefficient), torch.inference_mode():
-                model(**tokens)
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                COHERENCE_MODEL, revision=COHERENCE_REVISION,
+                torch_dtype=torch.bfloat16,
+            ).to("cuda").eval()
+            vector = _persona_vector(model, tokenizer)
+            shared_lm_head_weight = model.lm_head.weight.detach().float().cpu()
+            torch.save({"dir": vector, "avg_proj": torch.tensor(0.0)}, vector_path)
+
+            def score(prompt, coefficient, _seed):
+                tokens = tokenizer(prompt, return_tensors="pt").to("cuda")
+                captured = []
+
+                def capture_final_norm(_module, _inputs, output):
+                    captured.append(output[0, -1].detach().cpu())
+                    return output
+
+                handle = model.model.norm.register_forward_hook(capture_final_norm)
+                try:
+                    with _reference_steering(
+                        model, vector, coefficient
+                    ), torch.inference_mode():
+                        model(**tokens)
+                finally:
+                    handle.remove()
+                assert len(captured) == 1, (
+                    f"PyTorch final-norm captures: {len(captured)}")
+                return _common_head_logprobs(captured[0], shared_lm_head_weight)
+
+            def sample(prompt, coefficient, seed):
+                tokens = tokenizer(prompt, return_tensors="pt").to("cuda")
+                torch.manual_seed(seed)
+                params = dict(
+                    COHERENCE_SAMPLING, do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+                params["num_return_sequences"] = params.pop("n")
+                params["max_new_tokens"] = params.pop("max_tokens")
+                with _reference_steering(
+                    model, vector, coefficient
+                ), torch.inference_mode():
+                    sequences = model.generate(**tokens, **params)
+                rows = []
+                for sequence in sequences:
+                    ids = sequence[tokens.input_ids.shape[-1]:].tolist()
+                    if tokenizer.eos_token_id in ids:
+                        ids = ids[:ids.index(tokenizer.eos_token_id) + 1]
+                    finish = "stop" if ids[-1] == tokenizer.eos_token_id else "length"
+                    assert (
+                        finish == "stop"
+                        or len(ids) == COHERENCE_SAMPLING["max_tokens"]
+                    )
+                    rows.append({
+                        "text": tokenizer.decode(ids, skip_special_tokens=True),
+                        "finish_reason": finish,
+                        "tokens": len(ids),
+                    })
+                return rows
+
+            measure("pytorch", score, sample)
+            return vector, shared_lm_head_weight
         finally:
-            handle.remove()
-        assert len(captured) == 1, f"PyTorch final-norm captures: {len(captured)}"
-        return _common_head_logprobs(captured[0], shared_lm_head_weight)
+            if model is not None:
+                del model
+            gc.collect()
+            torch.cuda.empty_cache()
 
-    def reference_samples(prompt, coefficient, seed):
-        tokens = tokenizer(prompt, return_tensors="pt").to("cuda")
-        torch.manual_seed(seed)
-        params = dict(
-            COHERENCE_SAMPLING, do_sample=True, pad_token_id=tokenizer.eos_token_id
-        )
-        params["num_return_sequences"] = params.pop("n")
-        params["max_new_tokens"] = params.pop("max_tokens")
-        with _reference_steering(model, vector, coefficient), torch.inference_mode():
-            sequences = model.generate(**tokens, **params)
-        rows = []
-        for sequence in sequences:
-            ids = sequence[tokens.input_ids.shape[-1]:].tolist()
-            if tokenizer.eos_token_id in ids:
-                ids = ids[:ids.index(tokenizer.eos_token_id) + 1]
-            finish = "stop" if ids[-1] == tokenizer.eos_token_id else "length"
-            assert finish == "stop" or len(ids) == COHERENCE_SAMPLING["max_tokens"]
-            rows.append({
-                "text": tokenizer.decode(ids, skip_special_tokens=True),
-                "finish_reason": finish,
-                "tokens": len(ids),
-            })
-        return rows
+    vector, shared_lm_head_weight = run_pytorch_phase()
 
-    measure("pytorch", reference_score, reference_samples)
-    del model
-    torch.cuda.empty_cache()
-    PluginRegistry.register_worker("fidelity_capture", FidelityCaptureWorker)
-    llm = HookLLM(
-        model=COHERENCE_MODEL,
-        revision=COHERENCE_REVISION,
-        worker_name="fidelity_capture",
-        download_dir=str(cache_dir),
-        gpu_memory_utilization=0.6,
-        max_logprobs=-1,
-        dtype=torch.bfloat16,
-        enable_hook=True,
-        enable_prefix_caching=False,
-    )
-    llm.llm.collective_rpc("install_hooks")
+    def run_vllm_phase():
+        PluginRegistry.register_worker("fidelity_capture", FidelityCaptureWorker)
+        llm = None
+        try:
+            llm = HookLLM(
+                model=COHERENCE_MODEL,
+                revision=COHERENCE_REVISION,
+                worker_name="fidelity_capture",
+                download_dir=str(cache_dir),
+                gpu_memory_utilization=0.6,
+                max_logprobs=-1,
+                dtype=torch.bfloat16,
+                enable_hook=True,
+                enable_prefix_caching=False,
+            )
+            llm.llm.collective_rpc("install_hooks")
 
-    def vllm_output(prompt, coefficient, seed, params, capture=False):
-        extra_args = _steer_extra(vector_path, coefficient) if coefficient else {}
-        if capture:
-            extra_args["fidelity_capture"] = True
-        return llm.generate(
-            prompt,
-            sampling_params=SamplingParams(**params, seed=seed, extra_args=extra_args),
-            use_hook=bool(extra_args),
-        )[0]
+            def output(prompt, coefficient, seed, params, capture=False):
+                extra_args = _steer_extra(
+                    vector_path, coefficient
+                ) if coefficient else {}
+                if capture:
+                    extra_args["fidelity_capture"] = True
+                return llm.generate(
+                    prompt,
+                    sampling_params=SamplingParams(
+                        **params, seed=seed, extra_args=extra_args),
+                    use_hook=bool(extra_args),
+                )[0]
 
-    def vllm_score(prompt, coefficient, seed):
-        params = {"temperature": 0.0, "max_tokens": 1}
-        vllm_output(prompt, coefficient, seed, params, capture=True)
-        captures = llm.llm.collective_rpc("pop_final_norm_last_token")
-        assert len(captures) == 1, f"vLLM rank captures: {len(captures)}"
-        return _common_head_logprobs(captures[0], shared_lm_head_weight)
+            def score(prompt, coefficient, seed):
+                params = {"temperature": 0.0, "max_tokens": 1}
+                output(prompt, coefficient, seed, params, capture=True)
+                captures = llm.llm.collective_rpc("pop_final_norm_last_token")
+                assert len(captures) == 1, (
+                    f"vLLM rank captures: {len(captures)}")
+                return _common_head_logprobs(
+                    captures[0], shared_lm_head_weight)
 
-    def vllm_samples(prompt, coefficient, seed):
-        output = vllm_output(prompt, coefficient, seed, COHERENCE_SAMPLING)
-        return [
-            {
-                "text": item.text,
-                "finish_reason": item.finish_reason,
-                "tokens": len(item.token_ids),
-            }
-            for item in output.outputs
-        ]
+            def sample(prompt, coefficient, seed):
+                generated = output(
+                    prompt, coefficient, seed, COHERENCE_SAMPLING)
+                return [
+                    {
+                        "text": item.text,
+                        "finish_reason": item.finish_reason,
+                        "tokens": len(item.token_ids),
+                    }
+                    for item in generated.outputs
+                ]
 
-    measure("vllm", vllm_score, vllm_samples)
+            measure("vllm", score, sample)
+        finally:
+            if llm is not None:
+                llm.close()
+                del llm
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    run_vllm_phase()
     worst_gap, gaps = _cross_backend_gaps(results)
     target_deltas = _ordinary_target_deltas(results)
     target_count = sum(
@@ -911,8 +945,6 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     oversteer_degrades = all(
         all(cells.values()) for cells in oversteer_mass.values()
     )
-    del llm
-    torch.cuda.empty_cache()
     elapsed_s = time.monotonic() - started
     artifact_path = tmp_path / "public_persona_coherence.json"
     artifact_path.write_text(json.dumps(results, indent=2) + "\n")
@@ -920,7 +952,8 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     print(f"coherence_artifact={artifact_path}")
     print(
         "score path: bf16 transformer/steering -> post-final-RMSNorm hidden -> "
-        "shared checkpoint lm_head and family logsumexp in fp32."
+        "HF-loaded bf16 checkpoint lm_head weights cast to fp32 for projection, "
+        "then family logsumexp in fp32."
     )
     print("generation path: each backend's native bf16 sampler; not a fidelity claim.")
     print(
