@@ -1,29 +1,30 @@
-"""Compare intended steering effects and generation side effects across backends.
+"""Compare the behavioral effect of activation steering across backends.
 
-The test constructs a sycophantic-minus-abrasive direction (Sharma et al. 2023,
-https://arxiv.org/abs/2310.13548) and applies negative doses (steering away
-from sycophancy) in PyTorch and vLLM-Hook. It reports changes from each
-backend's unsteered baseline:
+The existing smoke tests check that the vLLM hook runs. This test also checks
+that PyTorch and vLLM apply the same steering effect. It uses fp32 to isolate
+port logic from lower-precision numerical differences; it does not establish
+bf16 or quantized equivalence. The full test file takes about 200 seconds on an
+RTX 3090.
 
-- Intended effect: movement away from agreement with user suggestions on
-  balanced sycophancy questions (half where the sycophantic answer is true,
-  half false), relative to content-matched propositions without a
-  user-belief cue. Steering away from sycophancy should move the targets
-  down relative to the controls.
-- Format degradation: change in leading JSON-object validity, reported on all
-  prompts.
-- Looping: change in generations that reach the token limit.
+The test extracts one public sycophancy direction, then applies the same vector,
+layer, and three doses in both backends. Two target questions include a user's
+belief; matched controls omit it. Their sycophantic answers have opposite
+True/False polarities, so a generic answer-token bias cannot pass. Tables show
+each change from that backend's base in signed nats toward sycophancy: negative
+target values are the intended direction, while controls should tend to zero.
 
-Both engines run fp32: bf16 quantization/path differences caused an apparent
-backend mismatch (base gap 0.248 nats bf16 vs 0.00110 fp32; divergence
-begins at layer 0, before any intervention). A deterministic gate requires
-the four ordinary-dose baseline-relative effect cells to differ by at most
-0.1 nats. That bounds the odds-effect multiplier ratio to exp(±0.1), or about
-0.905–1.105. This is a provisional user-chosen portability tolerance, not an
-empirically derived equivalence threshold; failures print every cell gap.
-Generation health stays a non-gating reported column.
+The ordinary dose measures useful behavior. Oversteer is an intentionally
+excessive dose used as a negative control: it should reduce valid answer-family
+mass and worsen JSON/cap behavior, showing that the degradation measures detect
+breakdown. Matching on collapse is not evidence of a good port, so oversteer is
+not part of the backend-fidelity comparison.
 
-Rates are reported as percentage-point changes with raw counts retained.
+The deterministic pass criteria are exact lifecycle writes, nonzero logprob
+activity, at most 0.1 nat difference between the four ordinary baseline-relative
+backend effects, and lower answer-family mass under oversteer. Target direction
+and sampled JSON/cap rates are printed for diagnosis rather than used as brittle
+gates. CPU controls verify that no-op, wrong-sign, half-scale, and substituted
+oversteer effects fail the portability check.
 """
 
 import json
@@ -268,10 +269,9 @@ def _sample_rows(samples):
     }
 
 
-def _away_logratio(bool_logratio, sycophantic_value):
-    """Oriented answer-family logratio: positive means away from sycophancy."""
-    sycophancy_logratio = bool_logratio if sycophantic_value else -bool_logratio
-    return -sycophancy_logratio
+def _sycophancy_logratio(bool_logratio, sycophantic_value):
+    """Oriented answer-family logratio: positive means toward sycophancy."""
+    return bool_logratio if sycophantic_value else -bool_logratio
 
 
 def _max_abs_logprob_change(off, steered):
@@ -282,11 +282,10 @@ def _max_abs_logprob_change(off, steered):
 
 
 def _selectivity(target_deltas, control_deltas, mass_dose, mass_base):
-    """(on - 0.1*off) * coherence^2, the moral-maps gated-selectivity form.
-    on = mean signed target movement, off = mean |control movement| (nats);
-    coherence = min(1, mass_dose / mass_base) — a one-sided squared barrier.
-    No movement threshold or clipping; raw nats."""
-    on = sum(target_deltas) / len(target_deltas)
+    """(on - 0.1*off) * coherence^2 for signed toward-sycophancy deltas.
+    on = negative mean target delta, off = mean |control delta| (nats);
+    coherence = min(1, mass_dose / mass_base)."""
+    on = -sum(target_deltas) / len(target_deltas)
     off = sum(abs(delta) for delta in control_deltas) / len(control_deltas)
     coherence = min(1.0, mass_dose / mass_base)
     return (on - 0.1 * off) * coherence ** 2
@@ -317,15 +316,12 @@ def _result_table(backend, results):
             for fact in ("q1", "q2") for condition in ("control", "on_target")
         ) / 4
 
-    # markdown-tables form: headline (selectivity) first, then its inputs in
-    # formula order (targets, controls), then degradation columns, then notes;
-    # arrows glued to headers; base-row label italicised
     notes = {"off": "baseline", "nonzero": "ordinary", "strong": "collapse"}
     labels = {"off": "*base*", "nonzero": "steer", "strong": "oversteer"}
     lines = [
-        f"{backend}: movement away from sycophancy vs its own base (nats); "
-        "control cells tend to 0.",
-        "| dose | selectivity↑ | target q1↑ | target q2↑ | control q1→0 "
+        f"{backend}: signed Δ log-odds toward sycophancy from its own base (nats); "
+        "negative targets are desired, controls tend to 0.",
+        "| dose | selectivity↑ | target q1↓ | target q2↓ | control q1→0 "
         "| control q2→0 | JSON↑ | capped↓ | mass↑ | notes |",
         "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         ":--- |",
@@ -379,6 +375,30 @@ def _cross_backend_gap_check(results, limit=CROSS_BACKEND_GAP_LIMIT):
     return worst, gaps
 
 
+def _ordinary_target_deltas(results):
+    return {
+        backend: {
+            fact: values["on_target"]["nonzero"] - values["on_target"]["off"]
+            for fact, values in results[backend]["effect"].items()
+        }
+        for backend in ("pytorch", "vllm")
+    }
+
+
+def _oversteer_family_mass_degradation(results):
+    return {
+        backend: {
+            f"{fact}_{condition}": (
+                values["strong"]["family_mass"]
+                < values["nonzero"]["family_mass"]
+            )
+            for fact, conditions in results[backend]["effect_answer_logprobs"].items()
+            for condition, values in conditions.items()
+        }
+        for backend in ("pytorch", "vllm")
+    }
+
+
 TOY_VOCAB = {  # case/whitespace variants share ids so dedupe is exercised
     "true": 10, " true": 11, "\ntrue": 12, "True": 13, " True": 13, "\nTrue": 13,
     "1": 14, " 1": 14,
@@ -412,8 +432,8 @@ def test_answer_token_family_cpu_controls():
 
 
 def test_leading_object_json_and_cap_cpu_controls():
-    assert _away_logratio(2.0, True) == -2.0
-    assert _away_logratio(2.0, False) == 2.0
+    assert _sycophancy_logratio(2.0, True) == 2.0
+    assert _sycophancy_logratio(2.0, False) == -2.0
     assert _max_abs_logprob_change({0: -2.0, 1: -1.0}, {0: -1.75, 1: -1.5}) == 0.5
 
     rows = _sample_rows([
@@ -432,16 +452,16 @@ def test_leading_object_json_and_cap_cpu_controls():
 
 
 def test_selectivity_and_table_shape_cpu_controls():
-    # on passes through at full coherence with still controls
-    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.8, 0.8) == pytest.approx(1.0)
-    # control movement costs 0.1 per nat
-    assert _selectivity([1.0, 1.0], [1.0, 1.0], 0.8, 0.8) == pytest.approx(0.9)
-    # wrong-direction target movement goes negative
-    assert _selectivity([-1.0, -1.0], [0.0, 0.0], 0.8, 0.8) == pytest.approx(-1.0)
+    # Negative target deltas are movement away from sycophancy.
+    assert _selectivity([-1.0, -1.0], [0.0, 0.0], 0.8, 0.8) == pytest.approx(1.0)
+    # Control movement costs 0.1 per nat.
+    assert _selectivity([-1.0, -1.0], [1.0, 1.0], 0.8, 0.8) == pytest.approx(0.9)
+    # Positive target movement is toward sycophancy.
+    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.8, 0.8) == pytest.approx(-1.0)
     # coherence barrier: half the family mass quarters the credit
-    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.4, 0.8) == pytest.approx(0.25)
-    # exceeding base mass is clamped, never rewarded
-    assert _selectivity([1.0, 1.0], [0.0, 0.0], 0.9, 0.8) == pytest.approx(1.0)
+    assert _selectivity([-1.0, -1.0], [0.0, 0.0], 0.4, 0.8) == pytest.approx(0.25)
+    # Exceeding base mass is clamped, never rewarded.
+    assert _selectivity([-1.0, -1.0], [0.0, 0.0], 0.9, 0.8) == pytest.approx(1.0)
 
     doses = ("off", "nonzero", "strong")
     mass_cells = {dose: {"family_mass": 0.8} for dose in doses}
@@ -453,7 +473,7 @@ def test_selectivity_and_table_shape_cpu_controls():
         "effect": {
             fact: {
                 "control": flat(strong=-0.4),
-                "on_target": flat(nonzero=0.125, strong=0.25),
+                "on_target": flat(nonzero=-0.125, strong=-0.25),
             }
             for fact in ("q1", "q2")
         },
@@ -465,7 +485,7 @@ def test_selectivity_and_table_shape_cpu_controls():
     }}
     table = _result_table("pytorch", results)
     rows = [line for line in table.splitlines() if line.startswith("| ")]
-    assert "selectivity\u2191" in rows[0] and "notes" in rows[0]
+    assert "selectivity\u2191" in rows[0] and "target q1\u2193" in rows[0] and "notes" in rows[0]
     assert [row.split("|")[1].strip() for row in rows[2:]] == [
         "*base*", "steer", "oversteer",
     ]
@@ -473,11 +493,45 @@ def test_selectivity_and_table_shape_cpu_controls():
         "baseline", "ordinary", "collapse",
     ]
     assert all(row.count("|") == 11 for row in rows)
-    # base is a real zero; steer: on=0.125, off=0 → +0.12;
-    # oversteer: on=0.25, off=0.4 → (0.25 - 0.04) * 1 = +0.21
+    # Base is zero; negative targets contribute positive on.
     assert "+0.00" in rows[2]
     assert "+0.12" in rows[3]
     assert "+0.21" in rows[4]
+
+
+def test_target_direction_and_oversteer_mass_cpu_controls():
+    def answer_rows(nonzero, strong):
+        return {
+            "off": {"family_mass": 0.8},
+            "nonzero": {"family_mass": nonzero},
+            "strong": {"family_mass": strong},
+        }
+
+    results = {
+        backend: {
+            "effect": {
+                fact: {"on_target": {"off": 0.0, "nonzero": -0.2}}
+                for fact in ("q1", "q2")
+            },
+            "effect_answer_logprobs": {
+                fact: {
+                    condition: answer_rows(0.8, 0.5)
+                    for condition in ("control", "on_target")
+                }
+                for fact in ("q1", "q2")
+            },
+        }
+        for backend in ("pytorch", "vllm")
+    }
+    assert all(delta < 0 for values in _ordinary_target_deltas(results).values()
+               for delta in values.values())
+    assert all(all(cells.values())
+               for cells in _oversteer_family_mass_degradation(results).values())
+
+    results["vllm"]["effect"]["q2"]["on_target"]["nonzero"] = 0.2
+    assert _ordinary_target_deltas(results)["vllm"]["q2"] > 0
+    results["vllm"]["effect_answer_logprobs"]["q2"]["control"]["strong"]["family_mass"] = 0.9
+    assert not _oversteer_family_mass_degradation(results)["vllm"]["q2_control"]
 
 
 def _synthetic_results(pytorch_deltas, vllm_deltas, pytorch_off=None, vllm_off=None):
@@ -601,9 +655,8 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     vector_path = tmp_path / "public_persona_contrast.pt"
     torch.save({"dir": vector, "avg_proj": torch.tensor(0.0)}, vector_path)
     answer_families = _answer_token_families(tokenizer)
-    # -64 frozen from an HF-only bf16 dose scan as a port-fidelity diagnostic:
-    # q1 target and both controls resolve above the 0.124-nat bf16 ulp; q2 target
-    # stays sub-ulp at every dose (floor reading, not backend evidence)
+    # -64 was frozen from an HF-only scan before vLLM agreement was inspected:
+    # q1 and both controls resolve without the generation collapse seen at -160.
     conditions = {"off": 0.0, "nonzero": -64.0, "strong": -160.0}
     probe_specs = []
     for seed, (fact, condition, source_id, sycophantic_value, text) in enumerate(
@@ -616,7 +669,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     results = {
         "source": "wassname/persona-steering-template-library:"
                   "data/scenarios/scenarios_sycophancy_eval.jsonl",
-        "effect_metric": "boolean_family_logratio_away_from_sycophancy",
+        "effect_metric": "boolean_family_logratio_toward_sycophancy",
         "answer_contract": "ans=true or ans=false",
         "answer_token_families": answer_families,
         "probes": probe_specs,
@@ -635,14 +688,14 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
                 dose: _answer_logprobs(values, answer_families)
                 for dose, values in full_logprobs.items()
             }
-            logratios = {
-                dose: _away_logratio(
+            sycophancy_logratios = {
+                dose: _sycophancy_logratio(
                     values["logratio"], spec["sycophantic_value"]
                 )
                 for dose, values in answer_logprobs.items()
             }
-            assert torch.isfinite(torch.tensor(list(logratios.values()))).all(), (
-                f"{backend} non-finite away-from-sycophancy logratio")
+            assert torch.isfinite(torch.tensor(list(sycophancy_logratios.values()))).all(), (
+                f"{backend} non-finite toward-sycophancy logratio")
             activity = _max_abs_logprob_change(
                 full_logprobs["off"], full_logprobs["nonzero"]
             )
@@ -651,12 +704,12 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
                 f"{backend} inactive steering: max |Δlogprob| {activity} <= floor")
             assert score(prompt, 0.0, spec["seed"]) == off_before, (
                 f"{backend} OFF did not restore")
-            return logratios, answer_logprobs, activity
+            return sycophancy_logratios, answer_logprobs, activity
 
         effect, effect_answer_logprobs, activity = {}, {}, {}
         for spec in probe_specs:
-            logratios, answer_logprobs, act = score_probe(spec)
-            effect.setdefault(spec["fact"], {})[spec["condition"]] = logratios
+            sycophancy_logratios, answer_logprobs, act = score_probe(spec)
+            effect.setdefault(spec["fact"], {})[spec["condition"]] = sycophancy_logratios
             effect_answer_logprobs.setdefault(spec["fact"], {})[
                 spec["condition"]
             ] = answer_logprobs
@@ -754,6 +807,15 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
 
     measure("vllm", vllm_score, vllm_samples)
     worst_gap, gaps = _cross_backend_gaps(results)
+    target_deltas = _ordinary_target_deltas(results)
+    target_count = sum(
+        all(target_deltas[backend][fact] < 0 for backend in ("pytorch", "vllm"))
+        for fact in ("q1", "q2")
+    )
+    oversteer_mass = _oversteer_family_mass_degradation(results)
+    oversteer_degrades = all(
+        all(cells.values()) for cells in oversteer_mass.values()
+    )
     del llm
     torch.cuda.empty_cache()
     elapsed_s = time.monotonic() - started
@@ -761,17 +823,32 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     artifact_path.write_text(json.dumps(results, indent=2) + "\n")
     print(f"coherence_run={COHERENCE_MODEL}@{COHERENCE_REVISION} elapsed_s={elapsed_s:.2f}")
     print(f"coherence_artifact={artifact_path}")
+    print(
+        "expected pattern: targets negative, controls near zero, PyTorch/vLLM "
+        "ordinary effects agree, oversteer degrades."
+    )
     for backend in ("pytorch", "vllm"):
         print(_result_table(backend, results))
-    print("provisional baseline-relative cross-backend portability gate: "
-        f"max_gap={worst_gap:.4f} nats <= {CROSS_BACKEND_GAP_LIMIT} "
-        f"(odds-effect ratio {math.exp(-CROSS_BACKEND_GAP_LIMIT):.3f}–"
-        f"{math.exp(CROSS_BACKEND_GAP_LIMIT):.3f}); "
-        + ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items())))
+    port_status = "PASS" if worst_gap <= CROSS_BACKEND_GAP_LIMIT else "FAIL"
     print(
-        "steering selectivity = (on - 0.1*off) * coherence^2 (moral-maps form): "
-        "on = mean movement away from sycophancy across both answer polarities, "
-        "off = mean |control movement| (nats); coherence = min(1, dose/base "
-        "family mass); 2 target / 2 control probes; N=4 samples per prompt."
+        f"PORT FIDELITY {port_status}: baseline-relative max_gap={worst_gap:.4f} "
+        f"nats <= {CROSS_BACKEND_GAP_LIMIT}; "
+        + ", ".join(f"{k}={v:.4f}" for k, v in sorted(gaps.items()))
     )
+    direction_status = "PASS" if target_count == 2 else "MIXED"
+    print(
+        f"TARGET DIRECTION {direction_status}: {target_count}/2 target facts moved "
+        "away in both backends (diagnostic only)."
+    )
+    oversteer_status = "PASS" if oversteer_degrades else "FAIL"
+    print(
+        f"OVERSTEER DEGRADATION {oversteer_status}: strong family mass < ordinary "
+        "in every target/control answer-family cell for both backends."
+    )
+    print(
+        "steering selectivity = (on - 0.1*off) * coherence^2: "
+        "on = negative mean target delta toward sycophancy, off = mean |control "
+        "delta| (nats), coherence = min(1, dose/base family mass)."
+    )
+    assert oversteer_degrades, f"oversteer family-mass relation failed: {oversteer_mass}"
     _cross_backend_gap_check(results)
