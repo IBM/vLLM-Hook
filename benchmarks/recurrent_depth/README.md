@@ -113,7 +113,7 @@ into a new eval run; B produces the honest Pareto point.
 | Arm      | How                                                            |
 | -------- | -------------------------------------------------------------- |
 | Fixed    | `--sweep-fixed 4,8,16,32` → `rho=0`, vary `num_steps`          |
-| Adaptive | `--sweep-rho 0,0.01,… --num-steps 32` → vary `ρ`, cap `r_max`  |
+| Adaptive | `--condition margin=0.125 --condition top1_stability=T` (T sweep) |
 | Policy   | `--condition READOUT=THR …` or `--policy-manifest <json>`      |
 
 
@@ -152,7 +152,7 @@ BACKEND=hf OUT=benchmarks/recurrent_depth/results/hf \
 | `trajectory_io.py`         | flat trajectory → parquet       |
 | `analyze_signals.py`       | offline threshold calibration   |
 | `plot_pareto.py`           | quality vs \bar{r} PDF/PNG      |
-| `run_publication_sweep.sh` | fixed + ρ grids + plot          |
+| `run_sweep.sh`             | cal 64 + fixed/adaptive Pareto  |
 
 With `--capture-trajectory`, per-token decode metrics are written to
 `results/<backend>/trajectories/<slug>.parquet`. Run JSON / `sweep_summary.json`
@@ -183,10 +183,11 @@ python benchmarks/recurrent_depth/analyze_signals.py \
   --out-json benchmarks/recurrent_depth/results/vllm/signal_report.json \
   --write-manifest benchmarks/recurrent_depth/calibration/huginn_gsm8k_r32.json
 
-# 3. evaluate the frozen policy on held-out / full GSM8K (no capture-trajectory)
+# 3. evaluate the frozen pair at several stability thresholds (see run_sweep.sh)
 python benchmarks/recurrent_depth/run_lm_eval.py --backend vllm \
-  --tasks gsm8k --num-fewshot 5 --num-steps 32 \
-  --policy-manifest benchmarks/recurrent_depth/calibration/huginn_gsm8k_r32.json
+  --tasks gsm8k --num-fewshot 5 --num-steps 32 --limit 256 \
+  --min-steps 2 --patience 2 \
+  --condition margin=0.125 --condition top1_stability=4
 ```
 
 Earliest safe depth = shallowest depth whose top-1 token already matches the

@@ -17,25 +17,48 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-def _metric_from_results(results: dict, task: str, metric: str) -> Optional[float]:
+def _task_block(results: dict, task: str) -> Optional[dict]:
     if not results:
         return None
-    # lm-eval nests as results[task][metric] or results[task][metric,none]
     block = results.get(task) or results.get(f"{task}")
     if block is None:
-        # try first key containing task name
         for k, v in results.items():
             if task in k and isinstance(v, dict):
-                block = v
-                break
-    if not isinstance(block, dict):
-        return None
+                return v
+    return block if isinstance(block, dict) else None
+
+
+def _metric_key(block: dict, metric: str) -> Optional[str]:
     if metric in block and isinstance(block[metric], (int, float)):
-        return float(block[metric])
+        return metric
     for k, v in block.items():
-        if k.startswith(metric) and isinstance(v, (int, float)):
-            return float(v)
+        if k.startswith(metric) and "_stderr" not in k and isinstance(v, (int, float)):
+            return k
     return None
+
+
+def _stderr_key(quality_key: str) -> str:
+    if "," in quality_key:
+        prefix, suffix = quality_key.split(",", 1)
+        return f"{prefix}_stderr,{suffix}"
+    return f"{quality_key}_stderr"
+
+
+def _metric_from_results(
+    results: dict, task: str, metric: str
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return (quality, stderr) from an lm-eval results block."""
+    block = _task_block(results, task)
+    if block is None:
+        return None, None
+    key = _metric_key(block, metric)
+    if key is None:
+        return None, None
+    quality = float(block[key])
+    stderr_key = _stderr_key(key)
+    raw = block.get(stderr_key)
+    stderr = float(raw) if isinstance(raw, (int, float)) else None
+    return quality, stderr
 
 
 def load_points(results_dir: Path, task: str, metric: str) -> List[Dict[str, Any]]:
@@ -57,7 +80,7 @@ def load_points(results_dir: Path, task: str, metric: str) -> List[Dict[str, Any
         if r_bar is None and cfg.get("rho", 0) == 0 and cfg.get("num_steps") is not None:
             r_bar = float(cfg["num_steps"])
             cost_basis = "configured"
-        quality = _metric_from_results(data.get("results") or {}, task, metric)
+        quality, stderr = _metric_from_results(data.get("results") or {}, task, metric)
         if r_bar is None or quality is None:
             continue
         points.append(
@@ -73,6 +96,7 @@ def load_points(results_dir: Path, task: str, metric: str) -> List[Dict[str, Any
                 "mlp_token_steps": stats.get("mlp_token_steps"),
                 "attn_token_steps": stats.get("attn_token_steps"),
                 "quality": float(quality),
+                "quality_stderr": stderr,
                 "metric": metric,
                 "task": task,
             }
@@ -80,7 +104,19 @@ def load_points(results_dir: Path, task: str, metric: str) -> List[Dict[str, Any
     return points
 
 
-def plot(points: List[Dict[str, Any]], out: Path, title: str) -> None:
+def _yerr(points: List[Dict[str, Any]], ci_scale: float) -> Optional[List[float]]:
+    if any(p.get("quality_stderr") is None for p in points):
+        return None
+    return [ci_scale * float(p["quality_stderr"]) for p in points]
+
+
+def plot(
+    points: List[Dict[str, Any]],
+    out: Path,
+    title: str,
+    *,
+    ci_scale: float,
+) -> None:
     import matplotlib.pyplot as plt
 
     fixed = [p for p in points if p["arm"] == "fixed"]
@@ -89,32 +125,38 @@ def plot(points: List[Dict[str, Any]], out: Path, title: str) -> None:
     adaptive.sort(key=lambda p: p["mean_effective_r"])
 
     fig, ax = plt.subplots(figsize=(6.2, 4.2), dpi=160)
-    if fixed:
-        ax.plot(
-            [p["mean_effective_r"] for p in fixed],
-            [p["quality"] for p in fixed],
-            marker="o",
-            linestyle="-",
-            label="Fixed Depth (ρ = 0)",
-            color="#1f4e79",
-        )
-    if adaptive:
-        ax.plot(
-            [p["mean_effective_r"] for p in adaptive],
-            [p["quality"] for p in adaptive],
-            marker="s",
-            linestyle="--",
-            label="Adaptive Exit (ρ Sweep)",
-            color="#c45c26",
+    series = (
+        (fixed, "o", "-", "Fixed Depth (ρ = 0)", "#1f4e79"),
+        (adaptive, "s", "--", "Adaptive Exit", "#c45c26"),
+    )
+    for group, marker, linestyle, label, color in series:
+        if not group:
+            continue
+        ax.errorbar(
+            [p["mean_effective_r"] for p in group],
+            [p["quality"] for p in group],
+            yerr=_yerr(group, ci_scale),
+            marker=marker,
+            linestyle=linestyle,
+            label=label,
+            color=color,
+            capsize=3,
+            elinewidth=1,
         )
     basis = {p.get("cost_basis") for p in points}
-    label = (
+    xlabel = (
         r"Mean decode recurrence $\bar{r}_{\mathrm{decode}}$"
         if basis == {"decode"}
         else r"Mean effective recurrence $\bar{r}$"
     )
-    ax.set_xlabel(label)
-    ax.set_ylabel("Quality")
+    ax.set_xlabel(xlabel)
+    if abs(ci_scale - 1.96) < 0.02:
+        ylabel = "Quality (95% CI)"
+    elif abs(ci_scale - 1.0) < 0.02:
+        ylabel = r"Quality ($\pm$1 SE)"
+    else:
+        ylabel = f"Quality (±{ci_scale:g} SE)"
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
@@ -133,6 +175,12 @@ def main() -> None:
     p.add_argument("--metric", default="exact_match", help="lm-eval metric key prefix")
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--title", default=None)
+    p.add_argument(
+        "--ci-scale",
+        type=float,
+        default=1.96,
+        help="multiply lm-eval stderr by this for vertical bars (1.96 ≈ 95% CI)",
+    )
     args = p.parse_args()
 
     points = load_points(args.results_dir, args.task, args.metric)
@@ -145,7 +193,7 @@ def main() -> None:
 
     out = args.out or (args.results_dir / f"pareto_{args.task}.pdf")
     title = args.title or f"{args.task}: quality vs mean recurrence"
-    plot(points, out, title)
+    plot(points, out, title, ci_scale=args.ci_scale)
 
 
 if __name__ == "__main__":
