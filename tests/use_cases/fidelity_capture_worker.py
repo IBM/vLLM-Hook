@@ -41,4 +41,4 @@ class FidelityCaptureWorker(SteerHookActWorker):
             raise RuntimeError(
                 f"expected one final-norm state, captured {len(states)}"
             )
-        return states[0].clone()
+        return states[0].float().tolist()

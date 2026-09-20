@@ -647,7 +647,9 @@ def test_fidelity_capture_worker_uses_final_norm_boundary_cpu(monkeypatch):
     )
     assert worker._fidelity_final_norm_states == []
     normalized, _ = model.model.norm(hidden, hidden)
-    assert torch.equal(worker.pop_final_norm_last_token(), normalized[-1])
+    assert torch.equal(
+        torch.tensor(worker.pop_final_norm_last_token()), normalized[-1]
+    )
     worker.model_runner.requests["score"] = _request(None)
     model.model.norm(hidden, hidden)
     with pytest.raises(RuntimeError, match="captured 0"):
