@@ -1,34 +1,34 @@
-"""Compare the behavioral effect of activation steering across backends.
+"""Compare activation-steering effects in PyTorch and vLLM.
 
-The existing smoke tests check that the vLLM hook runs. This test also checks
-that PyTorch and vLLM apply the same steering effect. Both transformers and
-native sampled generation use bf16. Deterministic fidelity scoring captures
-each backend's post-final-RMSNorm last-token state and applies the HF-loaded
-bf16 checkpoint lm_head weights cast to fp32, plus answer-family logsumexp in
-fp32. This does not establish
-native bf16 output-probability equivalence. The full test file takes about 200
-seconds on an RTX 3090.
+Three pre-existing upstream smoke-test cases (OPT, GPT-2, and Qwen) check that
+the vLLM hook runs. The comparison also checks that both backends apply the
+same steering effect. Both transformers and native sampled generation use bf16.
+Deterministic fidelity scoring captures each backend's post-final-RMSNorm
+last-token state and applies the HF-loaded bf16 checkpoint ``lm_head`` weights
+cast to fp32, then answer-family logsumexp in fp32. It does not test native bf16
+output-probability equivalence.
 
-The test extracts one public sycophancy direction, then applies the same vector,
-layer, and three doses in both backends. Two target questions include a user's
-belief; matched controls omit it. Their sycophantic answers have opposite
-True/False polarities, which makes a generic answer-token bias visible in the
-per-question diagnostics. Target direction remains non-gating. Tables show
-each change from that backend's base in signed nats toward sycophancy: negative
-target values are the intended direction, while controls should tend to zero.
+The test extracts one public sycophancy direction and applies one away-from-
+sycophancy direction at ordinary and excessive doses to two target questions and
+their matched controls. q1
+maps sycophancy to true; q2 maps it to false. The signed metric is
+Δ[log P(Sycophantic) − log P(Not Sycophantic)] over the accepted answer-token
+families, so the q2 polarity flip gives the sign the same meaning. Negative
+target Δ means the sycophantic answer became less likely; controls should tend
+to zero. Target direction remains diagnostic.
 
-The ordinary dose measures useful behavior. Oversteer is an intentionally
-excessive dose used as a negative control: it should reduce valid answer-family
-mass and worsen leading-JSON-object/cap behavior, showing that the degradation
-measurements detect breakdown. Matching on collapse is not evidence of a good port, so oversteer is
-not part of the backend-fidelity comparison.
+The table asks whether steering changes target-concept answers without changing
+matched controls. Ordinary PyTorch/vLLM effects should agree. Deliberately
+excessive oversteer should reduce answer mass and generation health; it is not
+part of the port-fidelity comparison.
 
 The deterministic pass criteria are exact lifecycle writes, nonzero common-head
-logprob activity, at most 0.1 nat difference between the four ordinary
+logprob activity, at most 0.1 nat difference between four ordinary
 baseline-relative backend effects, and lower common-head answer-family mass
-under oversteer. Target direction and native bf16 sampled
-leading-JSON-object/cap rates are printed for diagnosis rather than used as brittle gates. CPU controls verify
-that no-op, wrong-sign, half-scale, and substituted oversteer effects fail the
+under oversteer. Leading JSON object is a parseable prefix, not schema
+validation. Capped means reaching the token limit. Both rates are diagnostic,
+shown as percentage-point changes with raw counts. CPU controls verify that
+no-op, wrong-sign, half-scale, and substituted-oversteer effects fail the
 portability check.
 """
 
@@ -279,7 +279,7 @@ def _sample_rows(samples):
 
 
 def _sycophancy_logratio(bool_logratio, sycophantic_value):
-    """Oriented answer-family logratio: positive means toward sycophancy."""
+    """log P(Sycophantic) - log P(Not Sycophantic); q2 flips True/False."""
     return bool_logratio if sycophantic_value else -bool_logratio
 
 
@@ -291,13 +291,12 @@ def _max_abs_logprob_change(off, steered):
 
 
 def _selectivity(target_deltas, control_deltas, mass_dose, mass_base):
-    """(on - 0.1*off) * coherence^2 for signed toward-sycophancy deltas.
-    on = negative mean target delta, off = mean |control delta| (nats);
-    coherence = min(1, mass_dose / mass_base)."""
+    """Mean target movement away minus 0.1*control movement, times coherence²."""
     on = -sum(target_deltas) / len(target_deltas)
     off = sum(abs(delta) for delta in control_deltas) / len(control_deltas)
     coherence = min(1.0, mass_dose / mass_base)
-    return (on - 0.1 * off) * coherence ** 2
+    score = (on - 0.1 * off) * coherence ** 2
+    return 0.0 if score == 0 else score
 
 
 def _aggregate_rows(rows):
@@ -325,13 +324,14 @@ def _result_table(backend, results):
             for fact in ("q1", "q2") for condition in ("control", "on_target")
         ) / 4
 
-    notes = {"off": "baseline", "nonzero": "ordinary", "strong": "collapse"}
+    notes = {"off": "baseline", "nonzero": "ordinary", "strong": "excessive"}
     labels = {"off": "*base*", "nonzero": "steer", "strong": "oversteer"}
     lines = [
-        f"{backend}: signed Δ log-odds toward sycophancy from its own base (nats); "
-        "negative targets are desired, controls tend to 0.",
-        "| dose | selectivity↑ | target q1↓ | target q2↓ | control q1→0 "
-        "| control q2→0 | leading JSON object↑ | capped↓ | mass↑ | notes |",
+        f"{backend}: signed Δ[log P(Sycophantic) − log P(Not Sycophantic)] "
+        "from its own base (nats); q2 flips True/False polarity, negative targets "
+        "mean less sycophancy, and controls tend to 0.",
+        "| dose | selectivity↑ | mass↑ | leading JSON object↑ | capped↓ "
+        "| target q1↓ | target q2↓ | control q1→0 | control q2→0 | notes |",
         "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         ":--- |",
     ]
@@ -351,10 +351,10 @@ def _result_table(backend, results):
         row = _aggregate_rows([rows[dose] for rows in generation.values()])
         sel = _selectivity(targets, controls, mean_mass(dose), mean_mass("off"))
         lines.append(
-            f"| {labels[dose]} | {sel:+.2f} | {targets[0]:+.2f} | {targets[1]:+.2f} | "
-            f"{controls[0]:+.2f} | {controls[1]:+.2f} | "
+            f"| {labels[dose]} | {sel:+.2f} | {min(masses):.2f}–{max(masses):.2f} | "
             f"{_count_cell(row, off, 'json')} | {_count_cell(row, off, 'capped')} | "
-            f"{min(masses):.2f}–{max(masses):.2f} | {notes[dose]} |"
+            f"{targets[0]:+.2f} | {targets[1]:+.2f} | "
+            f"{controls[0]:+.2f} | {controls[1]:+.2f} | {notes[dose]} |"
         )
     return "\n".join(lines)
 
@@ -494,12 +494,15 @@ def test_selectivity_and_table_shape_cpu_controls():
     }}
     table = _result_table("pytorch", results)
     rows = [line for line in table.splitlines() if line.startswith("| ")]
-    assert "selectivity\u2191" in rows[0] and "target q1\u2193" in rows[0] and "notes" in rows[0]
+    assert rows[0] == (
+        "| dose | selectivity↑ | mass↑ | leading JSON object↑ | capped↓ "
+        "| target q1↓ | target q2↓ | control q1→0 | control q2→0 | notes |"
+    )
     assert [row.split("|")[1].strip() for row in rows[2:]] == [
         "*base*", "steer", "oversteer",
     ]
     assert [row.split("|")[-2].strip() for row in rows[2:]] == [
-        "baseline", "ordinary", "collapse",
+        "baseline", "ordinary", "excessive",
     ]
     assert all(row.count("|") == 11 for row in rows)
     # Base is zero; negative targets contribute positive on.
@@ -733,7 +736,7 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     results = {
         "source": "wassname/persona-steering-template-library:"
                   "data/scenarios/scenarios_sycophancy_eval.jsonl",
-        "effect_metric": "boolean_family_logratio_toward_sycophancy",
+        "effect_metric": "log_p_sycophantic_minus_log_p_not_sycophantic",
         "deterministic_score_path": (
             "backend bf16 transformer/steering -> post-final-RMSNorm last-token "
             "hidden -> HF-loaded bf16 checkpoint lm_head weights cast to fp32 "
@@ -957,8 +960,10 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
     )
     print("generation path: each backend's native bf16 sampler; not a fidelity claim.")
     print(
-        "expected pattern: targets negative, controls near zero, PyTorch/vLLM "
-        "ordinary common-head effects agree, oversteer degrades."
+        "caption: steering should change target-concept answers without changing "
+        "matched controls. Negative target Δ means the sycophantic answer became "
+        "less likely. Ordinary PyTorch/vLLM effects should agree; deliberately "
+        "excessive oversteer should degrade answer mass and generation health."
     )
     for backend in ("pytorch", "vllm"):
         print(_result_table(backend, results))
@@ -980,9 +985,10 @@ def test_activation_steer_public_persona_coherence(cache_dir, tmp_path):
         "< ordinary in every target/control answer-family cell for both backends."
     )
     print(
-        "steering selectivity = (on - 0.1*off) * coherence^2: "
-        "on = negative mean target delta toward sycophancy, off = mean |control "
-        "delta| (nats), coherence = min(1, dose/base family mass)."
+        "selectivity = (mean target movement away - 0.1*mean |control movement|) "
+        "* coherence^2. Base is 0; ordinary values should be positive and similar. "
+        "coherence = min(1, dose/base valid-answer mass), so strong doses lose "
+        "credit as answer mass degrades."
     )
     assert oversteer_degrades, f"oversteer family-mass relation failed: {oversteer_mass}"
     _cross_backend_gap_check(results)
