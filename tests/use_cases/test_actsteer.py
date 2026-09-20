@@ -693,9 +693,11 @@ def _reference_steering(model, vector, coefficient):
         return
 
     def steer(_, __, output):
-        residual = output[0] if isinstance(output, tuple) else output
-        changed = residual.clone()
-        changed[:, -1:, :] += coefficient * vector.to(residual)
+        # HF returns the residual-summed stream; vLLM keeps it split and steers
+        # the residual branch before the next fused add+norm.
+        effective_hidden = output[0] if isinstance(output, tuple) else output
+        changed = effective_hidden.clone()
+        changed[:, -1:, :] += coefficient * vector.to(effective_hidden)
         return (changed, *output[1:]) if isinstance(output, tuple) else changed
 
     handle = model.model.layers[COHERENCE_LAYER].register_forward_hook(steer)
