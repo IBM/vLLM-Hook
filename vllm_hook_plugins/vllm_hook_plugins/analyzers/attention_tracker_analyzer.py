@@ -92,7 +92,7 @@ class AttntrackerAnalyzer:
         for attention, input_range in zip(batch_attention, batch_input_range):
             scores = []
             for _, layer_data in attention.items():
-                attn_np = layer_data['attention'].numpy()  # [num_heads, seq_len] — single transfer
+                attn_np = layer_data['attention'].to(torch.float32).numpy()  # [num_heads, seq_len] — single transfer
 
                 inst_attn = attn_np[:, input_range[0][0]:input_range[0][1]]  # [num_heads, inst_len]
                 data_attn = attn_np[:, input_range[1][0]:input_range[1][1]]  # [num_heads, data_len]
