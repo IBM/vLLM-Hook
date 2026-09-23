@@ -1,3 +1,7 @@
+from pathlib import Path
+
+__path__.append(str(Path(__file__).with_name("vllm_hook_plugins")))
+
 from .vllm_hook_plugins import (
     PluginRegistry,
     HookLLM,

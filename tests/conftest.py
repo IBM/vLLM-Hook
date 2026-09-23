@@ -34,7 +34,7 @@ def cache_root(tmp_path_factory) -> Path:
 
 @pytest.fixture
 def cache_dir(cache_root: Path, request) -> Path:
-    sub = cache_root / request.node.name
+    sub = cache_root / request.node.name.replace("/", "-").replace("[", "-").replace("]", "")
     sub.mkdir(parents=True, exist_ok=True)
     return sub
 
