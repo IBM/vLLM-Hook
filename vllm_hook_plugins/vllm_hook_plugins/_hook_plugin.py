@@ -73,12 +73,53 @@ def _trim_probes(probes: dict, key: str, expected_len: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _log_capture_budget(vllm_config, worker_type: str) -> None:
+    """Report per-step capture size against memory left outside vLLM's pool.
+
+    vLLM profiles GPU memory before hooks install, so capture buffers are not
+    part of the KV cache budget; they have to fit in whatever
+    gpu_memory_utilization leaves free.
+    """
+    import warnings
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+
+        mc = vllm_config.model_config
+        tc = mc.hf_text_config
+        tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        layers = tc.num_hidden_layers
+        gmu = vllm_config.cache_config.gpu_memory_utilization
+        total = torch.cuda.get_device_properties(0).total_memory
+        if worker_type == "qk":
+            head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
+            width = (tc.num_attention_heads + tc.num_key_value_heads) * head_dim
+        else:
+            width = tc.hidden_size
+        per_step = tokens * layers * width * mc.dtype.itemsize
+        free = total * (1.0 - gmu)
+    except Exception:  # noqa: BLE001 - diagnostics must never block startup
+        return
+
+    warnings.warn(
+        f"vLLM-Hook: capture buffers are outside vLLM's memory budget. "
+        f"One scheduler step at full width costs {per_step / 1024**2:.0f} MiB "
+        f"({tokens} tokens x {layers} layers x {width} x "
+        f"{mc.dtype.itemsize} bytes); gpu_memory_utilization={gmu:.2f} leaves "
+        f"about {free / 1024**2:.0f} MiB free. Capturing all_tokens over a whole "
+        f"generate() call costs more than one step.",
+        UserWarning,
+    )
+
+
 def _patched_create_engine_config(self, *args, **kwargs):
     """Inject worker extension and force eager mode before VllmConfig is built."""
+    # Default to hidden states worker; users can override via env var.
+    import os
+    worker_type = os.environ.get("VLLM_HOOK_WORKER", "hidden_states")
     if not self.worker_extension_cls:
-        # Default to hidden states worker; users can override via env var.
-        import os
-        worker_type = os.environ.get("VLLM_HOOK_WORKER", "hidden_states")
         if worker_type == "qk":
             self.worker_extension_cls = _WORKER_EXT_QK
         elif worker_type == "steer":
@@ -88,7 +129,9 @@ def _patched_create_engine_config(self, *args, **kwargs):
     self.enforce_eager = True
 
     assert _original_create_engine_config is not None
-    return _original_create_engine_config(self, *args, **kwargs)
+    config = _original_create_engine_config(self, *args, **kwargs)
+    _log_capture_budget(config, worker_type)
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +217,27 @@ async def _patched_generate(
 # ---------------------------------------------------------------------------
 
 
+def _looks_like_oom(exc: BaseException) -> bool:
+    """True if this failure was plausibly CUDA OOM.
+
+    vLLM V1 runs the engine in a subprocess and replaces the cause with a fixed
+    EngineDeadError message, so the exception text alone cannot distinguish OOM
+    from any other engine death. Fall back to asking the device whether it is
+    actually short of memory.
+    """
+    if "out of memory" in str(exc).lower():
+        return True
+    if type(exc).__name__ != "EngineDeadError":
+        return False
+    try:
+        import torch
+
+        free, total = torch.cuda.mem_get_info()
+        return free < 0.1 * total
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the original error
+        return False
+
+
 def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwargs) -> list:
     """Wrap LLM.generate to install hooks and dispatch post-generation.
 
@@ -200,7 +264,19 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
         self._vllm_hook_installed = True
 
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
+    try:
+        outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - re-raised below
+        if needs_hooks and _looks_like_oom(exc):
+            raise RuntimeError(
+                "CUDA OOM during a hooked generate() call. Capture buffers are "
+                "not part of vLLM's KV cache budget - they have to fit in "
+                "whatever gpu_memory_utilization leaves free. To reduce capture "
+                "memory: lower gpu_memory_utilization, lower "
+                "max_num_batched_tokens, capture fewer layers, or use last_token "
+                "instead of all_tokens."
+            ) from exc
+        raise
 
     if needs_hooks:
         import os
