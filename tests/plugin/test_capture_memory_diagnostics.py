@@ -10,7 +10,7 @@ import warnings
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from vllm_hook_plugins._hook_plugin import _log_capture_budget, _looks_like_oom
 
