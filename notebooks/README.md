@@ -17,23 +17,14 @@ Use the `_colab.ipynb` notebooks when running in Google Colab:
 
 ## Local Notebook Setup
 
-If you plan to use the local notebooks, install the project dependencies from
-the repository root:
-
-```bash
-pip install -r requirement.txt
-pip install -e .
-```
-
-Install the notebook-specific tools and register the environment as a Jupyter
-kernel:
+Install MIA as in the main [README](../README.md#-installation), then add the kernel:
 
 ```bash
 pip install jupyter ipykernel nbformat
-python -m ipykernel install --user --name vllm_hook_env --display-name "vllm_hook_env"
+python -m ipykernel install --user --name mia_v029 --display-name "mia_v029"
 ```
 
-Then select `vllm_hook_env` inside Jupyter Lab or Notebook.
+Select the `mia_v029` kernel. Skip each notebook's install cell if MIA is already installed.
 
 ## Colab Runtime Requirements
 

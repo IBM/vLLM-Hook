@@ -1,5 +1,7 @@
 # vLLM Hidden State Extraction
 
+> Historical: measured on vLLM 0.18; the scripts are not re-validated on vLLM 0.29.
+
 ## Overview
 
 This report benchmarks **MIA** vs. **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction. Both systems extract intermediate transformer hidden states during inference that would enable supports for activation steering, probing classifiers, etc.

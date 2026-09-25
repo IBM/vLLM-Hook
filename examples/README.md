@@ -4,8 +4,8 @@ A demo is one Python file: configure an engine, generate, read back what was cap
 
 ## 1. Skeleton
 
-Copy this. The four lines before the `vllm` import are mandatory — set them first or the engine
-starts with the wrong runtime.
+Copy this. Set the multiprocessing start method and `VLLM_WORKER_MULTIPROC_METHOD` before the `vllm`
+import, or the engine starts with the wrong runtime.
 
 ```python
 import os
@@ -13,7 +13,6 @@ import multiprocessing as mp
 import torch
 
 mp.set_start_method("spawn", force=True)
-os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm import SamplingParams
@@ -55,8 +54,8 @@ optional — omit it if you only want the raw tensors.
 | `capture_hs` | hidden states | `hidden_states` | `demo_hiddenstate.py` |
 | `capture_qk` | attention Q/K | `hookq` | `demo_attntracker.py` |
 | `steer` | — (steers instead) | `steering` | `demo_actsteer.py` |
-| `spotlight` | — (steers attention) | — | `demo_spotlight.py` |
-| `token_highlighter` | gradient influence | — | `demo_token_highlighter.py` |
+| `spotlight` | — (steers attention) | — | `demo_spotlight.py` (not supported on vLLM 0.29) |
+| `token_highlighter` | gradient influence | — | `demo_token_highlighter.py` (not supported on vLLM 0.29) |
 
 | `analyzer_name` | reference demo |
 |---|---|
@@ -65,7 +64,7 @@ optional — omit it if you only want the raw tensors.
 | `core_reranker` | `demo_corer.py` |
 | `hnode_hallucination` | `demo_halludetect.py` |
 | `science_hallucination` | `demo_scihal.py` |
-| `token_highlighter` | `demo_token_highlighter.py` |
+| `token_highlighter` | `demo_token_highlighter.py` (not supported on vLLM 0.29) |
 
 ## 3. Write the config
 
@@ -129,12 +128,8 @@ forces eager regardless. See `demo_capture_aperture.py`.
 
 ## 7. Notebooks
 
-`notebooks/` has the same demos in notebook form. Register the kernel first:
-
-```bash
-pip install ipykernel
-python -m ipykernel install --user --name vllm_hook_env
-```
+`notebooks/` has the same demos in notebook form; see [notebooks/README.md](../notebooks/README.md)
+for the kernel setup.
 
 ## 8. Running the included demos
 
@@ -143,7 +138,7 @@ Run every demo from the repo root, e.g. `python examples/demo_hiddenstate.py`. A
 - **`demo_actsteer_serve.py`** talks to a running server. Start it in another terminal first:
 
   ```bash
-  VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+  VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
       vllm serve microsoft/Phi-3-mini-4k-instruct --enforce-eager --max-model-len 2048 --port 8770
   ```
 

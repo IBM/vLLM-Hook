@@ -77,6 +77,7 @@ The two execution paths are documented below. For each path, the same code shape
 ### Offline (`MiaLLM`)
 
 ```python
+import torch
 from mia import MiaLLM
 from vllm import SamplingParams
 
@@ -85,19 +86,33 @@ llm = MiaLLM(
     worker_name="capture_qk",
     analyzer_name="attn_tracker",
     config_file="model_configs/attention_tracker/granite-3.1-8b-instruct.json",
+    hook_dir="/dev/shm/mia",  # where disk artifacts are written
+    dtype=torch.float16,      # attn_tracker cannot read bfloat16
 )
 
 # rpc (in-memory) path:
 out   = llm.generate(text, SamplingParams(...), save_to_disk=False)
 stats = llm.analyze(probes=out[0].probes, analyzer_spec={...})
 
-# disk path (artifact under /dev/shm/mia/<run_id>/):
+# disk path (artifact under /dev/shm/mia/<run_id>/); reset the prefix cache when re-capturing a prompt:
+llm.llm_engine.reset_prefix_cache()
 out   = llm.generate(text, SamplingParams(...), save_to_disk=True, run_id="run-1")
 stats = llm.analyze(analyzer_spec={...})  # uses the last run_id
+```
 
-# activation steering (worker_name="steer", no analyzer): no save_to_disk, difference is observed by comparing against a use_hook=False baseline.
-out_steered = llm.generate(text, SamplingParams(...))
-out_plain   = llm.generate(text, SamplingParams(...), use_hook=False)
+Steering (`worker_name="steer"`) applies the config's `steering` section; `extra_args["steer"]` overrides it per request:
+
+```python
+import json
+
+llm = MiaLLM(model="microsoft/Phi-3-mini-4k-instruct", worker_name="steer",
+             config_file="model_configs/activation_steer/Phi-3-mini-4k-instruct.json")
+with open("model_configs/activation_steer/Phi-3-mini-4k-instruct.json") as f:
+    base = json.load(f)["steering"]
+
+steer = {**base, "method": "add_vector", "coefficient": 10}
+out_steered = llm.generate(text, SamplingParams(temperature=0.0, max_tokens=200, extra_args={"steer": steer}))
+out_plain   = llm.generate(text, SamplingParams(temperature=0.0, max_tokens=200), use_hook=False)
 ```
 
 Format/save-mode are env-vars on the offline driver process, set **before** `MiaLLM(...)` is constructed (the worker subprocess inherits them at spawn):
@@ -113,12 +128,12 @@ Start the server with `MIA_WORKER` set to the worker that matches your use case:
 
 ```bash
 # probes (attention tracker / CoRer / hidden states):
-VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=qk \
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=qk \
   vllm serve ibm-granite/granite-3.1-8b-instruct \
     --enforce-eager --max-model-len 2048 --port 8770
 
 # activation steering:
-VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
   vllm serve microsoft/Phi-3-mini-4k-instruct \
     --enforce-eager --max-model-len 2048 --port 8770
 ```

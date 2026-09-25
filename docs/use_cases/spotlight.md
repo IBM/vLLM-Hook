@@ -1,5 +1,7 @@
 # Spotlight: Attention Steering for Instruction Following
 
+> **Not supported on vLLM 0.29** (the worker raises `UnsupportedRunnerError`).
+
 **Paper**: [Venkateswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)  
 **Reference implementation**: [agent-lifecycle-toolkit SpotLightComponent](https://github.com/AgentToolkit/agent-lifecycle-toolkit/blob/main/altk/pre_llm/spotlight/spotlight.py)
 

@@ -39,7 +39,7 @@ This includes dynamic analysis of:
 
 ## 📊 Performance Analysis
 
-For a detailed benchmark comparing **MIA** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction, see [`docs/numerical_analysis/`](docs/numerical_analysis/README.md).
+For a detailed benchmark comparing **MIA** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction (measured on vLLM 0.18), see [`docs/numerical_analysis/`](docs/numerical_analysis/README.md).
 
 Key takeaways:
 - MIA (`last_token`) offers significantly lower and prompt-length-invariant latency when only the final-position representation is needed
@@ -76,6 +76,9 @@ not supported, and Q/K `score` capture requires TP = 1.
 ---
 
 ## 📦 Installation
+
+**Requirements:** Linux, an NVIDIA GPU with a CUDA 13 driver, Python 3.12. Gated models (Llama, Mistral) need `hf auth login`.
+
 ### 1. Clone the repository
 
 ```bash
@@ -85,18 +88,24 @@ cd ./vLLM-Hook
 
 ### 2. Create an environment and install
 
-The plugin is currently validated on **vLLM 0.29.0 with torch 2.13.0**. To use this pinned environment:
+MIA is validated on **vLLM 0.29.0 with torch 2.13.0**:
 
 ```bash
 conda create -n mia_v029 python=3.12 pip
 conda activate mia_v029
-pip install vllm==0.29.0
-pip uninstall -y torchcodec
-pip install -e . --no-deps
+pip install vllm==0.29.0          # also installs torch 2.13.0
+pip uninstall -y torchcodec       # vLLM's audio/video decoder; MIA does not use it
+pip install -e . --no-deps        # MIA itself, from the repo root
 pip install zstandard
 ```
 
-For the complete list of pinned dependencies, see [`requirement.txt`](requirement.txt).
+Versions match [`requirement.txt`](requirement.txt). `pip check` flags the removed `torchcodec`; that is expected.
+
+### 3. Check the install
+
+```bash
+python examples/demo_hiddenstate.py   # from the repo root; prints a norm per captured layer
+```
 
 ---
 

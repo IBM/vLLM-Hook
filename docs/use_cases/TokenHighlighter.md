@@ -1,5 +1,7 @@
 # Token Highlighter
 
+> **Not supported on vLLM 0.29** (the worker raises `UnsupportedRunnerError`).
+
 *MIA integration · June 2026*
 
 **Paper.** [Token Highlighter: Inspecting and Mitigating Jailbreak Prompts for LLMs](https://arxiv.org/pdf/2412.18171) (arXiv:2412.18171)
@@ -107,11 +109,11 @@ The scorer approximates ‖∂L_aff/∂xᵢ‖ by back-propagating through the *
 4. **Query path** and **residual identity term** for boundary token (final prompt token, whose query vector influences affirmation loss).
 5. Score for token xᵢ: L2 norm of the resulting vector.
 
-**Fidelity.** The last-block residual MLP branch is back-propagated analytically: from g_out = dL/dh_L we form g_mid = g_out + J_Norm2ᵀ J_MLPᵀ g_out (`compute_mid_boundary_gradient`), so the MLP Jacobian is no longer dropped. The closed form covers gated MLPs (SwiGLU/GeGLU, separate `gate_proj`/`up_proj` or fused `gate_up_proj`) and plain MLPs (GELU/ReLU), including input biases. On Qwen2-1.5B, validated with `examples/validate_scorer_agreement.py` (seeded HuggingFace last-block autograd on vLLM's captured block input): g_out / g_mid relative L2 ≈ 0.16% (cosine ≈ 0.99999), block-input gradient relative L2 ≈ 2.6% (cosine ≈ 0.9996). Formal derivation: `utils/TokenHighlighter/grad_influence.py`.
+**Fidelity.** The last-block residual MLP branch is back-propagated analytically: from g_out = dL/dh_L we form g_mid = g_out + J_Norm2ᵀ J_MLPᵀ g_out (`compute_mid_boundary_gradient`), so the MLP Jacobian is no longer dropped. The closed form covers gated MLPs (SwiGLU/GeGLU, separate `gate_proj`/`up_proj` or fused `gate_up_proj`) and plain MLPs (GELU/ReLU), including input biases. On Qwen2-1.5B, validated against a seeded HuggingFace last-block autograd reference on vLLM's captured block input: g_out / g_mid relative L2 ≈ 0.16% (cosine ≈ 0.99999), block-input gradient relative L2 ≈ 2.6% (cosine ≈ 0.9996). Formal derivation: the Gradient score derivation PDF linked at the top.
 
 ### Scorer validation
 
-Offline comparison against a seeded HuggingFace last-block autograd reference (`examples/validate_scorer_agreement.py`). The reference is seeded with vLLM's captured block input so the comparison measures last-block VJP fidelity, not vLLM-vs-HF forward divergence.
+Offline comparison against a seeded HuggingFace last-block autograd reference. The reference is seeded with vLLM's captured block input so the comparison measures last-block VJP fidelity, not vLLM-vs-HF forward divergence.
 
 
 | Metric                              | Qwen2-1.5B (3 prompts) |
@@ -223,7 +225,7 @@ out_mit = generate_with_highlighter(
 )
 ```
 
-Demos: `examples/demo_token_highlighter.py`, `notebooks/demo_token_highlighter.ipynb`, `notebooks/demo_token_highlighter_colab.ipynb`.
+Demos: `examples/demo_token_highlighter.py`, `notebooks/demo_token_highlighter/demo_token_highlighter.ipynb`, `notebooks/demo_token_highlighter/demo_token_highlighter_colab.ipynb`.
 
 ## Support and limitations
 
