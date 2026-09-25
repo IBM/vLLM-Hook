@@ -129,6 +129,7 @@ def main() -> None:
         trust_remote_code=True,
         dtype=torch.float16,
         enforce_eager=not graph_mode,
+        compilation_config={"cudagraph_mode": "FULL"} if graph_mode else None,
         enable_prefix_caching=False,
         enable_hook=True,
         tensor_parallel_size=1,

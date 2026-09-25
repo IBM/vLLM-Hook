@@ -114,8 +114,9 @@ Capture and steering run under CUDA graphs instead of eager. Off by default.
 MIA_ALLOW_CUDAGRAPH=1 python examples/my_demo.py
 ```
 
-Your demo must also pass `enforce_eager=False`; without the env var the plugin forces eager
-regardless. See `demo_capture_aperture.py`.
+Your demo must also pass `enforce_eager=False` and `compilation_config={"cudagraph_mode": "FULL"}`
+(vLLM 0.29 defaults to `FULL_AND_PIECEWISE`, which MIA refuses); without the env var the plugin
+forces eager regardless. See `demo_capture_aperture.py`.
 
 ## 6. Gotchas
 
