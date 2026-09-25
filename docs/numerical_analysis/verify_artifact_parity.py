@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT / "vllm_hook_plugins"))
+sys.path.insert(0, str(PROJECT_ROOT / "mia"))
 
 MODEL_ID = os.path.expanduser(
     "~/.cache/huggingface/hub/models--Qwen--Qwen2-1.5B-Instruct"
@@ -28,12 +28,12 @@ def _build_prompts():
 
 os.environ.setdefault("VLLM_USE_V1", "1")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-os.environ["VLLM_HOOK_USE_SAFETENSORS"] = "1"
+os.environ["MIA_USE_SAFETENSORS"] = "1"
 
 
 def run_hook(hook_dir, prompts):
-    from vllm_hook_plugins import register_plugins
-    from vllm_hook_plugins.hook_llm import HookLLM
+    from mia import register_plugins
+    from mia.llm import MiaLLM
     from vllm import SamplingParams
     import tempfile
 
@@ -51,9 +51,9 @@ def run_hook(hook_dir, prompts):
     tmp_cfg.close()
 
     try:
-        llm = HookLLM(
+        llm = MiaLLM(
             model=MODEL_ID,
-            worker_name="probe_hidden_states",
+            worker_name="capture_hs",
             analyzer_name="hidden_states",
             config_file=tmp_cfg.name,
             download_dir=DOWNLOAD_DIR,
@@ -167,7 +167,7 @@ def compare(hook_result, hook_kb, native_result, native_kb):
 
     print(f"{'='*72}")
     print(f"\nArtifact sizes:")
-    print(f"  vLLM-Hook (all_tokens): {hook_kb:.1f} KB")
+    print(f"  MIA (all_tokens): {hook_kb:.1f} KB")
     print(f"  Native vLLM Eagle:      {native_kb:.1f} KB")
     print(f"  Ratio (native/hook):    {native_kb/hook_kb:.2f}x" if hook_kb > 0 else "")
 
@@ -176,10 +176,10 @@ if __name__ == "__main__":
     prompts = _build_prompts()
     print(f"Using {len(prompts)} prompts of ~{TARGET_PROMPT_LEN} tokens each")
 
-    hook_dir = "/dev/shm/vllm_hook_verify"
+    hook_dir = "/dev/shm/mia_verify"
     os.makedirs(hook_dir, exist_ok=True)
     try:
-        print("\nRunning vLLM-Hook (all_tokens, 20 layers)...")
+        print("\nRunning MIA (all_tokens, 20 layers)...")
         hook_result, hook_kb = run_hook(hook_dir, prompts)
 
         print("\nRunning Native vLLM Eagle (20 layers)...")

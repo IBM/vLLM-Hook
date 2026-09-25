@@ -6,13 +6,13 @@ Each row maps a use case to its plugin code and the corresponding contributor.
 
 | Use case | Worker | Analyzer | Demo | Contributor |
 | --- | --- | --- | --- | --- |
-| Attention Tracker | `probe_hookqk_worker.py` | `attention_tracker_analyzer.py` | `demo_attntracker.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
-| Core Reranker | `probe_hookqk_worker.py` † | `core_reranker_analyzer.py` | `demo_corer.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
-| Activation Steering | `steer_activation_worker.py` | — | `demo_actsteer.py`, `demo_actsteer_serve.py`, `demo_actsteer_language.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo); Language steering: [@lingyue404](https://github.com/lingyue404)) | [@IRENEKO](https://github.com/IRENEKO) |
-| Hidden-State Probe | `probe_hidden_states_worker.py` | `hidden_states_analyzer.py` | `demo_hiddenstate.py` | [@IRENEKO](https://github.com/IRENEKO) |
-| Science Hallucination Detector | `probe_hidden_states_worker.py` † | `science_hallucination_analyzer.py` | `demo_scihal.py` | [@IRENEKO](https://github.com/IRENEKO) |
+| Attention Tracker | `qk_capture_worker.py` | `attention_tracker_analyzer.py` | `demo_attntracker.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Core Reranker | `qk_capture_worker.py` † | `core_reranker_analyzer.py` | `demo_corer.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Activation Steering | `steer_worker.py` | — | `demo_actsteer.py`, `demo_actsteer_serve.py`, `demo_actsteer_language.py` (Colab: [@tburleyinfo](https://github.com/tburleyinfo); Language steering: [@lingyue404](https://github.com/lingyue404)) | [@IRENEKO](https://github.com/IRENEKO) |
+| Hidden-State Probe | `hs_capture_worker.py` | `hidden_states_analyzer.py` | `demo_hiddenstate.py` | [@IRENEKO](https://github.com/IRENEKO) |
+| Science Hallucination Detector | `hs_capture_worker.py` † | `science_hallucination_analyzer.py` | `demo_scihal.py` | [@IRENEKO](https://github.com/IRENEKO) |
 | [Spotlight](spotlight.md) | `spotlight_worker.py` | — | `demo_spotlight.py` | [@danishcontractor](https://github.com/danishcontractor) |
 | [Token Highlighter](TokenHighlighter.md) | `highlighter_worker.py` | `highlighter_analyzer.py` | `demo_token_highlighter.py`, [`live_TH.ipynb`](../../notebooks/demo_token_highlighter/live_highlighter/live_TH.ipynb) | [@asanth7](https://github.com/asanth7) |
-| [H-Node Detector](hnode_detector.md) | `probe_hidden_states_worker.py` † | `hnode_hallucination_analyzer.py` | `demo_halludetect.py` | [@Samarpit-bhatia](https://github.com/Samarpit-bhatia) |
+| [H-Node Detector](hnode_detector.md) | `hs_capture_worker.py` † | `hnode_hallucination_analyzer.py` | `demo_halludetect.py` | [@Samarpit-bhatia](https://github.com/Samarpit-bhatia) |
 
 > † Reuses an existing worker.

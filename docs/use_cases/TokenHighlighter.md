@@ -1,12 +1,12 @@
 # Token Highlighter
 
-*vLLM-Hook integration · June 2026*
+*MIA integration · June 2026*
 
 **Paper.** [Token Highlighter: Inspecting and Mitigating Jailbreak Prompts for LLMs](https://arxiv.org/pdf/2412.18171) (arXiv:2412.18171)
 
 **Related docs.** [Gradient score derivation (PDF)](https://drive.google.com/uc?export=download&id=1gWZYZE7rgqT4GuHkmFMNJJz7RlLX4idR) (click to download) · [PDF Version](https://drive.google.com/uc?export=download&id=1LaLxYR63qnLurJI4_BpeInYw-k9IAB7A) (click to download) · [Interactive notebook](../../notebooks/demo_token_highlighter/live_highlighter/live_TH.ipynb)
 
-Token Highlighter ranks prompt tokens by their contribution to a fixed **affirmation target phrase** under teacher forcing, then optionally **mitigates** jailbreak-style completions by scaling selected **driver** embeddings by β < 1 at a subsequent prefill. This writeup covers the vLLM-Hook integration: capture, offline scoring, driver selection, and embedding-level mitigation during inference.
+Token Highlighter ranks prompt tokens by their contribution to a fixed **affirmation target phrase** under teacher forcing, then optionally **mitigates** jailbreak-style completions by scaling selected **driver** embeddings by β < 1 at a subsequent prefill. This writeup covers the MIA integration: capture, offline scoring, driver selection, and embedding-level mitigation during inference.
 
 ## Overview
 
@@ -47,12 +47,12 @@ Artifacts: `{hook_dir}/{run_id}/tp_rank_0/highlighter_activations.pt` and `highl
 
 | Component             | Role                                                                             |
 | --------------------- | -------------------------------------------------------------------------------- |
-| `HookLLM`             | Single GPU engine; `generate_with_highlighter` wires mode, run id, hook dir, and config via `extra_args`. |
+| `MiaLLM`             | Single GPU engine; `generate_with_highlighter` wires mode, run id, hook dir, and config via `extra_args`. |
 | `HighlighterWorker`   | Capture hooks, trace I/O, embedding soft-removal at mitigate prefill.            |
 | `HighlighterAnalyzer` | Closed-form `forward_attr` from disk traces.                                     |
 
 
-Capture and mitigate share one `HookLLM` instance and one worker class. Mitigation is a later `generate_with_highlighter(..., mode="mitigate")` call that reuses the capture `run_id`.
+Capture and mitigate share one `MiaLLM` instance and one worker class. Mitigation is a later `generate_with_highlighter(..., mode="mitigate")` call that reuses the capture `run_id`.
 
 Implementation: `workers/highlighter_worker.py`, `analyzers/highlighter_analyzer.py`, `utils/TokenHighlighter/`.
 
@@ -182,7 +182,7 @@ Per-model defaults: `model_configs/token_highlighter/<model_short>.json`.
 
 ### Wrapper API (`generate_with_highlighter` / `analyze_with_highlighter`)
 
-Import from `vllm_hook_plugins` (or `vllm_hook_plugins.utils.TokenHighlighter.utils`). Load JSON defaults with `load_highlighter_config(path)` and pass `highlighter_config=hl_cfg` on each call.
+Import from `mia` (or `mia.utils.TokenHighlighter.utils`). Load JSON defaults with `load_highlighter_config(path)` and pass `highlighter_config=hl_cfg` on each call.
 
 
 | Parameter            | Role                                                     |
@@ -198,8 +198,8 @@ Import from `vllm_hook_plugins` (or `vllm_hook_plugins.utils.TokenHighlighter.ut
 ### Minimal API sequence
 
 ```python
-from vllm_hook_plugins import (
-    HookLLM,
+from mia import (
+    MiaLLM,
     analyze_with_highlighter,
     generate_with_highlighter,
     load_highlighter_config,
@@ -208,7 +208,7 @@ from vllm_hook_plugins import (
 hl_cfg = load_highlighter_config("model_configs/token_highlighter/Qwen2-1.5B-Instruct.json")
 hl_cfg["target_token_ids"] = tokenizer.encode(hl_cfg["target_phrase"], add_special_tokens=False)
 
-llm = HookLLM(model=..., worker_name="token_highlighter", analyzer_name="token_highlighter", ...)
+llm = MiaLLM(model=..., worker_name="token_highlighter", analyzer_name="token_highlighter", ...)
 
 out_cap = generate_with_highlighter(
     llm, prompt, mode="capture", highlighter_config=hl_cfg, temperature=0.0, max_tokens=32

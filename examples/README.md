@@ -17,12 +17,12 @@ os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm import SamplingParams
-from vllm_hook_plugins import HookLLM
+from mia import MiaLLM
 
 if __name__ == "__main__":
-    llm = HookLLM(
+    llm = MiaLLM(
         model="Qwen/Qwen2-1.5B-Instruct",
-        worker_name="probe_hidden_states",     # what to capture
+        worker_name="capture_hs",     # what to capture
         analyzer_name="hidden_states",         # what to do with it
         config_file="model_configs/hidden_states/Qwen2-1.5B-Instruct.json",
         download_dir="./cache/",
@@ -52,10 +52,10 @@ optional — omit it if you only want the raw tensors.
 
 | `worker_name` | captures | config section | reference demo |
 |---|---|---|---|
-| `probe_hidden_states` | hidden states | `hidden_states` | `demo_hiddenstate.py` |
-| `probe_hook_qk` | attention Q/K | `hookq` | `demo_attntracker.py` |
-| `steer_hook_act` | — (steers instead) | `steering` | `demo_actsteer.py` |
-| `probe_spotlight` | — (steers attention) | — | `demo_spotlight.py` |
+| `capture_hs` | hidden states | `hidden_states` | `demo_hiddenstate.py` |
+| `capture_qk` | attention Q/K | `hookq` | `demo_attntracker.py` |
+| `steer` | — (steers instead) | `steering` | `demo_actsteer.py` |
+| `spotlight` | — (steers attention) | — | `demo_spotlight.py` |
 | `token_highlighter` | gradient influence | — | `demo_token_highlighter.py` |
 
 | `analyzer_name` | reference demo |
@@ -111,11 +111,11 @@ returns what was captured, unchanged.
 Capture and steering run under CUDA graphs instead of eager. Off by default.
 
 ```bash
-VLLM_HOOK_ALLOW_CUDAGRAPH=1 python examples/my_demo.py
+MIA_ALLOW_CUDAGRAPH=1 python examples/my_demo.py
 ```
 
 Your demo must also pass `enforce_eager=False`; without the env var the plugin forces eager
-regardless. See `demo_capture_ring.py`.
+regardless. See `demo_capture_aperture.py`.
 
 ## 6. Gotchas
 
@@ -123,8 +123,8 @@ regardless. See `demo_capture_ring.py`.
 - Run from the repo root — config and vector paths are relative to it.
 - `enforce_eager=True` is required unless you enabled graph mode.
 - Call `llm.llm_engine.reset_prefix_cache()` between prompts if you capture the same prefix twice.
-- Profiler counters need `VLLM_HOOK_PROFILE=1`; without it they are no-ops.
-- Performance levers: `from vllm_hook_plugins.optimizations import describe; print(describe())`.
+- Profiler counters need `MIA_PROFILE=1`; without it they are no-ops.
+- Performance levers: `from mia.optimizations import describe; print(describe())`.
 
 ## 7. Notebooks
 
@@ -134,3 +134,29 @@ regardless. See `demo_capture_ring.py`.
 pip install ipykernel
 python -m ipykernel install --user --name vllm_hook_env
 ```
+
+## 8. Running the included demos
+
+Run every demo from the repo root, e.g. `python examples/demo_hiddenstate.py`. A few need more:
+
+- **`demo_actsteer_serve.py`** talks to a running server. Start it in another terminal first:
+
+  ```bash
+  VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+      vllm serve microsoft/Phi-3-mini-4k-instruct --enforce-eager --max-model-len 2048 --port 8770
+  ```
+
+  Each request carries its own steer config in `extra_body["vllm_xargs"]["steer"]`, JSON-encoded,
+  because `vllm_xargs` only accepts scalar values.
+- **`demo_capture_aperture.py`** runs hidden-state capture under FULL CUDA graphs (it sets
+  `MIA_ALLOW_CUDAGRAPH=1` itself). Pick the model with `MIA_DEMO_MODEL`:
+
+  ```bash
+  MIA_DEMO_MODEL=Qwen/Qwen2-1.5B-Instruct python examples/demo_capture_aperture.py
+  ```
+- **`demo_halludetect.py`** downloads a pre-built H-Node probe (~22 KB) into `./cache/hnode_probe/`
+  on first run, from
+  [hnode-probe-builder](https://github.com/Samarpit-bhatia/hnode-probe-builder/tree/master/artifacts).
+  Method: *H-Node Attack and Defense in Large Language Models*, <https://arxiv.org/abs/2603.26045>.
+- **`profiling_longdecode/`** holds long-decode variants of the Q/K and hidden-state demos; see
+  its [README](profiling_longdecode/README.md).

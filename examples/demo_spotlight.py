@@ -1,3 +1,4 @@
+"""Spotlight demo: steer attention toward emphasized prompt spans."""
 import os
 import multiprocessing as mp
 import torch
@@ -7,10 +8,9 @@ os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm import SamplingParams
-from vllm_hook_plugins import HookLLM, generate_with_spotlight, register_plugins
+from mia import MiaLLM, generate_with_spotlight, register_plugins
 
 if __name__ == "__main__":
-
     register_plugins()
 
     MODEL = "Qwen/Qwen2-1.5B-Instruct"
@@ -18,23 +18,20 @@ if __name__ == "__main__":
 
     print(f"Loading {MODEL}...")
 
-    llm = HookLLM(
+    llm = MiaLLM(
         model=MODEL,
-        worker_name="probe_spotlight",
+        worker_name="spotlight",
         download_dir=cache_dir,
         gpu_memory_utilization=0.8,
         dtype=torch.float16,
         enable_hook=True,
-        enforce_eager=True,  # Required for Spotlight (torch.compile traces away register_forward_hook callbacks)
+        enforce_eager=True,
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
     )
 
     print(f"Model loaded: {MODEL}")
 
-    # ========================================================
-    # Test parameters
-    # ========================================================
     prompt = (
         "Return the response for the following as a JSON: "
         "Write a 400 word paragraph on France and its food specifically "
@@ -51,9 +48,6 @@ if __name__ == "__main__":
         max_tokens=max_tokens,
     )
 
-    # ========================================================
-    # Baseline (no steering)
-    # ========================================================
     print("\n" + "=" * 70)
     print("Generating baseline (no attention steering)...")
     print("=" * 70)
@@ -67,9 +61,6 @@ if __name__ == "__main__":
     baseline_text = outputs_baseline[0].outputs[0].text
     print(baseline_text)
 
-    # ========================================================
-    # With Spotlight
-    # ========================================================
     print("\n" + "=" * 70)
     print(f"Generating with Spotlight (alpha={alpha})...")
     print("=" * 70)
@@ -86,9 +77,6 @@ if __name__ == "__main__":
     spotlight_text = outputs_spotlight[0].outputs[0].text
     print(spotlight_text)
 
-    # ========================================================
-    # Comparison
-    # ========================================================
     print("\n" + "=" * 70)
     print("COMPARISON")
     print("=" * 70)
@@ -105,3 +93,4 @@ if __name__ == "__main__":
     print(f"WITH SPOTLIGHT (alpha={alpha})")
     print("-" * 70)
     print(spotlight_text)
+

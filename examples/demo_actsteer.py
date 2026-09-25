@@ -1,3 +1,4 @@
+"""Activation steering demo: improve format instruction-following with per-request steering."""
 import os
 import json
 import multiprocessing as mp
@@ -8,55 +9,37 @@ mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-from vllm_hook_plugins import HookLLM
+from mia import MiaLLM
 from vllm import SamplingParams
 
 
 def _print_evidence(elapsed_s: float, n_tokens: int) -> None:
-    """Compact end-of-run evidence: wall-clock/decode-step timing, the profiler's
-    counters (meaningful only with VLLM_HOOK_PROFILE=1), and the active optimization
-    lever state -- so a reader can tell from the log whether anything actually ran
-    differently, not just that the script printed text."""
     per_step = (elapsed_s * 1000 / n_tokens) if n_tokens else float("nan")
     print(f"[evidence] generate: {elapsed_s * 1000:.1f} ms total, "
           f"{per_step:.2f} ms/decode-step over {n_tokens} tokens")
 
-    from vllm_hook_plugins._profiler import PROF
+    from mia._profiler import PROF
     snap = PROF.summary_only()
     if snap["enabled"]:
         print(f"[evidence] profiler counters: {snap['counters']}")
     else:
-        print("[evidence] profiler disabled -- set VLLM_HOOK_PROFILE=1 to see hook/ring counters")
+        print("[evidence] profiler disabled -- set MIA_PROFILE=1 to see hook/aperture counters")
 
-    from vllm_hook_plugins.optimizations import describe
+    from mia.optimizations import describe
     print("[evidence] active optimization levers:")
     print(describe())
 
 
 if __name__ == "__main__":
-
     cache_dir = "./cache/"
-    # Profiler-friendly: model + steer config are overridable via env so the same
-    # demo can be traced for different models (set VLLM_HOOK_DEMO_MODEL /
-    # VLLM_HOOK_CONFIG_FILE).
-    model = os.environ.get("VLLM_HOOK_DEMO_MODEL", 'microsoft/Phi-3-mini-4k-instruct')
-    # Resolved once and reused below for both the engine config (HookLLM's
-    # config_file=) and the per-request steering override base -- previously the
-    # latter recomputed the default path from `model` alone, so it silently
-    # diverged from the engine's actual config whenever VLLM_HOOK_CONFIG_FILE
-    # was set.
+    model = os.environ.get("MIA_DEMO_MODEL", 'microsoft/Phi-3-mini-4k-instruct')
     config_path = os.environ.get(
-        "VLLM_HOOK_CONFIG_FILE",
+        "MIA_CONFIG_FILE",
         f'model_configs/activation_steer/{model.split("/")[-1]}.json')
 
-    # Graph mode is strictly opt-in: VLLM_HOOK_ALLOW_CUDAGRAPH=1 arms the FULL
-    # CUDA-graph capture ring and lets enforce_eager below go False; unset/anything
-    # else keeps today's eager default unchanged. Its companion knob,
-    # VLLM_HOOK_RING_MAX_BATCHED_TOKENS, only ever LOWERS the scheduler's token
-    # budget (byte-identical capture either way) and is left at its "off" default here.
-    GRAPH_MODE = os.environ.get("VLLM_HOOK_ALLOW_CUDAGRAPH") == "1"
+    GRAPH_MODE = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
     print(f"[demo_actsteer] mode={'FULL CUDA-graph capture' if GRAPH_MODE else 'eager'} "
-          f"(VLLM_HOOK_ALLOW_CUDAGRAPH={'1' if GRAPH_MODE else '0'})")
+          f"(MIA_ALLOW_CUDAGRAPH={'1' if GRAPH_MODE else '0'})")
 
     dtype_map = {
         'microsoft/Phi-3-mini-4k-instruct': 'auto',
@@ -65,9 +48,9 @@ if __name__ == "__main__":
         'Qwen/Qwen2-1.5B-Instruct': torch.float
     }
 
-    llm = HookLLM(
+    llm = MiaLLM(
         model=model,
-        worker_name="steer_hook_act",
+        worker_name="steer",
         config_file=config_path,
         download_dir=cache_dir,
         gpu_memory_utilization=0.7,
@@ -77,7 +60,7 @@ if __name__ == "__main__":
         enforce_eager=not GRAPH_MODE,
         enable_prefix_caching=True,
         enable_hook=True,
-        tensor_parallel_size=1  # the number of gpus
+        tensor_parallel_size=1
     )
 
     test_cases = [
@@ -85,8 +68,6 @@ if __name__ == "__main__":
         "What is the difference between the 13 colonies and the other British colonies in North America? Your answer must contain exactly 6 bullet point in Markdown using the following format:\n* Bullet point one.\n* Bullet point two.\n...\n* Bullet point fix."
     ]
 
-    # Per-request steering: uses the JSON config as-is vs. overrides method+coefficient.
-    # Reuses the same config_path resolved above for the engine config.
     with open(config_path) as f:
         config = json.load(f)
     default_config   = config["steering"]
@@ -124,7 +105,6 @@ if __name__ == "__main__":
         llm.llm_engine.reset_prefix_cache()
 
 
-    ### batch processing 
     print("=" * 50)
     print("Batch processing examples...")
     examples = [

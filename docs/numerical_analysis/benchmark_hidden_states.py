@@ -1,5 +1,5 @@
 """
-Benchmark: vLLM-Hook (probe_hidden_states) vs. Native vLLM (ExampleHiddenStatesConnector)
+Benchmark: MIA (capture_hs) vs. Native vLLM (ExampleHiddenStatesConnector)
 
 Metrics:
   - gen_lat        : wall-clock of llm.generate() (prefill-only run)
@@ -16,7 +16,7 @@ Common flags (see --help for the full list):
   --sweep-grid                full 3D sweep: layers × prompt_len × token_mode
   --variant-last-token VID    storage variant for last_token cells
   --variant-all-tokens VID    storage variant for all_tokens cells
-  --hook-dir PATH             tmpfs (e.g. /dev/shm/vllm_hook) recommended
+  --hook-dir PATH             tmpfs (e.g. /dev/shm/mia) recommended
   --output FILE               CSV output path (default: benchmark_results.csv)
 """
 
@@ -84,10 +84,10 @@ SWEEP_CONFIGS = {
 STORAGE_VARIANTS = {
     "rpc":           {"env": {},                                                                       "storage": "rpc",  "last_token_only": False},
     "disk-pt":       {"env": {},                                                                       "storage": "disk", "last_token_only": False},
-    "disk-pt-async": {"env": {"VLLM_HOOK_ASYNC_SAVE": "1"},                                            "storage": "disk", "last_token_only": False},
-    "disk-st":       {"env": {"VLLM_HOOK_USE_SAFETENSORS": "1"},                                       "storage": "disk", "last_token_only": False},
-    "disk-st-async": {"env": {"VLLM_HOOK_USE_SAFETENSORS": "1", "VLLM_HOOK_ASYNC_SAVE": "1"},          "storage": "disk", "last_token_only": False},
-    "shm":           {"env": {"VLLM_HOOK_USE_SHM": "1"},                                               "storage": "shm",  "last_token_only": True},
+    "disk-pt-async": {"env": {"MIA_ASYNC_SAVE": "1"},                                            "storage": "disk", "last_token_only": False},
+    "disk-st":       {"env": {"MIA_USE_SAFETENSORS": "1"},                                       "storage": "disk", "last_token_only": False},
+    "disk-st-async": {"env": {"MIA_USE_SAFETENSORS": "1", "MIA_ASYNC_SAVE": "1"},          "storage": "disk", "last_token_only": False},
+    "shm":           {"env": {"MIA_USE_SHM": "1"},                                               "storage": "shm",  "last_token_only": True},
 }
 
 pynvml.nvmlInit()
@@ -121,7 +121,7 @@ def _write_temp_config(base_cfg_path: str, layers: list, mode: str) -> str:
     cfg["hidden_states"]["layers"] = layers
     cfg["hidden_states"]["mode"] = mode
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, prefix="vllm_hook_bench_"
+        mode="w", suffix=".json", delete=False, prefix="mia_bench_"
     )
     json.dump(cfg, tmp)
     tmp.flush()
@@ -172,7 +172,7 @@ def _print_table(hook_results, native_results):
 
     col_w = 38
     print("\n" + "=" * 80)
-    print(f"{'Metric':<{col_w}}  {'vLLM-Hook':>18}  {'Native vLLM':>18}")
+    print(f"{'Metric':<{col_w}}  {'MIA':>18}  {'Native vLLM':>18}")
     print("-" * 80)
     for name, hv, nv in rows:
         print(f"{name:<{col_w}}  {fmt(hv):>18}  {fmt(nv):>18}")
@@ -203,8 +203,8 @@ def _results_to_grid_row(results: dict, layers, prompt_len: int, token_mode: str
 
 def _apply_variant_env(variant_id: str):
     """Set the env vars for a storage variant; return a snapshot for restoration."""
-    keys = ("VLLM_HOOK_USE_SAFETENSORS", "VLLM_HOOK_ASYNC_SAVE",
-            "VLLM_HOOK_USE_SHM")
+    keys = ("MIA_USE_SAFETENSORS", "MIA_ASYNC_SAVE",
+            "MIA_USE_SHM")
     snap = {k: os.environ.get(k) for k in keys}
     # Clear all four first, then apply this variant's overrides.
     for k in keys:
@@ -253,20 +253,20 @@ def _wait_for_artifact(hook_dir: str, run_id: str, flags: dict,
 
 def _read_env_flags():
     return {
-        "use_shm":          os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1",
-        "use_safetensors":  os.environ.get("VLLM_HOOK_USE_SAFETENSORS", "0") == "1",
-        "use_async_save":   os.environ.get("VLLM_HOOK_ASYNC_SAVE", "0") == "1",
+        "use_shm":          os.environ.get("MIA_USE_SHM", "0") == "1",
+        "use_safetensors":  os.environ.get("MIA_USE_SAFETENSORS", "0") == "1",
+        "use_async_save":   os.environ.get("MIA_ASYNC_SAVE", "0") == "1",
     }
 
 def _build_hook_llm(cfg_path: str, hook_dir):
-    sys.path.insert(0, str(PROJECT_ROOT / "vllm_hook_plugins"))
-    from vllm_hook_plugins import register_plugins
-    from vllm_hook_plugins.hook_llm import HookLLM
+    sys.path.insert(0, str(PROJECT_ROOT / "mia"))
+    from mia import register_plugins
+    from mia.llm import MiaLLM
     register_plugins()
 
     init_kwargs = dict(
         model=MODEL_ID,
-        worker_name="probe_hidden_states",
+        worker_name="capture_hs",
         analyzer_name="hidden_states",
         config_file=cfg_path,
         download_dir=DOWNLOAD_DIR,
@@ -278,7 +278,7 @@ def _build_hook_llm(cfg_path: str, hook_dir):
     )
     if hook_dir is not None:
         init_kwargs["hook_dir"] = hook_dir
-    return HookLLM(**init_kwargs)
+    return MiaLLM(**init_kwargs)
 
 def _read_hook_artifact(hook_dir: str, run_id: str, stats: dict, flags: dict):
     """Read peak GPU MB and artifact size for one hook run. Returns (peak_mb, art_kb)."""
@@ -335,7 +335,7 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
                        layers=None, token_mode=None, prompts=None,
                        storage="disk"):
     """
-    Run the vLLM-Hook benchmark on the refactored per-request-config API.
+    Run the MIA benchmark on the refactored per-request-config API.
 
     Args:
         layers, token_mode: if provided, a temp config is written and used
@@ -344,10 +344,10 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
         storage: "rpc" (in-memory via collective_rpc; reads probes off the
             output object) or "disk" (artifact written under hook_dir/run_id;
             read back via analyze()) or "shm" (legacy fast-path; analyze()
-            reads from the SharedMemory block via VLLM_HOOK_USE_SHM=1 set in
+            reads from the SharedMemory block via MIA_USE_SHM=1 set in
             the parent's env BEFORE this function is called).
     """
-    print("\n[vLLM-Hook] Initializing...")
+    print("\n[MIA] Initializing...")
 
     _prompts = prompts if prompts is not None else PROMPTS
 
@@ -362,7 +362,7 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
 
     llm = _build_hook_llm(cfg_path, hook_dir)
     _hook_dir = llm._hook_dir
-    print(f"[vLLM-Hook] hook_dir = {_hook_dir}")
+    print(f"[MIA] hook_dir = {_hook_dir}")
     sampling_params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
     flags = _read_env_flags()
     save_to_disk = (storage == "disk")
@@ -413,7 +413,7 @@ def run_hook_benchmark(dry_run=False, hook_dir=None, *,
         # total_lat_full   = gen + wait + analyze (user-realistic)
         return t1 - t0, t1_stat - t0, t2 - t0, peak, art_kb
 
-    results = _run_timed_loop(one_run, dry_run, "vLLM-Hook")
+    results = _run_timed_loop(one_run, dry_run, "MIA")
     if _temp_cfg is not None:
         os.unlink(_temp_cfg)
     del llm
@@ -593,22 +593,22 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true",
                         help="Verify shapes and file paths without timing (no warm-up, 1 rep)")
     parser.add_argument("--skip-hook", action="store_true",
-                        help="Skip the vLLM-Hook benchmark")
+                        help="Skip the MIA benchmark")
     parser.add_argument("--skip-native", action="store_true",
                         help="Skip the Native vLLM benchmark")
     parser.add_argument("--hook-dir", default=None,
-                        help="Override hook_dir for vLLM-Hook "
-                             "(e.g. /dev/shm/vllm_hook for tmpfs, /tmp/vllm_hook for disk). "
-                             "Defaults to the HookLLM built-in default (~/.cache/_v1_qk_peeks).")
+                        help="Override hook_dir for MIA "
+                             "(e.g. /dev/shm/mia for tmpfs, /tmp/mia for disk). "
+                             "Defaults to the MiaLLM built-in default (~/.cache/_v1_qk_peeks).")
     parser.add_argument("--async-save", action="store_true",
                         help="Enable async background save thread in worker "
-                             "(sets VLLM_HOOK_ASYNC_SAVE=1).")
+                             "(sets MIA_ASYNC_SAVE=1).")
     parser.add_argument("--safetensors", action="store_true",
                         help="Store artifacts as safetensors instead of pickle "
-                             "(sets VLLM_HOOK_USE_SAFETENSORS=1).")
+                             "(sets MIA_USE_SAFETENSORS=1).")
     parser.add_argument("--use-shm", action="store_true",
                         help="Use shared memory instead of disk I/O "
-                             "(sets VLLM_HOOK_USE_SHM=1). Supports last_token mode only.")
+                             "(sets MIA_USE_SHM=1). Supports last_token mode only.")
     parser.add_argument("--sweep-grid", action="store_true",
                         help="Full 3D grid sweep: all combinations of layers × prompt_len × token_mode")
     parser.add_argument("--variant-last-token", default="disk-pt",
@@ -666,11 +666,11 @@ if __name__ == "__main__":
 
     # Legacy CLI flags (ignored when variant-last-token/variant-all-token set).
     if args.async_save:
-        os.environ["VLLM_HOOK_ASYNC_SAVE"] = "1"
+        os.environ["MIA_ASYNC_SAVE"] = "1"
     if args.safetensors:
-        os.environ["VLLM_HOOK_USE_SAFETENSORS"] = "1"
+        os.environ["MIA_USE_SAFETENSORS"] = "1"
     if args.use_shm:
-        os.environ["VLLM_HOOK_USE_SHM"] = "1"
+        os.environ["MIA_USE_SHM"] = "1"
 
     if args.sweep_grid:
         variant_per_mode = {

@@ -22,7 +22,7 @@ the repository root:
 
 ```bash
 pip install -r requirement.txt
-pip install -e vllm_hook_plugins
+pip install -e .
 ```
 
 Install the notebook-specific tools and register the environment as a Jupyter
@@ -59,7 +59,7 @@ The Colab install cell is designed to:
 - clone `https://github.com/IBM/vLLM-Hook.git`
 - check out the `main` branch
 - install `requirement.txt`
-- install `vllm_hook_plugins` in editable mode
+- install `mia` in editable mode
 - switch into the repo `notebooks/` directory
 
 Re-run that cell after a runtime reset before running the rest of the notebook.
@@ -96,7 +96,7 @@ Do not skip directly to later cells in a fresh runtime.
   - Free public Colab T4 runtimes can start with limited available GPU memory. The Colab notebooks use lower defaults (`gpu_memory_utilization=0.5` and `max_model_len=2048`) to reduce this, but repeated reruns can still leave less memory available.
 
 - `demo_actsteer_colab.ipynb` can still fail on free Colab T4 with a startup-memory error during generation
-  - This is a known limitation. The steering path builds a hooked vLLM engine after using the base engine, so constrained T4 sessions may temporarily need memory for both engine lifecycles in the same notebook run. This has been flagged for follow-up and is not yet changed in `HookLLM`.
+  - This is a known limitation. The steering path builds a hooked vLLM engine after using the base engine, so constrained T4 sessions may temporarily need memory for both engine lifecycles in the same notebook run. This has been flagged for follow-up and is not yet changed in `MiaLLM`.
 
 - Slow or inconsistent behavior after repeated experimentation
   - Use `Runtime -> Restart session` and re-run all cells in order.

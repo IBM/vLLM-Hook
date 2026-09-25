@@ -1,22 +1,4 @@
-"""H-Node hallucination detection demo (inference-only).
-
-Downloads a pre-built probe artifact (~22 KB) on first run and scores example
-prompts via the registered ``hnode_hallucination`` analyzer.
-
-Usage:
-    python examples/demo_halludetect.py
-
-The probe artifact (probe.npz + probe.json) is hosted in the config-building
-repo and cached under ./cache/hnode_probe/ — only users who run H-Node
-download it:
-
-    https://github.com/Samarpit-bhatia/hnode-probe-builder/tree/master/artifacts
-
-To build your own probe instead, see that repo's README.
-
-Method: "H-Node Attack and Defense in Large Language Models"
-        Yocam, Vaidyan, Wang, 2026 — https://arxiv.org/abs/2603.26045
-"""
+"""H-Node hallucination detection demo (inference only)."""
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -37,11 +19,9 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 CACHE_DIR = "./cache/"
-HOOK_DIR = "/dev/shm/vllm_hook"
+HOOK_DIR = "/dev/shm/mia"
 INFER_CFG = "model_configs/hnode_hallucination/Qwen2.5-1.5B-Instruct.infer.json"
 
-# Pre-built probe for Qwen2.5-1.5B-Instruct (layer 14, AUC 0.902, 50 H-Nodes).
-# Hosted in the config-building repo so it is fetched only when H-Node is used.
 PROBE_BASE_URL = (
     "https://raw.githubusercontent.com/Samarpit-bhatia/hnode-probe-builder/"
     "master/artifacts"
@@ -73,15 +53,11 @@ def ensure_probe():
 
 
 def _make_llm(config_file: str, analyzer_name: str = "hidden_states"):
-    from vllm_hook_plugins import HookLLM
+    from mia import MiaLLM
 
-    # Tuned for 8 GB laptop GPUs (RTX 4060 etc.). Qwen2.5-1.5B fp16 weights are
-    # ~3 GB. gpu_memory_utilization=0.85 (~7 GB budget) leaves room for KV cache
-    # and the captured activations; max_model_len/max_num_batched_tokens are
-    # capped so vLLM doesn't reserve KV blocks for huge hypothetical batches.
-    return HookLLM(
+    return MiaLLM(
         model=MODEL,
-        worker_name="probe_hidden_states",
+        worker_name="capture_hs",
         analyzer_name=analyzer_name,
         config_file=config_file,
         download_dir=CACHE_DIR,
@@ -133,3 +109,4 @@ def stage_detect():
 
 if __name__ == "__main__":
     stage_detect()
+

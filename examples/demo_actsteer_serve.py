@@ -1,17 +1,4 @@
-"""Serve-path
-
-Launch a `vllm serve` instance in a separate terminal:
-
-    VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_HOOK_WORKER=steer \\
-        vllm serve microsoft/Phi-3-mini-4k-instruct \\
-        --enforce-eager --max-model-len 2048 --port 8770
-
-Different requests can carry different steer configs via
-``extra_body["vllm_xargs"]["steer"]`` — vllm_xargs requires scalar values,
-so the per-request dict is JSON-encoded as a string. The plugin
-(_hook_plugin._patched_generate) decodes it back to a dict before the
-worker reads it.
-"""
+"""Activation steering over ``vllm serve``: per-request steer configs via vllm_xargs."""
 import json
 import openai
 

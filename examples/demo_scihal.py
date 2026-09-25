@@ -1,3 +1,4 @@
+"""Science hallucination demo: classify SciHal answers from captured hidden states."""
 import json
 import os
 import sys
@@ -7,10 +8,10 @@ import torch
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
+os.environ.setdefault("MIA_USE_SAFETENSORS", "1")
 
 from vllm import SamplingParams, TokensPrompt
-from vllm_hook_plugins import HookLLM
+from mia import MiaLLM
 
 PROMPT_TEMPLATE_PREFIX = (
     "\n"
@@ -46,7 +47,7 @@ def load_scihal_split(cache_dir: str, filename: str) -> list:
 
 
 def build_few_shot_middle(train_dataset: list, count_target: int = 2, total_target: int = 6) -> str:
-    """Build few shot examples following https://github.com/InfintyLab/SciHal-Challenge/blob/97817c788bde330c61f8ed2fc750d83b19fa1590/llama3_finetunec3_just_task1.py#L141."""
+    """Build few-shot examples following the SciHal-Challenge reference implementation."""
     middle = ""
     count_dict = {"entailment": 0, "contradiction": 0, "unverifiable": 0}
     total = 0
@@ -67,9 +68,7 @@ def build_few_shot_middle(train_dataset: list, count_target: int = 2, total_targ
 
 
 def build_prompt_ids(tokenizer, few_shot_middle: str, claim: str, reference: str) -> list:
-    """Build SciHal prompt token IDs following the original authors' doubled-BOS practice: apply_chat_template returns a string already prefixed
-    with <|begin_of_text|>, then tokenizer() with add_special_tokens=True prepends ANOTHER <|begin_of_text|>. The classifier was trained on hidden
-    states extracted from this prefix."""
+    """Build SciHal prompt token IDs with the authors' doubled-BOS convention."""
     my_input = "#Claim: " + claim + "\n #Reference: " + reference
     user_msg = few_shot_middle + PROMPT_TEMPLATE_SUFFIX.replace("!INPUT!", my_input)
     chat = [
@@ -81,19 +80,18 @@ def build_prompt_ids(tokenizer, few_shot_middle: str, claim: str, reference: str
 
 
 if __name__ == "__main__":
-
     cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-    hook_dir = "/dev/shm/vllm_hook" # None #
+    hook_dir = "/dev/shm/mia"
     model = "meta-llama/Llama-3.1-8B-Instruct"
-    n_test = 9 # number of test samples
+    n_test = 9
 
     dtype_map = {
         'meta-llama/Llama-3.1-8B-Instruct': torch.float16
     }
 
-    llm = HookLLM(
+    llm = MiaLLM(
         model=model,
-        worker_name="probe_hidden_states",
+        worker_name="capture_hs",
         analyzer_name="science_hallucination",
         config_file=f'model_configs/hidden_states/{model.split("/")[-1]}.json',
         download_dir=cache_dir,
@@ -104,7 +102,7 @@ if __name__ == "__main__":
         dtype=dtype_map[model],
         enable_prefix_caching=True,
         enable_hook=True,
-        tensor_parallel_size=1  # the number of gpus
+        tensor_parallel_size=1
     )
 
     tokenizer = llm.tokenizer
@@ -113,7 +111,6 @@ if __name__ == "__main__":
     test_cases = load_scihal_split(cache_dir, "subtask1_test.json")[:n_test]
     prompt_ids_list = [build_prompt_ids(tokenizer, few_shot_middle, q["claim"], q["reference"]) for q in test_cases]
 
-    # normal generation pass 
     gen_outputs = llm.generate(
         [TokensPrompt(prompt_token_ids=ids) for ids in prompt_ids_list],
         SamplingParams(temperature=0.0, max_tokens=1024),
@@ -121,29 +118,23 @@ if __name__ == "__main__":
     )
     response_token_ids = [list(gen_output.outputs[0].token_ids) for gen_output in gen_outputs]
 
-    # re-prefill (prompt_ids + response_ids[:-2]) and capture last-token hidden state
-    # following https://github.com/InfintyLab/SciHal-Challenge/blob/97817c788bde330c61f8ed2fc750d83b19fa1590/llama3_finetunec3_just_task1.py#L262
     capture_prompts = [
         TokensPrompt(prompt_token_ids=list(p) + list(r[:-2]))
         for p, r in zip(prompt_ids_list, response_token_ids)
     ]
     output = llm.generate(capture_prompts, SamplingParams(temperature=0.0, max_tokens=1), save_to_disk=True)
 
-    # classify with the science_hallucination analyzer
     config_file = f"model_configs/hidden_states/{model.split('/')[-1]}.json"
     with open(config_file) as f:
         config_clf_path = json.load(f)["scihal"]["clf_path"]
-    # The config's clf_path is the original author's personal absolute path.
-    # Let an env var override it so this demo is runnable on other machines;
-    # the config value stays the documented fallback/default.
-    clf_path = os.environ.get("VLLM_HOOK_SCIHAL_CLF", config_clf_path)
+    clf_path = os.environ.get("MIA_SCIHAL_CLF", config_clf_path)
     if not os.path.isfile(clf_path):
         print(
             f"[demo_scihal] SciHal classifier not found: {clf_path}\n"
             f"  This joblib file is produced by the SciHal-Challenge repo linked "
             f"above (https://github.com/InfintyLab/SciHal-Challenge) -- train/export "
             f"a classifier there, then point this demo at it by either:\n"
-            f"    export VLLM_HOOK_SCIHAL_CLF=/path/to/your_classifier.joblib\n"
+            f"    export MIA_SCIHAL_CLF=/path/to/your_classifier.joblib\n"
             f"  or updating \"scihal.clf_path\" in {config_file}."
         )
         sys.exit(1)
@@ -153,12 +144,10 @@ if __name__ == "__main__":
         "clf_path": clf_path,
         "model_id": model,
     }
-    # generate() above used save_to_disk=True, so output[0].probes is always None and
-    # analyze() reads the artifacts from disk via the run_id it recorded. Passing a dead
-    # probes= here only made it look like in-memory retrieval.
     stats = llm.analyze(analyzer_spec=spec)
-    
+
     labels = stats["prediction_labels"]
     print("=" * 50)
     for case, label in zip(test_cases, labels):
         print(f"classifier label: {label}")
+

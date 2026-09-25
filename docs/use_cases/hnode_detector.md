@@ -18,9 +18,9 @@ Using TruthfulQA as the training signal, the best layer is selected by held-out 
 
 ---
 
-## How it integrates with vLLM-Hook
+## How it integrates with MIA
 
-vLLM-Hook installs a forward hook on the model's transformer layers at startup (`ProbeHiddenStatesWorker`). During inference, when the residual stream passes through the probe's best layer, the hook captures the last-token hidden state vector and saves it to disk.
+MIA installs a forward hook on the model's transformer layers at startup (`HSCaptureWorker`). During inference, when the residual stream passes through the probe's best layer, the hook captures the last-token hidden state vector and saves it to disk.
 
 After generation, `HNodeHallucinationAnalyzer` reads that vector, runs it through the probe, and returns:
 
@@ -66,13 +66,13 @@ To use a probe for a different model, point `analyzer_spec["probe_path"]` at you
 ## Quick start
 
 ```python
-from vllm_hook_plugins import HookLLM
+from mia import MiaLLM
 from vllm import SamplingParams
 import torch
 
-llm = HookLLM(
+llm = MiaLLM(
     model="Qwen/Qwen2.5-1.5B-Instruct",
-    worker_name="probe_hidden_states",
+    worker_name="capture_hs",
     analyzer_name="hnode_hallucination",
     config_file="model_configs/hnode_hallucination/Qwen2.5-1.5B-Instruct.infer.json",
     gpu_memory_utilization=0.85,
@@ -114,7 +114,7 @@ To train a probe for a different model or dataset, use the config-building repos
 **[github.com/Samarpit-bhatia/hnode-probe-builder](https://github.com/Samarpit-bhatia/hnode-probe-builder)**
 
 The workflow:
-1. **Extract** — run prompts through vLLM-Hook to dump per-layer hidden states (`activations.pt`)
+1. **Extract** — run prompts through MIA to dump per-layer hidden states (`activations.pt`)
 2. **Train** — fit per-layer logistic-regression probes, select best layer by AUC, identify H-Nodes
 3. **Drop in** — point `analyzer_spec["probe_path"]` at the resulting `probe.npz` (keeping `probe.json` beside it) and update the captured layer in the infer config to match the new `best_layer`
 
@@ -124,7 +124,7 @@ See the repo's README for setup and usage instructions.
 
 ## Two-repo architecture
 
-vLLM-Hook ships the inference side only: the numpy-only scorer, the analyzer, and the infer configs. Probe training lives in [hnode-probe-builder](https://github.com/Samarpit-bhatia/hnode-probe-builder), which also hosts the pre-built artifacts. Keeping them separate means vLLM-Hook takes no dependency on `datasets` or scikit-learn, and no model binaries are vendored here.
+MIA ships the inference side only: the numpy-only scorer, the analyzer, and the infer configs. Probe training lives in [hnode-probe-builder](https://github.com/Samarpit-bhatia/hnode-probe-builder), which also hosts the pre-built artifacts. Keeping them separate means MIA takes no dependency on `datasets` or scikit-learn, and no model binaries are vendored here.
 
 ---
 
