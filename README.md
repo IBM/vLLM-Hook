@@ -53,7 +53,7 @@ Key takeaways:
 - **Runtime envelope.** MIA requires vLLM 0.29.0 with its V2 model runner and `cudagraph_mode`
   `NONE` (`enforce_eager=True`) or `FULL`; `PIECEWISE` and `FULL_AND_PIECEWISE` are rejected at
   engine start. Spotlight and Token Highlighter are not supported on the V2 runner.
-- **Logprobs under FULL CUDA graphs.** Arming capture keeps generated token ids identical but can
+- **Logprobs under FULL CUDA graphs.** Arming capture usually keeps generated token ids identical but can
   move per-token logprobs (up to ~1.5e-2 for hidden-state capture, ~5e-7 for Q/K capture),
   because the capture op changes what the compiler fuses. A near-tie greedy step can therefore
   occasionally flip and change the rest of the text. Eager mode is bit-exact; use

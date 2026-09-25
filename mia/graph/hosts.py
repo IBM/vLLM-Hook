@@ -1,4 +1,4 @@
-"""Per-attention-layer static-buffer host for CUDA-graph QK capture."""
+"""Per-layer static-buffer hosts for CUDA-graph QK and HS capture and buffer-mode steering."""
 from __future__ import annotations
 
 import torch

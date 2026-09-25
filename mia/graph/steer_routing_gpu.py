@@ -1,4 +1,4 @@
-"""Fill the steer and capture routing slabs on the GPU (MIA_CAPTURE_GPU_ROUTING)."""
+"""GPU scatter of the steer and capture routing slabs (MIA_STEER_GPU_ROUTING, MIA_CAPTURE_GPU_ROUTING)."""
 from __future__ import annotations
 
 import torch
