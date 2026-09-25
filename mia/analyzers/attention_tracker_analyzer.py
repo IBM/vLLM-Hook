@@ -1,3 +1,4 @@
+"""Attention Tracker analyzer: prompt-injection detection from captured attention."""
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -8,11 +9,6 @@ from mia.run_utils import load_and_merge_qk_cache, unpack_qk
 
 
 class AttntrackerAnalyzer:
-
-    # Capability declaration read by MiaLLM admission (import-light class attr, no
-    # instantiation). "score" => this analyzer can consume per-head attention scores (its
-    # fast-path reduces them to per-head softmax), so the size-model auto-select may
-    # substitute score for raw QK when score is the smaller artifact.
     ACCEPTS = "score"
 
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
@@ -25,7 +21,6 @@ class AttntrackerAnalyzer:
         run_id: Optional[str] = None,
         probes: Optional[Dict] = None,
     ) -> Optional[Dict]:
-
         with PROF.timed("analyzer.kernel"):
             attention_weights = self.compute_attention_from_qk(run_id, probes=probes)
             score = self.attn2score(attention_weights, analyzer_spec['input_range'], analyzer_spec['attn_func'])
@@ -36,7 +31,6 @@ class AttntrackerAnalyzer:
 
 
     def compute_attention_from_qk(self, run_id: str = None, probes: Optional[Dict] = None) -> Dict[str, Dict]:
-
         if probes is not None:
             config = probes["config"]
             qk_cache = probes["qk_cache"]
@@ -54,12 +48,6 @@ class AttntrackerAnalyzer:
         for layer_name, qk_data in qk_cache.items():
             layer_num = qk_data['layer_num']
 
-            # Score fast-path: the worker already computed softmax(QK·mult) on-GPU for this
-            # layer's head set, so skip the QK->score recompute. ``scores`` is a per-pass
-            # list; each element is [n_heads, S_q, S_k] (all_tokens) or [n_heads, 1, S_k]
-            # (last_token), with ``heads`` the matching q-head indices. The attention tracker
-            # uses the last query row (the final token's attention over all keys) ->
-            # [n_heads, S_k], matching the eager filtered-QK path.
             if "scores" in qk_data:
                 scores_list = qk_data["scores"]
                 heads = qk_data.get("heads") or [qk_data.get("head", 0)]
@@ -67,13 +55,13 @@ class AttntrackerAnalyzer:
                     batch_attention_weights = [dict() for _ in range(len(scores_list))]
                 for i, score_t in enumerate(scores_list):
                     if score_t.dim() == 3:
-                        attn = score_t[:, -1, :]            # [n_heads, S_k]
+                        attn = score_t[:, -1, :]
                     elif score_t.dim() == 2:
-                        attn = score_t[-1:, :]              # [1, S_k] (legacy single head)
+                        attn = score_t[-1:, :]
                     else:
                         attn = score_t.reshape(1, -1)
                     batch_attention_weights[i][layer_name] = {
-                        'attention': attn,                 # [n_heads, seq_len]
+                        'attention': attn,
                         'head_indices': list(heads),
                         'layer_index': layer_num,
                     }
@@ -86,27 +74,24 @@ class AttntrackerAnalyzer:
                 batch_attention_weights = [dict() for _ in range(len(q_list))]
 
             for i, (q_last, k_all) in enumerate(zip(q_list, k_list)):
-                
                 seq_len = k_all.shape[0]
-                
-                # Reshape to heads
+
                 q_heads = q_last.view(config["num_attention_heads"], config["head_dim"])
-                q_heads = q_heads.unsqueeze(0).unsqueeze(2)  # [1, 32, 1, 128]
-                
+                q_heads = q_heads.unsqueeze(0).unsqueeze(2)
+
                 k_heads = k_all.view(seq_len, config["num_key_value_heads"], config["head_dim"])
-                k_heads = k_heads.permute(1, 0, 2).unsqueeze(0)  # [1, 8, seq_len, 128]
-                
+                k_heads = k_heads.permute(1, 0, 2).unsqueeze(0)
+
                 if config["num_key_value_heads"] < config["num_attention_heads"]:
                     num_repeat = config["num_attention_heads"] // config["num_key_value_heads"]
-                    k_heads = k_heads.repeat_interleave(num_repeat, dim=1)  # [1, 32, seq_len, 128]
-                
+                    k_heads = k_heads.repeat_interleave(num_repeat, dim=1)
+
                 scores = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * config["attention_multiplier"]
-                
-                full_attention = F.softmax(scores, dim=-1).squeeze(2).squeeze(0)  # [32, seq_len]
-                
-                # filter to only important heads
-                filtered_attention = full_attention[important_head_indices, :]  # [num_important_heads, seq_len]
-                
+
+                full_attention = F.softmax(scores, dim=-1).squeeze(2).squeeze(0)
+
+                filtered_attention = full_attention[important_head_indices, :]
+
                 batch_attention_weights[i][layer_name] = {
                     'attention': filtered_attention,
                     'head_indices': important_head_indices,
@@ -116,9 +101,9 @@ class AttntrackerAnalyzer:
         if prev_threads > 1:
             torch.set_num_threads(prev_threads)
         return batch_attention_weights
-    
+
     def attn2score(self, batch_attention: List[Dict[str, Dict]], batch_input_range: List[Tuple[Tuple[int, int], Tuple[int, int]]], attn_func: str = "sum_normalize") -> float:
-        """Following https://github.com/khhung-906/Attention-Tracker/blob/main/detector/utils.py"""
+        """Attention score per Attention-Tracker (github.com/khhung-906/Attention-Tracker)."""
         if not isinstance(batch_input_range, list):
             batch_input_range = [batch_input_range]
 
@@ -126,10 +111,10 @@ class AttntrackerAnalyzer:
         for attention, input_range in zip(batch_attention, batch_input_range):
             scores = []
             for _, layer_data in attention.items():
-                attn_np = layer_data['attention'].numpy()  # [num_heads, seq_len] — single transfer
+                attn_np = layer_data['attention'].numpy()
 
-                inst_attn = attn_np[:, input_range[0][0]:input_range[0][1]]  # [num_heads, inst_len]
-                data_attn = attn_np[:, input_range[1][0]:input_range[1][1]]  # [num_heads, data_len]
+                inst_attn = attn_np[:, input_range[0][0]:input_range[0][1]]
+                data_attn = attn_np[:, input_range[1][0]:input_range[1][1]]
 
                 if "sum" in attn_func:
                     head_scores = inst_attn.sum(axis=1)
@@ -145,4 +130,4 @@ class AttntrackerAnalyzer:
                 scores.extend(head_scores.tolist())
             batch_scores.append(np.mean(scores))
         return batch_scores
-    
+

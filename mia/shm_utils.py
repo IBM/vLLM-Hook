@@ -1,10 +1,4 @@
-"""Shared-memory helpers
-
-  setup_shm()    — allocate the block + set env vars (called from MiaLLM.__init__)
-  teardown_shm() — close + unlink the block (called from MiaLLM.__del__)
-  load_from_shm()— poll ready flag, read tensors, return hs_cache dict
-                   (called from HiddenStatesAnalyzer.analyze)
-"""
+"""Shared-memory buffers for moving captured tensors out of workers."""
 
 from __future__ import annotations
 
@@ -16,16 +10,7 @@ from typing import Dict, List, Optional, Any
 
 
 def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
-    """Allocate a SharedMemory block sized for (num_layers, max_batch, hidden_size).
-
-    Reads hidden_size and target layers from config_file, allocates the block,
-    sets all MIA_SHM_* env vars so the worker subprocess (forked after
-    this call) can attach by name.
-
-    Returns the SharedMemory object (caller must keep it alive), or None if
-    the config is missing required fields or an unsupported worker/mode is
-    detected (in which case MIA_USE_SHM is also cleared from the environment).
-    """
+    """Allocate a SharedMemory block sized for (num_layers, max_batch, hidden_size)."""
     import warnings
     from multiprocessing.shared_memory import SharedMemory
 
@@ -66,8 +51,6 @@ def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
 
     num_layers = len(target_layers)
     max_batch = int(os.environ.get("MIA_MAX_BATCH", "64"))
-    # Header: 2×uint32 (num_layers, batch_size) = 8 bytes
-    # Data:   float16 × num_layers × max_batch × hidden_size
     total_bytes = 8 + num_layers * max_batch * hidden_size * 2
     shm_name = f"mia_{os.getpid()}"
 
@@ -85,10 +68,7 @@ def setup_shm(config_file: str, worker_name: str = None) -> Optional[Any]:
 
 
 def teardown_shm(shm: Optional[Any]) -> None:
-    """Close and unlink a SharedMemory block returned by setup_shm().
-
-    Safe to call with None (no-op).
-    """
+    """Close and unlink a SharedMemory block returned by setup_shm()."""
     if shm is None:
         return
     try:
@@ -99,15 +79,7 @@ def teardown_shm(shm: Optional[Any]) -> None:
 
 
 def load_from_shm(hook_dir: str, run_id: Optional[str] = None) -> Dict:
-    """Read tensors directly from the shared memory block.
-
-    Polls for the ready flag written by the worker, then reads the buffer
-    using the layout: [0:4] uint32 num_layers, [4:8] uint32 batch_size,
-    [8:] float16 data row-major (layer_slot, batch_item, hidden_dim).
-
-    Optionally persists the artifact to disk when MIA_SHM_PERSIST=1
-    (requires ``run_id`` to be provided).
-    """
+    """Read tensors directly from the shared memory block."""
     import torch
     from multiprocessing.shared_memory import SharedMemory
 
@@ -135,7 +107,7 @@ def load_from_shm(hook_dir: str, run_id: Optional[str] = None) -> Dict:
     hs_cache: Dict = {}
     data_offset = 8
     for slot, lnum in enumerate(layer_order[:num_layers]):
-        nbytes = batch_size * hidden_size * 2  # float16
+        nbytes = batch_size * hidden_size * 2
         start = data_offset + slot * batch_size * hidden_size * 2
         raw = bytes(shm.buf[start : start + nbytes])
         t = torch.frombuffer(bytearray(raw), dtype=torch.float16).view(
@@ -168,3 +140,4 @@ def load_from_shm(hook_dir: str, run_id: Optional[str] = None) -> Dict:
         os.rename(tmp_path, out_path)
 
     return hs_cache, peak_gpu_mb
+

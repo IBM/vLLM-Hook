@@ -1,3 +1,4 @@
+"""MIA: capture and steer vLLM model internals; public API and plugin registration."""
 from mia.registry import PluginRegistry
 from mia.llm import MiaLLM
 from mia.client import MiaClient
@@ -21,15 +22,12 @@ from mia.analyzers.hnode_hallucination_analyzer import HNodeHallucinationAnalyze
 
 
 def register_plugins():
-
-    # Register workers
     PluginRegistry.register_worker("capture_qk",       QKCaptureWorker)
     PluginRegistry.register_worker("steer",      SteerWorker)
     PluginRegistry.register_worker("capture_hs", HSCaptureWorker)
     PluginRegistry.register_worker("spotlight",     SpotlightWorker)
     PluginRegistry.register_worker("token_highlighter",   HighlighterWorker)
 
-    # Register analyzers
     PluginRegistry.register_analyzer("attn_tracker",          AttntrackerAnalyzer)
     PluginRegistry.register_analyzer("core_reranker",         CorerAnalyzer)
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
@@ -58,3 +56,4 @@ __all__ = [
     "HNodeHallucinationAnalyzer",
     "register_plugins"
 ]
+

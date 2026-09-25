@@ -1,8 +1,4 @@
-"""Stateless helpers for TokenHighlighter worker / analyzer plumbing.
-
-Grouped like ``workers/_common.py``: model graph lookup, driver selection, trace I/O,
-extended/suffix teacher prefill, and last-layer Q/K/V capture (capture_qk-style).
-"""
+"""Stateless helpers for the Token Highlighter worker and analyzer."""
 
 from __future__ import annotations
 
@@ -20,16 +16,10 @@ from vllm.forward_context import get_forward_context
 
 from mia.workers._common import get_query_metadata
 
-# pyright: reportOperatorIssue=false, reportArgumentType=false, reportIndexIssue=false, reportCallIssue=false, reportOptionalCall=false, reportAttributeAccessIssue=false
 
 _REQUIRED_CAPTURE_KEYS = ("Q", "K", "V", "h_L")
 _OPTIONAL_CAPTURE_KEYS = ("h_input", "h_mid")
 _CAPTURE_KEYS = _REQUIRED_CAPTURE_KEYS + _OPTIONAL_CAPTURE_KEYS
-
-
-# ---------------------------------------------------------------------------
-# Model graph
-# ---------------------------------------------------------------------------
 
 
 def _last_transformer_block(model: torch.nn.Module) -> torch.nn.Module:
@@ -58,33 +48,30 @@ def locate_last_attention(model: torch.nn.Module) -> torch.nn.Module:
     return _attention_on_block(_last_transformer_block(model))
 
 
-# Dot-paths for pre-lm_head norm on common HF / vLLM decoder-only causal LMs.
 _FINAL_NORM_PATHS = (
-    "model.norm",                     # LLaMA, Mistral, Qwen
+    "model.norm",
     "norm",
-    "transformer.ln_f",               # GPT-2
-    "model.decoder.final_layer_norm", # OPT
+    "transformer.ln_f",
+    "model.decoder.final_layer_norm",
     "decoder.final_layer_norm",
-    "model.gpt_neox.final_layer_norm",# GPT-NeoX
+    "model.gpt_neox.final_layer_norm",
     "gpt_neox.final_layer_norm",
     "model.final_layernorm",
     "final_layernorm",
 )
 
-# Attribute names for the attention input norm on a single transformer block
 _INPUT_NORM_ATTRS = (
-    "input_layernorm",      # LLaMA, Qwen, Mistral, Gemma
-    "ln_1",                 # GPT-2, GPT-NeoX
-    "self_attn_layer_norm", # OPT
-    "attention_norm",       # Custom Triton wrappers
+    "input_layernorm",
+    "ln_1",
+    "self_attn_layer_norm",
+    "attention_norm",
 )
 
-# Attribute names for the FFN/pre-MLP norm on a single transformer block
 _FFN_NORM_ATTRS = (
-    "post_attention_layernorm",  # LLaMA, Qwen, Mistral, Gemma
-    "ln_2",                      # GPT-2, GPT-NeoX
-    "final_layer_norm",          # OPT-style block
-    "ffn_norm",                  # custom wrappers
+    "post_attention_layernorm",
+    "ln_2",
+    "final_layer_norm",
+    "ffn_norm",
 )
 
 def _get_submodule(model: torch.nn.Module, path: str) -> torch.nn.Module | None:
@@ -112,19 +99,14 @@ def locate_final_norm(model: torch.nn.Module) -> torch.nn.Module | None:
 def locate_input_norm(
     model: torch.nn.Module
 ) -> torch.nn.Module | None:
-    """Find the attention input norm for the final transformer block.
-    
-    Traverses the model to the last block and extracts the input norm layer 
-    used to normalize the residual stream before the attention QKV projections.
-    """
+    """Find the attention input norm for the final transformer block."""
     try:
         block = _last_transformer_block(model)
     except RuntimeError:
         return None
-        
+
     for attr in _INPUT_NORM_ATTRS:
         if (norm := getattr(block, attr, None)) is not None:
-            # Verify it's a module with learnable parameters
             if getattr(norm, "weight", None) is not None or getattr(norm, "bias", None) is not None:
                 return norm
     return None
@@ -145,8 +127,6 @@ def locate_ffn_input_norm(
             return norm
     return None
 
-# Try to capture common norm families: rmsnorm, layernorm, gemma_rms
-# WARNING: Scoring procedure and approximation may not be accurate for custom or otherwise specialized norms 
 def infer_norm_kind(norm: torch.nn.Module) -> str:
     """``rmsnorm`` | ``layernorm`` | ``gemma_rms`` for analytic forward / Jacobian."""
     name = type(norm).__name__.lower()
@@ -160,8 +140,7 @@ def infer_norm_kind(norm: torch.nn.Module) -> str:
 
 
 def export_norm_spec(norm: torch.nn.Module | None, norm_placement) -> dict[str, Any] | None:
-    """CPU snapshot of norm weights for ``highlighter_activations.pt``
-    either before final attention layer ("attn") or before lm_head ("final")."""
+    """CPU snapshot of norm weights, before the final attention layer or before lm_head."""
     if norm is None:
         return None
     weight = getattr(norm, "weight", None)
@@ -192,11 +171,7 @@ def linear_weight(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Return unquantized weights in ``[out_features, in_features]`` layout.
-
-    vLLM fp16 layers expose ``.weight``; AWQ/GPTQ-style layers use ``qweight`` and
-    require dequantization before the analyzer can run matmul-based influence math.
-    """
+    """Return unquantized weights in ``[out_features, in_features]`` layout."""
     weight = getattr(module, "weight", None)
     if weight is not None:
         w = cast(torch.Tensor, weight)
@@ -248,23 +223,17 @@ def lm_head_weight(model: torch.nn.Module) -> torch.Tensor:
     raise RuntimeError(f"Could not resolve output embeddings for {type(model).__name__}.")
 
 
-
 def get_attn_key_value_weights(
     last_attn: torch.nn.Module,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(W_O, W_V, W_K)`` for forward-attribution key/value paths.
-
-    Handles fused ``qkv_proj`` (vLLM) vs separate projections (HF-style layouts).
-    """
+    """Return ``(W_O, W_V, W_K)`` for forward-attribution key/value paths."""
     attn = cast(Any, last_attn)
     w_o = linear_weight(attn.o_proj)
-    # Fused QKV proj: common with vLLM models
     if hasattr(last_attn, "qkv_proj"):
         qkv_w = linear_weight(attn.qkv_proj)
         q_size, kv_size = int(attn.q_size), int(attn.kv_size)
         return w_o, qkv_w[q_size + kv_size : q_size + 2 * kv_size], qkv_w[q_size : q_size + kv_size]
-    
-    # Separate QKV projections: common with HF models
+
     return w_o, linear_weight(attn.v_proj), linear_weight(attn.k_proj)
 
 
@@ -278,11 +247,6 @@ def get_attn_query_weight(last_attn: torch.nn.Module) -> torch.Tensor:
     return linear_weight(attn.q_proj)
 
 
-# ---------------------------------------------------------------------------
-# Driver selection / soft removal
-# ---------------------------------------------------------------------------
-
-
 def flag_driver_tokens(
     scores: list[float],
     *,
@@ -290,11 +254,7 @@ def flag_driver_tokens(
     mode: str | None = None,
     alpha: float | None = None,
 ) -> list[int]:
-    """Return prompt token indices selected as drivers (mean+std or top-α).
-
-    ``mean_std``: score > mean + k·std. ``top_percentage`` (default): top α fraction.
-    Used for mitigate embedding scaling and trace metadata.
-    """
+    """Return prompt token indices selected as drivers (mean+std or top-α)."""
     if not scores:
         return []
     mode = mode or "top_percentage"
@@ -308,11 +268,6 @@ def flag_driver_tokens(
     return [i for i, v in enumerate(scores) if float(v) > float(threshold)]
 
 
-# ---------------------------------------------------------------------------
-# Scheduler / trace I/O
-# ---------------------------------------------------------------------------
-
-
 def iter_prompt_batches(request: Any) -> list[list[int]]:
     """Collect ``prompt_token_ids`` from scheduler output (new + cached metadata)."""
     batches: list[list[int]] = []
@@ -324,11 +279,7 @@ def iter_prompt_batches(request: Any) -> list[list[int]]:
 
 
 def prompt_prefill_done(model_runner: Any, prompt_ids: list[int]) -> bool:
-    """True when a matching in-flight request has ``num_computed_tokens >= len(prompt)``.
-
-    Walks ``input_batch`` and compares the request prefix of ``prompt_token_ids`` to
-    ``prompt_ids``. Used to know when capture can finish and suffix teacher can run.
-    """
+    """True when a matching in-flight request has ``num_computed_tokens >= len(prompt)``."""
     plen = len(prompt_ids)
     requests = getattr(model_runner, "requests", None)
     input_batch = getattr(model_runner, "input_batch", None)
@@ -382,18 +333,7 @@ def export_forward_attr_weights(
     runtime_rope_probe: dict[str, Any] | None = None,
     include_unembedding: bool = False,
 ) -> dict[str, Any]:
-    """Snapshot tensors needed for ``compute_grad_influences`` within analyzer without 
-    reloading the model with `from_pretrained` during analysis.
-
-    Saved alongside ``highlighter_activations.pt`` so the analyzer can run pure math on
-    CPU/GPU using captures + this bundle (vLLM worker weights, including fused QKV layouts).
-
-    The unembedding ``W_U`` (``[vocab, d_model]``) is large (hundreds of MB) and is only
-    used to form the affirmation-loss gradient ``g`` at the few generation positions. The
-    worker precomputes that tiny ``g`` per sequence (see ``_finish_capture``), so ``W_U`` is
-    omitted by default. Set ``include_unembedding=True`` for legacy/standalone bundles whose
-    analyzer recomputes ``g`` from ``W_U`` + ``target_ids``.
-    """
+    """Snapshot the weights ``compute_grad_influences`` needs, so analysis never reloads the model."""
     last_attn = locate_last_attention(model)
     w_o, w_v, w_k = get_attn_key_value_weights(last_attn)
     w_q = get_attn_query_weight(last_attn)
@@ -416,8 +356,6 @@ def export_forward_attr_weights(
 
     bundle["input_norm"] = export_norm_spec(locate_input_norm(model), "attn")
     bundle["final_norm"] = export_norm_spec(locate_final_norm(model), "final")
-    # RoPE metadata for inverse VJP in analyzer:
-    # only apply inverse rotation when this attention path actually uses RoPE.
     rope_spec: dict[str, Any] = {
         "has_rope": False,
         "rotate_q": None,
@@ -426,7 +364,6 @@ def export_forward_attr_weights(
     }
     rope_theta = getattr(cfg, "rope_theta", None)
     rope_scaling = getattr(cfg, "rope_scaling", None)
-    # Some configs (e.g. vLLM's Qwen2) expose the RoPE base only inside ``rope_scaling``.
     if rope_theta is None and isinstance(rope_scaling, dict):
         rope_theta = rope_scaling.get("rope_theta")
     if rope_theta is not None:
@@ -492,11 +429,7 @@ def load_highlighter_artifact(
     poll_interval: float = 0.05,
     quiet: bool = False,
 ) -> dict | None:
-    """Load newest ``filename`` under ``hook_dir/{run_id}/**`` with optional short wait.
-
-    Some vLLM capture flows finish writing the artifact just after ``generate`` returns.
-    ``wait_seconds`` allows a bounded poll before declaring the file missing.
-    """
+    """Load newest ``filename`` under ``hook_dir/{run_id}/**`` with optional short wait."""
     deadline = time.time() + max(0.0, wait_seconds)
     while True:
         paths = glob.glob(os.path.join(hook_dir, run_id, "**", filename), recursive=True)
@@ -540,18 +473,13 @@ def build_highlighter_record(
     return record
 
 
-# ---------------------------------------------------------------------------
-# Forward-attr capture state
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ForwardAttrCapture:
     """Per-worker hook buffers for one capture phase (see ``HighlighterWorker._cap``)."""
 
-    active: bool = False  # gates hooks during prefill forwards only
-    live: dict[str, torch.Tensor] = field(default_factory=dict)  # Q, K, V, h_L, h_input
-    meta: dict[str, Any] = field(default_factory=dict)  # query_start_loc, input_ids
+    active: bool = False
+    live: dict[str, torch.Tensor] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 def capture_ready(live: dict[str, torch.Tensor]) -> bool:
@@ -581,16 +509,10 @@ def _slice_capture(
     missing_msg: str,
     match_msg: str,
 ) -> dict[str, torch.Tensor]:
-    """Slice flat-batch Q/K/V/h_L/(optional h_input) by ``query_start_loc`` (probe-style).
-
-    vLLM lays the batch out as one concatenated sequence; ``meta`` maps a request's
-    token ids to ``[start:end)`` indices. Without meta, assumes a single-request batch.
-    """
     if not capture_ready(live):
         raise RuntimeError(missing_msg)
     n = len(token_ids)
     if not meta:
-        # Single-request path: hooks filled rows 0..n-1 in order.
         if live["h_L"].size(0) < n:
             raise RuntimeError(
                 f"forward_attr: capture length {live['h_L'].size(0)} < expected {n}."
@@ -608,7 +530,6 @@ def _slice_capture(
     for r in range(int(qsl.numel()) - 1):
         start = int(qsl[r].item())
         seg = flat_ids[start : int(qsl[r + 1].item())].tolist()
-        # Match this batch row to the expected token prefix.
         if len(seg) >= n and seg[:n] == token_ids:
             out = {
                 k: live[k][start : start + n].detach()
@@ -654,19 +575,14 @@ def slice_real_prefill_capture(
     )
 
 
-# ---------------------------------------------------------------------------
-# Extended teacher prefill (one scheduler step)
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TeacherPrefillExtendPlan:
     """Per-request state for extended prefill (scheduler bump + post-forward restore)."""
 
     req_id: str
     prompt_len: int
-    suffix_ids: list[int]  # target[:-1]
-    saved_prompt_row: Any = None  # prompt slice of token_ids_cpu before staging
+    suffix_ids: list[int]
+    saved_prompt_row: Any = None
 
 
 def _prompt_matches(req_prompt: list[int] | None, prompt_ids: list[int]) -> bool:
@@ -685,13 +601,11 @@ def prefill_chunked_for_prompt(
     def _chunked(computed: int, scheduled: int) -> bool:
         return computed == 0 and 0 < scheduled < plen
 
-    # Check for newly scheduled requests within this step that match the prompt
     for nrd in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
         if _prompt_matches(nrd.prompt_token_ids, prompt_ids):
             scheduled = int(scheduler_output.num_scheduled_tokens.get(nrd.req_id, 0))
             if _chunked(int(nrd.num_computed_tokens), scheduled):
                 return True
-    # Check for in-flight requests that match the prompt
     for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
         req = model_runner.requests.get(req_id)
         if _prompt_matches(getattr(req, "prompt_token_ids", None), prompt_ids):
@@ -707,11 +621,7 @@ def plan_teacher_prefill_extend(
     target_ids: list[int],
     already_extended: set[str],
 ) -> list[TeacherPrefillExtendPlan]:
-    """Bump ``num_scheduled_tokens`` so one forward runs ``prompt + target[:-1]``.
-
-    Only applies on the first prefill step when the full prompt fits in that step
-    (``computed == 0`` and ``scheduled >= plen``). Chunked prompts skip bump here.
-    """
+    """Bump ``num_scheduled_tokens`` so one forward runs ``prompt + target[:-1]``."""
     suffix_ids = list(target_ids[:-1])
     if not suffix_ids:
         return []
@@ -723,7 +633,6 @@ def plan_teacher_prefill_extend(
         if req_id in already_extended or req_id in seen or scheduled <= 0:
             return
         plen = len(prompt_ids)
-        # First chunk must cover entire prompt; otherwise use suffix capture path.
         if computed != 0 or scheduled < plen:
             return
         scheduler_output.num_scheduled_tokens[req_id] = scheduled + extra
@@ -752,11 +661,7 @@ def plan_teacher_prefill_extend(
 def stage_teacher_prefill_tokens(
     model_runner: Any, plans: list[TeacherPrefillExtendPlan]
 ) -> None:
-    """Write ``target[:-1]`` into ``input_batch`` after ``_update_states``.
-
-    vLLM fills prompt slots from ``prompt_token_ids``; this overwrites the tail of
-    the row so the upcoming forward sees teacher-forced token ids.
-    """
+    """Write ``target[:-1]`` into ``input_batch`` after ``_update_states``."""
     batch = model_runner.input_batch
     for plan in plans:
         idx = batch.req_id_to_index[plan.req_id]
@@ -769,11 +674,7 @@ def stage_teacher_prefill_tokens(
 def restore_teacher_prefill_state(
     model_runner: Any, plans: list[TeacherPrefillExtendPlan]
 ) -> None:
-    """Reset ``num_computed_tokens`` ("cursor") to ``prompt_len`` so decode ignores teacher tokens.
-
-    KV for teacher positions may remain in the paged cache, but the scheduler cursor
-    and token row are rewound so generation continues from the prompt boundary only.
-    """
+    """Reset ``num_computed_tokens`` ("cursor") to ``prompt_len`` so decode ignores teacher tokens."""
     batch = model_runner.input_batch
     for plan in plans:
         plen, m = plan.prompt_len, len(plan.suffix_ids)
@@ -782,7 +683,6 @@ def restore_teacher_prefill_state(
         idx = batch.req_id_to_index.get(plan.req_id)
         if idx is None:
             continue
-        # Mirror cursor reset on batch tensors the runner reads on the next step.
         batch.num_computed_tokens_cpu[idx] = plen
         batch.num_computed_tokens_cpu_tensor[idx] = plen
         model_runner.num_computed_tokens[idx] = plen
@@ -810,11 +710,7 @@ def merge_real_and_teacher_captures(
     real_capture: dict[str, torch.Tensor],
     teacher_capture: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Prompt rows from scheduler prefill; suffix rows from teacher pass (suffix mode).
-
-    ``teacher_capture`` is usually padded via ``expand_suffix_capture``; prompt
-    positions are overwritten with activations from the real prefill hooks.
-    """
+    """Prompt rows from scheduler prefill; suffix rows from teacher pass (suffix mode)."""
     if not capture_ready(real_capture):
         raise RuntimeError("forward_attr: real prefill capture required for prompt merge.")
     merged: dict[str, torch.Tensor] = {}
@@ -828,33 +724,21 @@ def merge_real_and_teacher_captures(
         if key not in real_capture:
             continue
         end = min(prompt_len, real_capture[key].size(0), merged[key].size(0))
-        merged[key][:end] = real_capture[key][:end]  # prompt slice from scheduler path
+        merged[key][:end] = real_capture[key][:end]
     return merged
-
-
-# ---------------------------------------------------------------------------
-# Suffix teacher pass (chunked prefill fallback)
-# ---------------------------------------------------------------------------
 
 
 def expand_suffix_capture(
     prompt_len: int,
     suffix_capture: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Pad suffix-only hook tensors to full teacher-forced length ``prompt_len + |target|-1``.
-
-    The suffix forward runs ``target[:-1]`` only, so hooks see ``m`` rows. Forward attribution
-    expects ``prompt_len + m`` positions (prompt slots + teacher slots). Prefix zeros stand in
-    for prompt positions; ``merge_real_and_teacher_captures`` overwrites ``[:prompt_len]`` with
-    real prefill activations.
-    """
+    """Pad suffix-only hook tensors to the full teacher-forced length."""
     if not capture_ready(suffix_capture):
         raise RuntimeError("forward_attr: suffix capture missing Q/K/V/h_L.")
     out: dict[str, torch.Tensor] = {}
     for key, t in suffix_capture.items():
         if not torch.is_tensor(t):
             continue
-        # [0:prompt_len) placeholder; [prompt_len:] filled from suffix-only forward.
         full = torch.zeros(
             (prompt_len + t.size(0),) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
         )
@@ -869,13 +753,6 @@ def _run_runner_forward(
     *,
     tokens_per_req: dict[str, int],
 ) -> None:
-    """Run one vLLM model forward outside the normal scheduler step.
-
-    vLLM V1 does not expose ``model.forward(kv_caches=...)``; this is the minimal
-    ``GPUModelRunner.execute_model`` path: ``_prepare_inputs`` → attention metadata →
-    ``set_forward_context`` → ``model(...)``. Used by ``vllm_teacher_suffix_capture`` after
-    prompt KV is already in the paged cache.
-    """
     import numpy as np
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import set_forward_context
@@ -883,7 +760,6 @@ def _run_runner_forward(
     from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
     batch = model_runner.input_batch
-    # Per-request token counts for this ad-hoc forward (one hot request for suffix pass).
     sched_np = np.array(
         [int(tokens_per_req.get(batch.req_ids[i], 0)) for i in range(batch.num_reqs)],
         dtype=np.int32,
@@ -911,7 +787,6 @@ def _run_runner_forward(
         ubatch_slices, ubatch_slices_pad = maybe_create_ubatch_slices(
             should_ubatch, sched_np, n_pad, n_reqs_pad, model_runner.parallel_config.num_ubatches
         )
-        # Get slot mappings into KV cache for the padded batch.
         slots_gid, slots_layer = model_runner._get_slot_mappings(
             num_tokens_padded=n_tok,
             num_reqs_padded=batch.num_reqs,
@@ -928,7 +803,6 @@ def _run_runner_forward(
         )
         ids, embeds, pos, inter, model_kw, _ = model_runner._preprocess(sched, n_pad, None)
 
-    # Attention kernels read slot_mapping / metadata from forward context.
     with set_forward_context(
         attn_md,
         model_runner.vllm_config,
@@ -940,7 +814,6 @@ def _run_runner_forward(
         slot_mapping=slots_layer,
     ):
         with torch.no_grad():
-            # Run the model forward.
             model(
                 input_ids=ids,
                 positions=pos,
@@ -956,13 +829,7 @@ def vllm_teacher_suffix_capture(
     prompt_ids: list[int],
     target_ids: list[int],
 ) -> None:
-    """Forward ``target[:-1]`` on existing prompt KV, then restore prompt-only decode boundary.
-
-    Used when extended prefill is unavailable (chunked prompt). Cursor stays at
-    ``prompt_len`` so queries attend to prompt KV only and the target sequence
-    is not mistaken for part of the prompt; hooks run inside the worker's
-    temporary ``register_forward_attr_hooks`` call.
-    """
+    """Forward ``target[:-1]`` on existing prompt KV, then restore prompt-only decode boundary."""
     suffix = list(target_ids[:-1])
     if not suffix:
         raise RuntimeError("forward_attr: need at least two target tokens.")
@@ -976,29 +843,20 @@ def vllm_teacher_suffix_capture(
     req = model_runner.requests[req_id]
     saved_row = batch.token_ids_cpu[req_idx, :plen].copy()
 
-    # Stage teacher ids; cursor (num_computed_tokens) at prompt end (not after teacher tokens).
     batch.token_ids_cpu[req_idx, plen : plen + len(suffix)] = suffix
     batch.num_computed_tokens_cpu[req_idx] = plen
     batch.num_computed_tokens_cpu_tensor[req_idx] = plen
     req.num_computed_tokens = plen
     try:
-        # Retrieve counts of suffix tokens for each request in the batch.
         counts = {
             batch.req_ids[i]: (len(suffix) if i == req_idx else 0)
             for i in range(batch.num_reqs)
         }
-        # Run ad-hoc forward pass (simulates execute_model() path).
         _run_runner_forward(model_runner, model, tokens_per_req=counts)
     finally:
-        # Restore cursor (num_computed_tokens) to prompt end and reset teacher tokens.
         restore_teacher_prefill_state(
             model_runner, [TeacherPrefillExtendPlan(req_id, plen, suffix, saved_row)]
         )
-
-
-# ---------------------------------------------------------------------------
-# Last-layer hooks (QKCaptureWorker-style)
-# ---------------------------------------------------------------------------
 
 
 def _decoder_layer_hidden(output: Any) -> torch.Tensor:
@@ -1011,19 +869,10 @@ def _decoder_layer_hidden(output: Any) -> torch.Tensor:
 
 
 def _decoder_layer_input(inputs: Any) -> torch.Tensor:
-    """Return residual-stream input to the decoder block (pre input-norm source).
-
-    vLLM decoder layers are called as ``forward(positions, hidden_states, residual)``
-    with a fused add+norm, so the value actually normalized by the input layernorm is
-    ``hidden_states + residual`` (residual is ``None`` only on the first block). HF-style
-    layers are called as ``forward(hidden_states, ...)`` with the residual already folded
-    in, so a single 2-D tensor is present. Selecting ``inputs[0]`` blindly would grab the
-    1-D ``positions`` tensor under vLLM and corrupt the input-norm Jacobian.
-    """
     if isinstance(inputs, (tuple, list)):
         mats = [x for x in inputs if isinstance(x, torch.Tensor) and x.dim() >= 2]
         if len(mats) >= 2:
-            return mats[0] + mats[1]  # vLLM fused residual: hidden_states + residual
+            return mats[0] + mats[1]
         if mats:
             return mats[0]
         if inputs:
@@ -1032,7 +881,6 @@ def _decoder_layer_input(inputs: Any) -> torch.Tensor:
 
 
 def _forward_context_att_metadata() -> Any | None:
-    """Return ``attn_metadata`` from the active forward context, or ``None`` if unset."""
     try:
         ctx = get_forward_context()
     except AssertionError:
@@ -1041,13 +889,6 @@ def _forward_context_att_metadata() -> Any | None:
 
 
 def _skip_forward_capture() -> bool:
-    """Skip CUDA-graph capture passes only.
-
-    Do not gate on ``attn_metadata`` being unset: hooks run inside ``model()`` but
-    ``record_batch_meta`` already tolerates missing metadata. Treating missing
-    metadata as "skip capture" leaves ``cap.live`` empty on short prompts while
-    prefill still completes (misleading ``max_num_batched_tokens`` errors).
-    """
     return bool(
         torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
     )
@@ -1081,7 +922,6 @@ def infer_qkv_rotation_probe(
         if pre_f is None or post_f is None:
             return None
         n = min(pre_f.size(0), post_f.size(0))
-        # Position 0 is often identity even when RoPE is enabled.
         if n <= 1:
             return None
         pre_f = pre_f[:n][1:]
@@ -1110,11 +950,7 @@ def register_runtime_rope_probe_hooks(
     rel_tol: float = 5e-3,
     require_attn_metadata: bool = False,
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Install one-shot runtime probe hooks to infer Q/K/V rotation status.
-
-    Compares pre-projection outputs (qkv/q/k/v proj hooks) with post-attn-core inputs
-    from the same forward pass and stores result under ``meta['rope_runtime_probe']``.
-    """
+    """Install one-shot runtime probe hooks to infer Q/K/V rotation status."""
     last_attn = _attention_on_block(_last_transformer_block(model))
     attn = cast(Any, last_attn)
     state: dict[str, Any] = {
@@ -1149,13 +985,11 @@ def register_runtime_rope_probe_hooks(
 
     hooks: list[torch.utils.hooks.RemovableHandle] = []
     if (core := _attn_core_module(last_attn)) is not None:
-
         def post_hook(_m, inputs: Any, _output: Any) -> None:
             if state["done"] or inactive() or not inputs or len(inputs) < 3:
                 return
             if require_attn_metadata and _forward_context_att_metadata() is None:
                 return
-            # Capture inputs to last attention module (after RoPe)
             state["Q_post"] = cast(torch.Tensor, inputs[0]).detach().clone()
             state["K_post"] = cast(torch.Tensor, inputs[1]).detach().clone()
             state["V_post"] = cast(torch.Tensor, inputs[2]).detach().clone()
@@ -1163,7 +997,6 @@ def register_runtime_rope_probe_hooks(
 
         hooks.append(core.register_forward_hook(post_hook))
 
-    # Fused QKV projection (qkv_proj) hook.
     if hasattr(last_attn, "qkv_proj"):
         q_size, kv_size = int(attn.q_size), int(attn.kv_size)
 
@@ -1174,17 +1007,14 @@ def register_runtime_rope_probe_hooks(
             if not torch.is_tensor(qkv):
                 return
             q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-            # Hooks capture outputs of QKV projection (before RoPe)
             state["Q_pre"] = q.detach().clone()
             state["K_pre"] = k.detach().clone()
             state["V_pre"] = v.detach().clone()
             maybe_finalize()
 
-        # Register single QKV hook for fused projection (qkv_proj)
         hooks.append(attn.qkv_proj.register_forward_hook(pre_fused_hook))
         return hooks
 
-    # Separate Q/K/V projection hooks.
     if all(hasattr(attn, n) for n in ("q_proj", "k_proj", "v_proj")):
         tmp: dict[str, torch.Tensor] = {}
 
@@ -1204,7 +1034,6 @@ def register_runtime_rope_probe_hooks(
 
             return _hook
 
-        # Register separate hooks for each projection module (q_proj, k_proj, v_proj)
         hooks.append(attn.q_proj.register_forward_hook(pre_hook("Q")))
         hooks.append(attn.k_proj.register_forward_hook(pre_hook("K")))
         hooks.append(attn.v_proj.register_forward_hook(pre_hook("V")))
@@ -1212,11 +1041,7 @@ def register_runtime_rope_probe_hooks(
 
 
 def record_batch_meta(model_runner: Any, meta: dict[str, Any]) -> None:
-    """Save flat ``input_ids`` and ``query_start_loc`` for per-request slicing.
-
-    Populated after each capture forward so ``_slice_capture`` can find the right
-    rows when multiple requests share one batch. Falls back to runner buffers if needed.
-    """
+    """Save flat ``input_ids`` and ``query_start_loc`` for per-request slicing."""
     metadata = _forward_context_att_metadata()
     if metadata is None:
         return
@@ -1275,14 +1100,6 @@ def _register_qkv_hooks(
     require_post_rope: bool = True,
     require_attn_metadata: bool = False,
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Capture last-layer Q/K/V, preferring post-RoPE tensors from ``.attn`` inputs.
-
-    Default behavior enforces post-RoPE capture (`require_post_rope=True`), which
-    matches the online worker path and avoids analyzer mismatch from pre-RoPE Q/K.
-    Set ``require_post_rope=False`` only as a compatibility fallback for models
-    without a hookable inner attention core.
-    """
-
     def store_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         dest["Q"], dest["K"], dest["V"] = q.detach().clone(), k.detach().clone(), v.detach().clone()
         if on_qkv:
@@ -1292,7 +1109,6 @@ def _register_qkv_hooks(
         return not enabled() or _skip_forward_capture()
 
     if (core := _attn_core_module(last_attn)) is not None:
-
         def attn_input_hook(_m, inputs: Any, _output: Any) -> None:
             if inactive() or not inputs or len(inputs) < 3:
                 return
@@ -1355,28 +1171,15 @@ def register_forward_attr_hooks(
     require_attn_metadata: bool = False,
     allow_prerope_fallback: bool = False,
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Install last-layer Q/K/V + ``h_L`` hooks for forward attribution.
-
-    Hooks are gated by ``enabled()`` (worker sets ``_cap.active`` during prefill).
-    ``on_qkv`` records batch layout for multi-request slicing after the forward.
-
-    The ``require_attn_metadata`` flag controls whether hooks are installed only
-    during a scheduler-driven attention forward with populated context metadata (True),
-    or whether they run as long as enabled() is set and CUDA-graph capture is not active (False).
-    """
-    # Locate last transformer block and last attention module
+    """Install last-layer Q/K/V + ``h_L`` hooks for forward attribution."""
     last_layer = _last_transformer_block(model)
     last_attn = _attention_on_block(last_layer)
     ffn_input_norm = locate_ffn_input_norm(model)
 
-    # Record batch metadata for multi-request slicing
     def on_qkv() -> None:
         if model_runner is not None and meta is not None and enabled():
             record_batch_meta(model_runner, meta)
 
-    # Register Q/K/V hooks for last-layer attention module in vLLM and HF-format serving
-    # models, and collect QKV activations immediately after projection
-    # and immediately before the attention module to determine whether RoPE was applied.
     hooks = _register_qkv_hooks(
         last_attn,
         dest,
@@ -1391,10 +1194,6 @@ def register_forward_attr_hooks(
             return
         if require_attn_metadata and _forward_context_att_metadata() is None:
             return
-        # Capture the block's residual-stream input BEFORE the layer runs. vLLM's fused
-        # add+norm rewrites the ``residual`` tensor in-place during forward, so reading the
-        # layer inputs in a post-forward hook observes a mutated (wrong) residual stream and
-        # corrupts the Norm1 base used by the attention VJP. A pre-hook clones the true input.
         dest["h_input"] = _decoder_layer_input(_i).detach().clone()
 
     def layer_hook(_m, _i, output: Any) -> None:
@@ -1405,8 +1204,8 @@ def register_forward_attr_hooks(
         dest["h_L"] = _decoder_layer_hidden(output).detach().clone()
         on_qkv()
 
-    hooks.append(last_layer.register_forward_pre_hook(layer_input_prehook))  # block input
-    hooks.append(last_layer.register_forward_hook(layer_hook))  # residual stream at layer L
+    hooks.append(last_layer.register_forward_pre_hook(layer_input_prehook))
+    hooks.append(last_layer.register_forward_hook(layer_hook))
     if ffn_input_norm is not None:
         def ffn_norm_prehook(_m, inputs: Any) -> None:
             if not enabled() or _skip_forward_capture():
@@ -1415,19 +1214,11 @@ def register_forward_attr_hooks(
                 return
             if not inputs:
                 return
-            # vLLM's fused add+norm passes (attn_out, residual); the true MLP-norm input is
-            # their sum. _decoder_layer_input sums the >=2-D tensors (and is a no-op for the
-            # single-tensor HF call), matching the residual stream h_mid we backprop through.
             dest["h_mid"] = _decoder_layer_input(inputs).detach().clone()
             on_qkv()
 
         hooks.append(ffn_input_norm.register_forward_pre_hook(ffn_norm_prehook))
     return hooks
-
-
-# ---------------------------------------------------------------------------
-# User-facing generation wrappers
-# ---------------------------------------------------------------------------
 
 
 def load_highlighter_config(config_file: str) -> dict:
@@ -1449,12 +1240,7 @@ def generate_with_highlighter(
     save_to_disk: bool | None = None,
     **kwargs,
 ):
-    """Generate with Token Highlighter capture or mitigation.
-
-    Works with ``MiaLLM`` configured with ``worker_name="token_highlighter"``.
-    Installs worker hooks, sets per-request ``extra_args``, runs ``MiaLLM.generate``,
-    and flushes disk artifacts when ``save_to_disk`` is enabled (capture mode).
-    """
+    """Generate with Token Highlighter capture or mitigation."""
     import copy
     import os
     import uuid
@@ -1560,3 +1346,4 @@ def analyze_with_highlighter(
         run_id=run_id,
         run_ids=run_ids,
     )
+

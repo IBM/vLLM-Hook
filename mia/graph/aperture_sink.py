@@ -1,46 +1,4 @@
-"""The capture-aperture drains' raw-file write path: persistent per-file sinks, O_DIRECT where the
-alignment rules hold, and a small writer-thread pool.
-
-WHY. In FULL-graph aperture mode the drain consumer thread IS the disk writer (the writer process
-idles; docs/tp_support.md §8). The old path, per step and per layer, materialised the rows as a
-fresh ``bytes`` object (``.numpy().tobytes()``, GIL held) and then ``open(path, "ab")`` / ``write`` /
-``close`` -- two host copies and an open/close per layer per step, on ONE thread, with every
-aperture row held until the last layer's append. Measured on the 70B TP4 full step (10.74 GB): about
-1.84 GB/s, which saturates HS capture near 3 req/s. That sequence survives unchanged as
-``MIA_APERTURE_WRITE_MODE=legacy``, for A/B validation only.
-
-THE NEW PATH (``auto``, the default):
-
-* **Zero-copy.** Each write hands ``os.pwrite`` a ``memoryview`` straight over the per-layer host
-  buffer the D2H landed in. bfloat16 goes out as its raw 2-byte payload -- exactly the bytes the
-  old ``.view(torch.uint16).numpy().tobytes()`` produced, which is what the reader reads back.
-* **Files stay open.** One fd per raw file for the whole run, opened (``O_TRUNC``) when the drain
-  is built and closed at ``close()``. The append offset is tracked here; no per-step open/close.
-* **O_DIRECT where it is legal AND where it pays.** A file is opened ``O_DIRECT`` only when its
-  row size is a multiple of the directory's direct-I/O block size, so every write length -- and
-  therefore every file offset, a running sum of them -- is block-aligned by construction; the
-  drain's host buffers are allocated at ``mem_align``. The block size is DETECTED
-  (``statx(STATX_DIOALIGN)``, else the block device's ``logical_block_size`` from sysfs, then a
-  probe write that must succeed), never assumed. A file whose rows are not a multiple (QK k rows
-  at TP4 70B are 512 B, at TP8 256 B) is written through the zero-copy buffered path instead.
-  ``auto`` then weighs the PREDICTED write size (:func:`predict_rows_per_write` x the row width)
-  against :data:`DIRECT_MIN_BYTES`, the low end of the measured crossover band: below it an
-  O_DIRECT write's device round-trip stops paying for itself (it does not shrink with the
-  payload), and at the bottom of the ladder it measurably costs, so the file is written buffered.
-  An explicit ``direct`` ignores the size rule -- it is a requirement, not a suggestion.
-  The decision is made once per file, at open: a file is never written both ways.
-* **The per-request disk staging shares this writer** (:class:`PerRequestSinks`), in buffered
-  mode: same zero-copy ``pwrite``, same run-long fds, no ``bytes`` copy and no per-step
-  open/close, for the same bytes.
-* **Writer threads.** A pool of ``MIA_APERTURE_WRITE_THREADS`` (default 2) threads runs the writes
-  while the drain thread keeps issuing per-layer D2H copies, so the copies overlap the writes.
-  The drain joins every write of a step BEFORE ``advance_drain`` frees that step's rows.
-
-LOUD FAILURES ONLY. A write that fails raises out of the task; the drain waits for the step's other
-writes, then re-raises in its consumer thread, which dies without advancing the aperture cursor, so
-the engine's backpressure check turns it into ``ApertureBackpressureError``. ``direct`` refuses at
-construction when O_DIRECT cannot be honoured. Nothing here falls back after a file is open.
-"""
+"""Raw-file write path for the aperture drains: persistent sinks, O_DIRECT, writer threads."""
 from __future__ import annotations
 
 import ctypes
@@ -70,75 +28,14 @@ WRITE_MODES = ("auto", "direct", "buffered", "legacy")
 DEFAULT_WRITE_THREADS = 2
 _MAX_WRITE_THREADS = 64
 
-#: THE O_DIRECT CROSSOVER, in bytes per write (one raw file, one drained step). Below it a file
-#: is opened buffered, at or above it O_DIRECT; `auto` weighs a file's PREDICTED write size
-#: (``WriteShape.rows`` x that file's row width) against this. It governs ONE thing: the per-file
-#: choice in the OFF-LOOP SHARED-FILE drains (``_ALLOW_DIRECT = True``), which always run a
-#: writer pool of :func:`resolve_write_threads` threads -- default 2, and 2 on every engine run
-#: recorded so far (the 1- and 4-thread install lines in the study's output are the drain bench's
-#: own sweep). So the column to read it off is the per-STEP one at 2 threads, not the per-write
-#: one at 1 -- but a run may set 1, so the threshold must not contradict that column either.
-#:
-#: MEASURED, job 1802981, H100 node p2-r14-n3, MIA pin 279ef1a, sink on the node-local NVMe (XFS
-#: on an 8-way PM1733a LVM stripe, 512 B logical block): `tests/perf/drain_bench.py` driven over
-#: two HS geometries x eight step sizes x {legacy, buffered, direct, auto} x {1, 2} writer
-#: threads = 128 points, every one `--verify` ok (the bytes are identical in all four modes at
-#: every size). Raw data `bench/small_sweep.1802981/small_sweep.json`.
-#:
-#: **Per drained STEP** -- what the drain thread actually spends, D2H included -- as O_DIRECT's
-#: cost relative to the same step buffered (positive = O_DIRECT SLOWER):
-#:
-#:      per-layer write     8 KiB   16 KiB   32 KiB   64 KiB  128 KiB  256 KiB  512 KiB    1 MiB
-#:      1 writer thread    +36.6%   +26.8%   +14.3%    +8.5%    -7.2%    -6.8%   -46.4%   -67.5%
-#:      2 writer threads    +2.8%    -5.0%    -7.6%    +3.0%    -9.9%    -3.8%   -35.7%   -58.7%
-#:
-#: The ladder alternates geometries (8/32/128/512 KiB are the 8B shape, h4096 = 8 KiB rows;
-#: 16/64/256 KiB and 1 MiB the 70B shard, h8192 = 16 KiB rows), so read it column by column.
-#:
-#: NOISE FLOOR, from the same job's 32 `auto`-vs-`direct` pairs -- identical path, identical
-#: bytes, so their spread is pure noise: median 2.8 %, p90 11.9 %, max 36 %. Against it exactly
-#: three points are DECISIVE for buffered -- 8, 16 and 32 KiB, and only at ONE writer thread --
-#: and everything from 512 KiB up is decisive for direct at both thread counts. 64-256 KiB the
-#: measurement cannot call either way, and at the shipped 2 threads nothing below 512 KiB is
-#: decisive at all: buffered's best showing there is +3 %.
-#:
-#: **Hence 64 KiB: the low end of the undecidable band -- the smallest threshold no measured
-#: column contradicts.** It keeps buffered exactly where buffered decisively wins, and inside the
-#: band it errs towards direct because the error is asymmetric: wrong towards direct costs at
-#: most +0.43 ms per step with a single writer and +0.04 ms with the shipped 2-thread pool (the
-#: worst rows above, on steps of 1.18 and 1.43 ms), wrong towards buffered costs ~4x and grows
-#: without limit (264 vs 67 ms per step at 64 MiB). Deliberately NOT thread-aware: one number
-#: above every decisive 1-thread loss and below every decisive 2-thread win serves both, and the
-#: pool size is not known where this is read. In rows: 8 at 8B, 4 at 70B. (Until 2026-09-20 this
-#: read 128 KiB, taken from
-#: the per-write column below; at 2 threads that column does not describe this decision, and the
-#: rule it produced could only cost -- up to ~10 % of a step at 128 KiB.)
-#:
-#: **Per WRITE**, for completeness and because it IS the right column elsewhere -- direct as a
-#: multiple of buffered: at 1 thread 1.74x (8 KiB), 1.65x, 1.33x, 1.17x, 0.91x, 0.95x, 0.49x
-#: (512 KiB); at 2 threads 1.02x, 1.10x, 0.90x, 1.17x, 0.97x, 0.99x, 0.59x. The 1-thread row is
-#: what the per-request staging faces -- it writes inline on the drain thread with no pool
-#: (:class:`PerRequestSinks`) -- and a bare `write()` control in the same job (single-threaded,
-#: no drain) puts parity at 256 KiB. Neither governs this constant.
-#:
-#: The mechanism under both: an O_DIRECT write carries an ~18-20 us device round-trip that does
-#: not shrink with the payload, while a buffered write is a memcpy into the page cache at
-#: ~3.2 GB/s with a ~2 us floor -- they meet where 3.2 GB/s spends 20 us, and a second writer
-#: thread hides the round-trip but not the memcpy. Write-up: `results/model-scale/CAPTURE_IO.md`
-#: section 6.1 in the profiling harness. Override: MIA_APERTURE_DIRECT_MIN_BYTES.
 DIRECT_MIN_BYTES = 64 * 1024
 
-# One pwrite never asks for more than this. Linux caps a single write at 0x7ffff000 bytes anyway;
-# a power-of-two cap keeps every chunk boundary block-aligned for O_DIRECT.
 _MAX_IO_BYTES = 1 << 30
-# Host buffers for O_DIRECT are aligned to at least a page (cudaHostAlloc memory already is).
 _PAGE = mmap.PAGESIZE
-# Largest direct-I/O block size the probe will try.
 _PROBE_MAX_BLOCK = 1 << 16
 
 
 def _human_bytes(n: int) -> str:
-    """``131072`` -> ``"128.0 KiB"``. Log-line sugar only; nothing parses it back."""
     v = float(n)
     for unit in ("B", "KiB", "MiB", "GiB"):
         if v < 1024 or unit == "GiB":
@@ -155,15 +52,8 @@ class ApertureWriteError(RuntimeError):
     """A raw-file write failed or would have violated O_DIRECT's alignment rules."""
 
 
-# --------------------------------------------------------------------------------------------
-# Env
-# --------------------------------------------------------------------------------------------
-
 def resolve_write_mode() -> Tuple[str, bool]:
-    """``(mode, explicit)`` from ``MIA_APERTURE_WRITE_MODE``. Unset or empty means ``auto``.
-
-    Refuses anything but the four spellings (case-insensitive): a misspelt mode that silently ran
-    another path would make an A/B measure the wrong thing."""
+    """``(mode, explicit)`` from ``MIA_APERTURE_WRITE_MODE``."""
     raw = os.environ.get(WRITE_MODE_ENV)
     if raw is None or not raw.strip():
         return "auto", False
@@ -177,8 +67,7 @@ def resolve_write_mode() -> Tuple[str, bool]:
 
 
 def resolve_write_threads() -> int:
-    """``MIA_APERTURE_WRITE_THREADS`` (default 2): writer threads per off-loop drain. Must be an
-    integer in [1, 64]; anything else is refused rather than clamped."""
+    """``MIA_APERTURE_WRITE_THREADS`` (default 2): writer threads per off-loop drain."""
     raw = os.environ.get(WRITE_THREADS_ENV)
     if raw is None or not raw.strip():
         return DEFAULT_WRITE_THREADS
@@ -193,22 +82,7 @@ def resolve_write_threads() -> int:
 
 
 def resolve_per_request_write_mode(mode: str, explicit: bool) -> str:
-    """The write path a per-request DISK staging takes, from the drain's resolved
-    ``MIA_APERTURE_WRITE_MODE``: ``"legacy"`` for ``legacy``, else ``"buffered"``.
-
-    Per-request delivery writes no shared raw file, so the per-file O_DIRECT decision has nothing
-    to decide; what is left is whether the staging writes zero-copy through
-    :class:`PerRequestSinks` (``auto``/``buffered``) or through the pre-2026-09-20 ``_raw_bytes`` +
-    open/append/close sequence (``legacy``). Two configurations are REFUSED rather than quietly
-    ignored, mirroring the shared-file drain:
-
-    * an explicit ``direct`` -- there is no O_DIRECT path here, and the measurement says there
-      should not be: at this staging's 8-16 KiB per write O_DIRECT is 1.65-1.74x slower
-      (job 1802981, per write with a single writer -- which is exactly this path, since the
-      staging writes inline on the drain thread with no pool), quite apart from a mid-buffer row
-      slice having no alignment guarantee;
-    * ``MIA_APERTURE_MMAP=1`` under any mode but ``legacy`` -- the mmap sink existed to remove the
-      per-step ``open()``, which keeping the fd open already does."""
+    """Write path for per-request disk staging: legacy if the drain is legacy, else buffered."""
     if mode == "direct" and explicit:
         raise ApertureWriteConfigError(
             f"{WRITE_MODE_ENV}=direct refused: per-request delivery (MIA_APERTURE_PER_REQUEST=1) "
@@ -229,11 +103,7 @@ def resolve_per_request_write_mode(mode: str, explicit: bool) -> str:
 
 
 def resolve_direct_min_bytes() -> int:
-    """``MIA_APERTURE_DIRECT_MIN_BYTES`` (default :data:`DIRECT_MIN_BYTES`, 64 KiB): the smallest
-    PREDICTED write ``auto`` will open a file ``O_DIRECT`` for. Must be a non-negative integer;
-    anything else is refused rather than clamped (a misread size would silently pick the slower
-    path, which is exactly what this constant exists to stop). ``0`` restores the pre-2026-09-20
-    alignment-only rule -- direct wherever the rows align, whatever the size."""
+    """Smallest predicted write (bytes) that ``auto`` opens with O_DIRECT; default 64 KiB."""
     raw = os.environ.get(DIRECT_MIN_BYTES_ENV)
     if raw is None or not raw.strip():
         return DIRECT_MIN_BYTES
@@ -249,17 +119,9 @@ def resolve_direct_min_bytes() -> int:
     return n
 
 
-# --------------------------------------------------------------------------------------------
-# What one step is predicted to write -- the size half of `auto`
-# --------------------------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class WriteShape:
-    """How many rows one drained step is predicted to append to ONE raw file, and why.
-
-    ``rows`` x a file's row width is the write size ``auto`` weighs against
-    :data:`DIRECT_MIN_BYTES`. ``basis`` is the configuration that bounds it, printed in the
-    install line so the choice can be argued with from the log alone."""
+    """How many rows one drained step is predicted to append to ONE raw file, and why."""
     rows: int
     basis: str
 
@@ -270,43 +132,7 @@ class WriteShape:
 def predict_rows_per_write(kind: str, *, capture_mode: str,
                            max_batched_tokens: Optional[int], max_num_seqs: Optional[int],
                            aperture_rows: Optional[int]) -> Optional[WriteShape]:
-    """An UPPER BOUND on the rows one drained step appends per raw file, from the CAPTURE
-    CONFIGURATION alone (no traffic), or None when every bound it could use is missing -- in which
-    case ``auto`` decides on alignment alone, as it did before 2026-09-20.
-
-    The bound, per capture kind:
-
-    * **QK**, either ``hookq_mode`` -- every token of the step has its k row appended (``k_full``;
-      ``last_token`` only stops *q* being emitted, and q rides the same row span). One step's rows
-      are therefore the step's token budget: ``min(max_num_batched_tokens, aperture rows)``.
-    * **HS ``all_tokens``** (and any mode this function is not sure of) -- every token of the step
-      is captured: the same token budget.
-    * **HS ``last_token``** -- at most one row per IN-FLIGHT REQUEST per step, whatever the phase
-      (a prefill-only capture writes the one row of each request whose prefill ends in that step;
-      a decode-hooked one writes a row per active decoder). Bound: ``min(max_num_seqs, aperture
-      rows)``. The measured `8b-hs-decode` shape is exactly this at 128 decoders -- 1.05 MB per
-      layer write, 8x above the crossover.
-
-    WHY ``last_token`` IS NOT BOUNDED AT ONE ROW, although a prefill-only last-token capture
-    really does write one row per layer once. The mode this function is handed is the WORKER-WIDE
-    FALLBACK (``worker.hs_mode`` / ``hookq_mode``); every request may override it in its
-    ``extra_args``, and in serve most do. Predicting 1 row off a fallback would be a fabricated
-    certainty, and it errs in the expensive direction: a file opened buffered that then takes
-    64 MiB writes runs ~4x slower (264 vs 67 ms per step), while a file opened direct that takes
-    8 KiB writes costs a bounded +0.12 ms (70B) to +0.29 ms (8B) per step -- on a step that costs
-    ~1 ms in any mode and whose drain has >10x headroom (job 1802981, CAPTURE_IO.md 6.1/6.2). So
-    every bound here is an upper bound and the bias is towards ``direct``.
-
-    WHERE THE ``max_num_seqs`` BOUND BITES is arithmetic off :data:`DIRECT_MIN_BYTES`, not a
-    second measurement: below 8 concurrent requests at 8B (8 KiB rows) and 4 at 70B (16 KiB rows)
-    the predicted write is under the crossover and the file opens buffered. That window is
-    narrower than the one where buffered DECISIVELY wins (writes of 8-32 KiB, and only with a
-    single writer thread), because the threshold sits at the low end of the band the measurement
-    cannot call either way -- see the constant for both columns. A run that knows it writes small
-    and is not covered by the bound sets ``MIA_APERTURE_WRITE_MODE=buffered`` -- byte-identical,
-    and measured 14-37 % of the drained step at 8-32 KiB with a single writer (inside the noise
-    floor with the default 2-thread pool). ``ApertureWritePath.note_step_rows`` catches a
-    prediction that was wrong the other way, once, in the log."""
+    """Upper bound on rows one drained step appends per raw file, or None if unknown."""
     rows_cap = int(aperture_rows) if aperture_rows else 0
     mode = (capture_mode or "").strip().lower()
 
@@ -332,15 +158,9 @@ def predict_rows_per_write(kind: str, *, capture_mode: str,
                          + (f" and the {rows_cap}-row aperture" if rows_cap else ""))
 
 
-# --------------------------------------------------------------------------------------------
-# Direct-I/O detection
-# --------------------------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class DirectIOInfo:
-    """What ``probe_direct_io`` found for one directory. ``block_size`` is the offset/length
-    alignment O_DIRECT needs there; ``mem_align`` the buffer-address alignment MIA uses (at least a
-    page). ``source`` says where the block size came from; ``reason`` why direct I/O is off."""
+    """What ``probe_direct_io`` found for one directory."""
     supported: bool
     block_size: int = 0
     mem_align: int = 0
@@ -353,9 +173,6 @@ _AT_FDCWD = -100
 
 
 def _statx_dio_alignment(path: str) -> Optional[Tuple[int, int]]:
-    """``(mem_align, offset_align)`` from ``statx(STATX_DIOALIGN)``, or None when the kernel or
-    libc does not report it (Linux < 6.1, and this node's 5.14). ``offset_align == 0`` means the
-    file system says direct I/O is unsupported."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         fn = libc.statx
@@ -365,7 +182,7 @@ def _statx_dio_alignment(path: str) -> Optional[Tuple[int, int]]:
     try:
         rc = fn(ctypes.c_int(_AT_FDCWD), os.fsencode(path), ctypes.c_int(0),
                 ctypes.c_uint(_STATX_DIOALIGN), buf)
-    except Exception:  # noqa: BLE001 -- a foreign libc signature: "not reported"
+    except Exception:  # noqa: BLE001
         return None
     if rc != 0:
         return None
@@ -377,9 +194,6 @@ def _statx_dio_alignment(path: str) -> Optional[Tuple[int, int]]:
 
 
 def _sysfs_logical_block_size(path: str) -> Optional[int]:
-    """``logical_block_size`` of the block device backing ``path`` (None for a file system with no
-    block device -- tmpfs, NFS, GPFS -- or when sysfs is unreadable). Handles a partition by
-    reading its parent disk's queue."""
     try:
         st = os.stat(path)
     except OSError:
@@ -400,14 +214,7 @@ def _sysfs_logical_block_size(path: str) -> Optional[int]:
 
 
 def probe_direct_io(directory: str) -> DirectIOInfo:
-    """Can ``directory`` take O_DIRECT writes, and at what alignment? Detects, never assumes.
-
-    The candidate block size comes from ``statx(STATX_DIOALIGN)`` when the kernel reports it, else
-    from the backing block device's sysfs ``logical_block_size``. It is then CONFIRMED by a real
-    probe: open a scratch file ``O_DIRECT`` (a file system that rejects the flag fails here, e.g.
-    tmpfs before Linux 6.6) and ``pwrite`` one block from page-aligned memory at offset 0. If the
-    candidate is refused with EINVAL, larger powers of two are tried up to 64 KiB; with no
-    candidate the search starts at 512. The probe file is always removed."""
+    """Can ``directory`` take O_DIRECT writes, and at what alignment?"""
     if not hasattr(os, "O_DIRECT"):
         return DirectIOInfo(False, reason="this platform has no O_DIRECT")
     reported: Optional[int] = None
@@ -438,7 +245,7 @@ def probe_direct_io(directory: str) -> DirectIOInfo:
         return DirectIOInfo(False, source=source,
                             reason=f"open(O_DIRECT) under {directory} failed: {e}")
     try:
-        buf = mmap.mmap(-1, _PROBE_MAX_BLOCK)          # anonymous -> page-aligned
+        buf = mmap.mmap(-1, _PROBE_MAX_BLOCK)
         mv = memoryview(buf)
         try:
             candidates: List[int] = []
@@ -455,7 +262,7 @@ def probe_direct_io(directory: str) -> DirectIOInfo:
                 except OSError as e:
                     err, n = e, -1
                 finally:
-                    chunk.release()     # an exception's traceback must not pin the mapping
+                    chunk.release()
                 if err is not None:
                     if err.errno == errno.EINVAL:
                         last_err = str(err)
@@ -488,18 +295,9 @@ def probe_direct_io(directory: str) -> DirectIOInfo:
             pass
 
 
-# --------------------------------------------------------------------------------------------
-# Host buffers and zero-copy views
-# --------------------------------------------------------------------------------------------
-
 def alloc_host_rows(n_rows: int, width: int, dtype: torch.dtype, *, pinned: bool,
                     align: int) -> torch.Tensor:
-    """An ``(n_rows, width)`` host tensor whose data pointer is a multiple of ``align``.
-
-    Allocates exactly the bytes needed first: cudaHostAlloc (pinned) and large CPU allocations
-    come back page-aligned, and torch's pinned allocator rounds a request up to a power of two, so
-    padding every buffer by ``align`` would double pinned memory at the 70B step size. Only a
-    misaligned result is re-allocated with slack and sliced to an aligned start."""
+    """An ``(n_rows, width)`` host tensor whose data pointer is a multiple of ``align``."""
     elt = torch.empty((), dtype=dtype).element_size()
     nbytes = int(n_rows) * int(width) * elt
     raw = torch.empty(max(nbytes, 1), dtype=torch.uint8, pin_memory=pinned)
@@ -513,11 +311,7 @@ def alloc_host_rows(n_rows: int, width: int, dtype: torch.dtype, *, pinned: bool
 
 
 def tensor_bytes_view(t: torch.Tensor) -> memoryview:
-    """A flat, zero-copy ``memoryview`` of a contiguous CPU tensor's bytes.
-
-    Byte-for-byte the old ``_raw_bytes`` output: row-major, native (little-endian) layout, and a
-    bfloat16 tensor's raw 2-byte payload -- the same bytes ``.view(torch.uint16).numpy().tobytes()``
-    produced. The view keeps the tensor alive for as long as it exists."""
+    """A flat, zero-copy ``memoryview`` of a contiguous CPU tensor's bytes."""
     if t.device.type != "cpu":
         raise ApertureWriteError(f"raw-file write needs a host tensor, got {t.device}")
     if not t.is_contiguous():
@@ -528,19 +322,8 @@ def tensor_bytes_view(t: torch.Tensor) -> memoryview:
     return memoryview(flat.view(torch.uint8).numpy())
 
 
-# --------------------------------------------------------------------------------------------
-# One raw file
-# --------------------------------------------------------------------------------------------
-
 class RawFileSink:
-    """One raw file, open for the whole run. ``write`` appends at the tracked offset with
-    ``os.pwrite`` straight from the tensor's memory (the GIL is released for the syscall).
-
-    ``direct=True`` opens it ``O_DIRECT``; every write is then checked against the alignment rules
-    (buffer address % ``mem_align``, length and offset % ``block_size``) and a violation RAISES --
-    the drain guarantees them by construction, so a violation is a bug, never a reason to switch
-    this file to buffered writes. One writer per file at a time (the drain joins a step's writes
-    before the next step), so the offset needs no lock."""
+    """One raw file, open for the whole run."""
 
     def __init__(self, path: str, *, direct: bool, block_size: int = 0, mem_align: int = 0):
         self.path = path
@@ -550,8 +333,6 @@ class RawFileSink:
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
         if self.direct:
             flags |= os.O_DIRECT
-        # O_TRUNC: a re-run never appends onto stale bytes (the old path truncated up front too).
-        # 0o666 & ~umask: the same permissions the old open(path, "wb") gave the file.
         self.fd: Optional[int] = os.open(path, flags, 0o666)
         self.offset = 0
 
@@ -560,7 +341,7 @@ class RawFileSink:
         return "direct" if self.direct else "buffered"
 
     def write(self, t: torch.Tensor) -> int:
-        """Append ``t``'s bytes; returns the byte count. Raises on any short/failed write."""
+        """Append ``t``'s bytes; returns the byte count."""
         fd = self.fd
         if fd is None:
             raise ApertureWriteError(f"write to {self.path} after its sink was closed")
@@ -594,21 +375,11 @@ class RawFileSink:
             os.close(fd)
 
 
-# --------------------------------------------------------------------------------------------
-# Writer threads
-# --------------------------------------------------------------------------------------------
-
 _POOL_STOP = object()
 
 
 class WriterPool:
-    """``n`` daemon threads running write tasks; each returns a ``concurrent.futures.Future``.
-
-    Deliberately NOT a ``ThreadPoolExecutor``: that one refuses new work once interpreter shutdown
-    starts, which is exactly when the atexit backstop still needs the drain to finish its backlog.
-    Every thread binds ``device`` first (docs/tp_support.md §6); a thread whose bind fails keeps
-    serving its queue and fails every task with that error, so a submitted write always completes
-    -- with a result or an exception -- and the drain can never wait forever on a dead writer."""
+    """``n`` daemon threads running write tasks; each returns a ``concurrent.futures.Future``."""
 
     def __init__(self, n_threads: int, device, name: str):
         self.n_threads = int(n_threads)
@@ -624,7 +395,7 @@ class WriterPool:
         bind_error: Optional[BaseException] = None
         try:
             bind_thread_to_device(self._device)
-        except BaseException as e:  # noqa: BLE001 -- recorded; every task below fails with it
+        except BaseException as e:  # noqa: BLE001
             bind_error = e
             logger.exception("aperture writer thread %s could not bind %s; every write it takes "
                              "will fail", threading.current_thread().name, self._device)
@@ -642,7 +413,7 @@ class WriterPool:
                 continue
             try:
                 fut.set_result(fn(*args))
-            except BaseException as e:  # noqa: BLE001 -- delivered to the drain, never swallowed
+            except BaseException as e:  # noqa: BLE001
                 fut.set_exception(e)
 
     def submit(self, fn, *args) -> Future:
@@ -656,7 +427,7 @@ class WriterPool:
         return all(t.is_alive() for t in self._threads)
 
     def close(self, timeout: float = 60.0) -> None:
-        """Stop the threads after the queued tasks. Idempotent."""
+        """Stop the threads after the queued tasks."""
         if self._closed:
             return
         self._closed = True
@@ -667,9 +438,7 @@ class WriterPool:
 
 
 def join_writes(futures: Iterable[Future]) -> List:
-    """Wait for EVERY future, then raise the first failure (naming how many failed) or return the
-    results in order. Waiting for all of them first means no write is still reading a host buffer
-    when the drain gives up on the step."""
+    """Wait for every future, then raise the first failure or return the results in order."""
     futs = list(futures)
     if not futs:
         return []
@@ -686,16 +455,11 @@ def join_writes(futures: Iterable[Future]) -> List:
 
 
 def join_writes_quietly(futures: Iterable[Future]) -> None:
-    """Wait for every future without raising -- for a step that is already failing for another
-    reason, so no write is left reading a host buffer while that error propagates."""
+    """Wait for every future without raising, for a step already failing for another reason."""
     futs = list(futures)
     if futs:
         _wait_futures(futs)
 
-
-# --------------------------------------------------------------------------------------------
-# A drain's whole write path
-# --------------------------------------------------------------------------------------------
 
 @dataclass
 class _FileSpec:
@@ -707,8 +471,7 @@ class _FileSpec:
 
 @dataclass
 class WriteStats:
-    """Cumulative per-drain write-path accounting (seconds and bytes). Kept regardless of
-    ``MIA_PROFILE`` so the GPU micro-benchmark and a validation run can split a step's time."""
+    """Cumulative per-drain write-path accounting (seconds and bytes)."""
     steps: int = 0
     rows: int = 0
     step_s: float = 0.0
@@ -731,23 +494,7 @@ class WriteStats:
 
 
 class ApertureWritePath:
-    """The resolved write path of ONE drain: the per-file mode decision, the open sinks, and (for
-    an off-loop drain) the writer pool.
-
-    ``files`` maps a drain-side key (HS: the layer number; QK: ``("q", L)`` / ``("k", L)``) to
-    ``(path, kind, row_bytes)``. ``allow_direct`` is False for the synchronous drain, whose host
-    rows are pageable ``.to("cpu")`` tensors with no alignment guarantee.
-
-    ``mode``: ``auto`` opens a file O_DIRECT iff the directory takes O_DIRECT, the file's rows are
-    a multiple of the block size, AND its predicted write is at least
-    :func:`resolve_direct_min_bytes` -- else buffered (the reason is kept for the install line);
-    ``direct`` requires alignment of EVERY file and refuses at construction otherwise, ignoring
-    size (an explicit mode is a requirement, never a suggestion); ``buffered`` never uses
-    O_DIRECT. ``legacy`` is not handled here -- the drains keep that path verbatim.
-
-    ``shape`` is what one drained step is predicted to write per file
-    (:func:`predict_rows_per_write`); None means the caller could not predict, and ``auto`` then
-    decides on alignment alone -- the rule before 2026-09-20."""
+    """The resolved write path of one drain: per-file modes, open sinks and writer pool."""
 
     def __init__(self, run_dir: str, files: Dict[object, Tuple[str, str, int]], mode: str, *,
                  allow_direct: bool, direct_refusal: str = "", label: str = "aperture",
@@ -772,12 +519,9 @@ class ApertureWritePath:
         if mode == "direct" and not self.dio.supported:
             raise ApertureWriteConfigError(
                 f"{WRITE_MODE_ENV}=direct refused for {label}: {self.dio.reason}")
-        # Per-file decision, made ONCE, before any byte is written: alignment first (O_DIRECT is
-        # illegal without it), then the predicted write size (`auto` only -- an explicit `direct`
-        # is a requirement, not a suggestion, and is never overruled by a prediction).
         self.kind_reason: Dict[str, str] = {}
         self.kind_predicted: Dict[str, int] = {}
-        self._size_downgraded: Dict[str, int] = {}   # kind -> row bytes, watched by note_step_rows
+        self._size_downgraded: Dict[str, int] = {}
         self._mispredicted = False
         decisions: Dict[object, bool] = {}
         for k, s in self.specs.items():
@@ -801,8 +545,6 @@ class ApertureWritePath:
                         f"below the {_human_bytes(self.direct_min_bytes)} O_DIRECT crossover, "
                         f"where a drained step measures 14-37 % slower direct with a single "
                         f"writer and inside the noise floor with the pool")
-                    # Watched by note_step_rows: this one was decided on a PREDICTION, which real
-                    # traffic can contradict (a request may override the worker-wide capture mode).
                     self._size_downgraded[s.kind] = s.row_bytes
                 else:
                     direct = True
@@ -819,7 +561,6 @@ class ApertureWritePath:
                 except OSError as e:
                     if not direct or mode == "direct":
                         raise
-                    # auto, before any write: this file takes the buffered path, stated below.
                     self.kind_reason.setdefault(s.kind, f"open(O_DIRECT) failed: {e}")
                     self.sinks[k] = RawFileSink(s.path, direct=False)
         except BaseException:
@@ -835,13 +576,11 @@ class ApertureWritePath:
         self.closed = False
         self.stats = WriteStats()
 
-    # ---- setup ----
     def start_pool(self, n_threads: int, device, name: str) -> None:
         if self.pool is None:
             self.pool = WriterPool(n_threads, device, name)
             self.threads = int(n_threads)
 
-    # ---- per write ----
     def sink(self, key) -> RawFileSink:
         return self.sinks[key]
 
@@ -853,9 +592,7 @@ class ApertureWritePath:
         return {kind: "+".join(sorted(m)) for kind, m in seen.items()}
 
     def summary(self) -> str:
-        """The one install line's body: mode per tensor kind with the predicted write size and the
-        reason it went that way, then threads, block size and the configuration the prediction
-        came from. Everything a reader needs to argue with the decision from the log alone."""
+        """Install-line summary: mode per tensor kind with predicted write size, threads, block size."""
         parts = []
         rows = {}
         for s in self.specs.values():
@@ -885,17 +622,7 @@ class ApertureWritePath:
                 f"{len(self.sinks)} raw files kept open, zero-copy writes{basis}")
 
     def note_step_rows(self, rows: int) -> None:
-        """A drained step spanned ``rows`` rows -- an upper bound on what any ONE of its files
-        wrote (a selective drain compacts a file that no request asked for below it). WARNS ONCE,
-        and only for a file ``auto`` opened buffered BECAUSE its predicted write was under the
-        crossover, when this step's span reaches it.
-
-        The prediction is made at install from the worker-wide capture mode, which every request
-        may override (see :func:`predict_rows_per_write`), so it can be wrong -- and wrong this way
-        is the expensive direction: buffered at 64 MiB per write is ~4x slower than O_DIRECT. The
-        mode cannot change now (a file is never written both ways, by design), so the only useful
-        thing to do is SAY SO rather than be quietly slow. Costs one comparison per step, and
-        nothing at all once it has fired or when no file was downgraded by size."""
+        """Record that a drained step spanned ``rows`` rows."""
         if self._mispredicted or not self._size_downgraded:
             return
         for kind, row_bytes in self._size_downgraded.items():
@@ -915,7 +642,7 @@ class ApertureWritePath:
             return
 
     def close(self) -> None:
-        """Join the writer threads, then close every fd. Idempotent."""
+        """Join the writer threads, then close every fd."""
         if self.closed:
             return
         self.closed = True
@@ -932,32 +659,14 @@ class ApertureWritePath:
 
 
 class PerRequestSinks:
-    """The per-request disk staging's raw files: opened on first use, kept open for the request,
-    written zero-copy, always BUFFERED.
-
-    The staging appends ONE request's rows for one layer per step, which is 8 KiB (8B, h4096) or
-    16 KiB (70B, h8192) per write by construction -- permanently at the bottom of the write ladder
-    (see :data:`DIRECT_MIN_BYTES`), and it writes them INLINE on the drain thread, with no writer
-    pool. That is the one place the single-writer per-write column of job 1802981 is the column
-    that applies, and there O_DIRECT measures 1.65-1.74x WORSE; the rows are also a mid-buffer
-    slice with no alignment guarantee. So there is no mode to choose here: this is the buffered
-    half of the same :class:`RawFileSink` the shared-file drain uses.
-
-    Measured gain over the pre-2026-09-20 staging (``_raw_bytes`` copy + ``open(p,"ab")`` / write /
-    close per layer per step): **1.39-1.59x** on that write -- legacy 0.0242 ms (8 KiB) / 0.0313 ms
-    (16 KiB) -> buffered 0.0174 / 0.0197 ms, job 1802981.
-
-    One writer at a time (the drain's consumer thread owns a request's staging), so no lock; the
-    bytes are consumed synchronously inside :meth:`append`, before the caller's aperture rows are
-    freed, exactly as the copy it replaces was."""
+    """A per-request staging's raw files: opened on first use, written zero-copy, buffered."""
 
     def __init__(self, label: str = "per-request staging"):
         self.label = label
         self.sinks: Dict[object, RawFileSink] = {}
 
     def append(self, key, path: str, t: torch.Tensor) -> int:
-        """Append ``t``'s bytes to ``key``'s file, opening it (``O_TRUNC``, so a re-run never
-        appends onto stale bytes -- what the old ``open(p,"wb").close()`` did) on first use."""
+        """Append ``t``'s bytes to ``key``'s file, truncating it on first use."""
         sink = self.sinks.get(key)
         if sink is None:
             sink = RawFileSink(path, direct=False)
@@ -965,8 +674,7 @@ class PerRequestSinks:
         return sink.write(t if t.is_contiguous() else t.contiguous())
 
     def close(self) -> None:
-        """Close every fd. Idempotent, and best-effort per file: a staging dir can vanish under an
-        aborted request, and a close error must never wedge the consumer thread."""
+        """Close every fd."""
         sinks, self.sinks = self.sinks, {}
         for s in sinks.values():
             try:
@@ -986,18 +694,7 @@ def record_step_stats(stats: WriteStats, kind: str, *, rows: int, step_s: float,
                       write_s: float, write_tail_s: float, busy_s: float, bookkeeping_s: float,
                       bytes_by_mode: Dict[str, int],
                       wp: "Optional[ApertureWritePath]" = None) -> None:
-    """Account one drained step, in ``stats`` always and in PROF when ``MIA_PROFILE=1``.
-
-    PROF names (timers in ms, one sample per step): ``aperture.<kind>.step`` (the whole drained
-    step), ``.d2h`` (D2H issue until the last layer's rows landed on the host), ``.write`` (first
-    write submitted until every write finished; overlaps ``.d2h`` in the pooled path),
-    ``.write_tail`` (waiting on writes after D2H and bookkeeping were done: the part the overlap did
-    not hide), ``.bookkeeping`` (copy plans + sidecar records). Counters:
-    ``aperture.<kind>.bytes.{direct,buffered,legacy}`` and ``aperture.<kind>.write_busy_us`` (sum of
-    per-file write durations across writer threads).
-
-    ``wp`` (the drain's write path, when it has one) also gets this step's row count, so a
-    size-predicted buffered decision that real traffic contradicts is reported once."""
+    """Account one drained step, in ``stats`` always and in PROF when ``MIA_PROFILE=1``."""
     if wp is not None:
         wp.note_step_rows(rows)
     stats.last = {"rows": int(rows), "step_s": step_s, "d2h_s": d2h_s, "write_s": write_s,
@@ -1013,7 +710,6 @@ def record_step_stats(stats: WriteStats, kind: str, *, rows: int, step_s: float,
     stats.bookkeeping_s += bookkeeping_s
     for m, n in bytes_by_mode.items():
         setattr(stats, f"bytes_{m}", getattr(stats, f"bytes_{m}") + int(n))
-    # Last: a reader that sees `steps` reach N also sees step N's `last` (single writer).
     stats.steps += 1
     if not is_prof_enabled():
         return
@@ -1038,3 +734,4 @@ __all__ = [
     "tensor_bytes_view", "RawFileSink", "PerRequestSinks", "WriterPool", "join_writes",
     "WriteStats", "ApertureWritePath", "timed_write", "record_step_stats", "join_writes_quietly",
 ]
+

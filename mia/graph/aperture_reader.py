@@ -1,19 +1,4 @@
-"""Read-side reconstruction for the capture-aperture raw dump: pair the row-major raw file with the
-`aperture_metadata` sidecar to rebuild each request's per-layer tensors, byte-identical to what was
-written. Pure host-side (no GPU): `numpy.memmap` + `torch.from_numpy`.
-
-Contract (see `aperture_metadata.py::LayerEntry`): `read_sidecar` returns entries grouped into
-`StepMeta`s, but step index/position is NOT meaningful — reconstruction keys on each entry's
-`file_row`, the row offset into THAT ENTRY'S OWN raw file (the per-layer file for the multi-layer
-reader; the single shared file for `load_aperture_artifact`), NEVER on `logical_start` (the aperture-wide
-reservation position — only equal to `file_row` while every layer receives every row) nor on list
-position. `file_row` is always populated (`LayerEntry.__post_init__` / `read_sidecar`'s "fr"-else-"o"
-fallback resolve it), so this module reads it unconditionally; `_file_row()` below adds one more layer
-of defensiveness for an entry that somehow lacks the attribute. Multiple blocks for the same
-(req_id, layer) are sorted by `file_row` (ascending) before concatenation, so the reconstructed token
-order is correct regardless of the order entries appear in the sidecar — the reader does not rely on
-the upstream drain writing monotonically.
-"""
+"""Rebuild each request's per-layer tensors from an aperture raw dump and its sidecar."""
 from __future__ import annotations
 
 import os
@@ -25,18 +10,10 @@ from .aperture_metadata import read_qk_sidecar, read_sidecar
 
 
 def _file_row(e) -> int:
-    """The row offset into `e`'s OWN raw file: prefer the explicit per-layer `file_row`, else fall
-    back to `logical_start`. `LayerEntry.__post_init__` / `read_sidecar` already guarantee
-    `file_row` is populated on every entry this module sees in practice, but keying through this
-    helper (rather than `e.file_row` directly) keeps the reader correct even against an entry that
-    somehow lacks the attribute — "keys on file_row when present, else logical_start", literally."""
     fr = getattr(e, "file_row", None)
     return e.logical_start if fr is None else fr
 
 
-# Map the header's dtype string to a numpy dtype. bfloat16 has no native numpy dtype: read its raw
-# bytes as uint16 and reinterpret via `torch.view(torch.bfloat16)` after the tensor is built (numpy
-# has no bf16 type to view into directly).
 _NUMPY_DTYPE_BY_NAME = {
     "float32": np.float32,
     "float16": np.float16,
@@ -51,11 +28,7 @@ _NUMPY_DTYPE_BY_NAME = {
 
 
 def load_aperture_artifact(raw_path: str, meta_path: str) -> dict:
-    """Reconstruct `{req_id: {layer: Tensor}}` from a raw aperture dump + its metadata sidecar.
-
-    `raw_path` is the row-major dump of aperture rows in logical order (row `i` at byte offset
-    `i * row_bytes`); `meta_path` is the `aperture_metadata` sidecar written alongside it.
-    """
+    """Reconstruct `{req_id: {layer: Tensor}}` from a raw aperture dump + its metadata sidecar."""
     header, steps = read_sidecar(meta_path)
     dtype_name = header["dtype"]
     row_shape = tuple(header["row_shape"])
@@ -70,17 +43,12 @@ def load_aperture_artifact(raw_path: str, meta_path: str) -> dict:
 
     mmap = np.memmap(raw_path, dtype=np_dtype, mode="r").reshape((-1,) + row_shape)
 
-    # Flatten in write order (steps are organizational only; grouping below is keyed on
-    # file_row, not on this order).
     entries = [e for s in steps for e in s.entries]
 
-    # Collect every block per (req_id, layer) tagged with its file_row, so multi-block concatenation
-    # can be sorted into file row order below — self-contained-correct regardless of the order
-    # entries happen to appear in the sidecar (do not rely on writer monotonicity).
     blocks: dict = {}
     for e in entries:
         fr = _file_row(e)
-        block = np.array(mmap[fr : fr + e.n_rows])  # copy out of the mmap
+        block = np.array(mmap[fr : fr + e.n_rows])
         tensor = torch.from_numpy(block)
         if is_bf16:
             tensor = tensor.view(torch.bfloat16)
@@ -97,7 +65,6 @@ def load_aperture_artifact(raw_path: str, meta_path: str) -> dict:
 
 
 def _np_dtype_for(dtype_name: str):
-    """numpy dtype for a header dtype string; bfloat16 reads as uint16 (reinterpreted after)."""
     if dtype_name == "bfloat16":
         return np.uint16, True
     try:
@@ -107,32 +74,12 @@ def _np_dtype_for(dtype_name: str):
 
 
 def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = None) -> dict:
-    """Reconstruct ``{req_id: {layer: {"q", "k_all", "k_full", "k_prefix_ends", "hookq_mode"}}}``
-    from the QK capture-aperture dump: one q raw file + one k raw file per layer
-    (``qk_q_layer_<L>.raw`` / ``qk_k_layer_<L>.raw``, row-major, written by
-    :class:`MultiLayerQKApertureDrain`) + ONE shared QK sidecar (``qk_aperture_meta.jsonl``).
-
-    Both per-layer files grow in lockstep with the shared aperture cursor, so a
-    ``QKStepEntry.k_start`` / ``q_start`` is the row offset into ITS file (same invariant as
-    :func:`load_multilayer_aperture_artifact`, split across the q and k files). Per (req, layer):
-
-      * ``k_full`` = the forwarded key history (cat of each step's ``k_file[k_start:k_start+k_rows]``,
-        in ``k_start`` / logical order);
-      * ``q``      = cat of the emit_q ``q_file[q_start:q_start+q_rows]`` slices;
-      * ``k_all``  = ``[k_full[:L] for L in k_prefix_ends]`` — the growing-prefix reconstruction the
-        worker's ``_k_all_cpu_list`` produces (byte-identical to the eager path).
-
-    v1 PREFIX-CACHE / hooks_on=decode LIMIT (deferred, see the module + QKStepEntry docstrings): the
-    trimmed cached prefix ``[0, num_computed)`` is NOT written into the aperture, so when a request's
-    FIRST capture step has ``num_computed > 0`` this raises ``NotImplementedError`` rather than
-    returning a k_all that is short by the cached prefix. Fresh prefills (clean / hooks_on=both) have
-    first-step ``num_computed == 0`` and reconstruct exactly.
-    """
+    """Reconstruct per-request, per-layer QK tensors from a QK aperture dump and its sidecar."""
     if meta_path is None:
         meta_path = os.path.join(run_dir, "qk_aperture_meta.jsonl")
     header, entries = read_qk_sidecar(meta_path)
     q_dtype, q_is_bf16 = _np_dtype_for(header["dtype"])
-    k_dtype, k_is_bf16 = q_dtype, q_is_bf16  # q and k share the model dtype
+    k_dtype, k_is_bf16 = q_dtype, q_is_bf16
     q_row_shape = tuple(header["q_row_shape"])
     k_row_shape = tuple(header["k_row_shape"])
 
@@ -147,7 +94,6 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
             cache[layer] = mm
         return mm
 
-    # Group entries by (req_id, layer), preserving per-entry step order via k_start.
     grouped: dict = {}
     for e in entries:
         grouped.setdefault((e.req_id, e.layer), []).append(e)
@@ -155,7 +101,6 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
     out: dict = {}
     for (req_id, layer), es in grouped.items():
         es.sort(key=lambda e: e.k_start)
-        # First capture step = smallest k_start. v1 does not reconstruct a trimmed prefix.
         if es and es[0].num_computed > 0:
             raise NotImplementedError(
                 f"QK capture-aperture prefix reconstruction is deferred (v1): request {req_id!r} "
@@ -196,16 +141,7 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
 
 
 def load_multilayer_aperture_artifact(run_dir: str, meta_path: str | None = None) -> dict:
-    """Reconstruct ``{req_id: {layer: Tensor}}`` from the HS capture-aperture dump: one raw file per
-    layer (``hs_layer_<L>.raw``, row-major, written by ``MultiLayerApertureDrain``) + ONE shared
-    ``aperture_metadata`` sidecar (``hs_aperture_meta.jsonl``).
-
-    Each ``LayerEntry``'s ``file_row`` is the row offset into ITS OWN layer's file (same invariant as
-    the single-file ``load_aperture_artifact``, extended to per-layer files) — NOT ``logical_start``, the
-    aperture-wide reservation position, which only coincides with ``file_row`` today because every
-    installed layer's file receives every step's rows (see ``LayerEntry``). Multi-block
-    ``(req_id, layer)`` groups are sorted by ``file_row`` before concatenation.
-    """
+    """Reconstruct ``{req_id: {layer: Tensor}}`` from an HS aperture dump and its sidecar."""
     if meta_path is None:
         meta_path = os.path.join(run_dir, "hs_aperture_meta.jsonl")
     header, steps = read_sidecar(meta_path)
@@ -220,8 +156,6 @@ def load_multilayer_aperture_artifact(run_dir: str, meta_path: str | None = None
         except KeyError:
             raise ValueError(f"unsupported dtype {dtype_name!r} in aperture header")
 
-    # One memmap per layer file, opened lazily on first reference (a request may touch only a
-    # subset of layers; non-referenced layer files are never opened).
     mmaps: dict = {}
 
     def _mm(layer: int):
@@ -237,7 +171,7 @@ def load_multilayer_aperture_artifact(run_dir: str, meta_path: str | None = None
     for e in entries:
         mm = _mm(e.layer)
         fr = _file_row(e)
-        block = np.array(mm[fr: fr + e.n_rows])  # copy out of the mmap
+        block = np.array(mm[fr: fr + e.n_rows])
         tensor = torch.from_numpy(block)
         if is_bf16:
             tensor = tensor.view(torch.bfloat16)
@@ -253,18 +187,6 @@ def load_multilayer_aperture_artifact(run_dir: str, meta_path: str | None = None
     return out
 
 
-# ---------------------------------------------------------------------------
-# Tensor parallelism: per-rank QK dirs -> ONE global-head-order artifact
-# ---------------------------------------------------------------------------
-# QK is captured on EVERY TP rank, each rank writing its OWN local heads to its own
-# ``<MIA_APERTURE_DIR>/tp_rank_<r>/`` (see ``mia/graph/tp_shard.py`` for which heads a rank
-# holds). Nothing downstream should ever read one rank dir and call it the layer: the merge
-# below is the reader's TP contract. HS is different -- the residual stream is REPLICATED, so a
-# rank's copy of a layer IS the layer, and under the TP LAYER shard (the default at TP > 1)
-# every rank writes a DIFFERENT subset of the layers (round-robin) to its own ``tp_rank_<r>/``:
-# ``merge_hs_aperture_ranks`` / ``load_hs_aperture_tp`` union them, refusing a gap or a
-# duplicate. Without the shard (TP = 1, ``MIA_HS_TP_SHARD=0``) only ``tp_rank_0`` holds data.
-
 QK_SIDECAR_NAME = "qk_aperture_meta.jsonl"
 HS_SIDECAR_NAME = "hs_aperture_meta.jsonl"
 
@@ -279,27 +201,7 @@ def read_sidecar_header(meta_path: str) -> dict:
 
 
 def merge_qk_aperture_ranks(rank_dirs, meta_paths=None, *, check_replicas: bool = False) -> dict:
-    """Merge per-rank QK aperture dumps into ONE artifact in the global head layout.
-
-    ``rank_dirs``: the per-rank directories (``tp_rank_<r>``) of ONE capture, in any order --
-    typically ``[d for d in llm.collective_rpc("flush_aperture") if d]``. ``meta_paths``
-    (optional, aligned with ``rank_dirs``) overrides each rank's sidecar, e.g. a filtered
-    sidecar holding only a sample of requests (the header line must be kept).
-
-    Returns the SAME shape as :func:`load_multilayer_qk_aperture_artifact`:
-    ``{req_id: {layer(0-based): {"q", "k_all", "k_full", "k_prefix_ends", "hookq_mode"}}}``
-    with ``q`` of width ``num_attention_heads * head_dim`` and ``k_full`` / every ``k_all``
-    element of width ``num_key_value_heads * head_dim``, heads in GLOBAL order (rank order for
-    q; for k, one copy of each KV head -- replicas vLLM made when ``num_key_value_heads <
-    tp_size`` are de-duplicated, lowest rank wins; ``check_replicas=True`` also requires the
-    replicas to be bitwise equal).
-
-    Raises :class:`mia.graph.tp_shard.TPShardError` when the set is not exactly one dir per rank
-    ``0..tp_size-1`` (a rank-0-only capture fails HERE), when headers disagree on the global
-    geometry, when a rank's file widths contradict its header, or when the ranks disagree on
-    which (request, layer) pairs they captured or on their row structure. A dir whose header
-    carries no TP fields (a pre-TP artifact) is accepted only alone, as a full-width TP=1 dump.
-    """
+    """Merge per-rank QK aperture dumps into ONE artifact in the global head layout."""
     from .tp_shard import TPShardError, check_complete_shard_set, merge_head_tensors, \
         qk_shard_from_header
 
@@ -364,10 +266,7 @@ def merge_qk_aperture_ranks(rank_dirs, meta_paths=None, *, check_replicas: bool 
 
 
 def load_qk_aperture_tp(aperture_dir: str, *, check_replicas: bool = False) -> dict:
-    """Discover every ``tp_rank_<r>/`` under ``aperture_dir`` (the ``MIA_APERTURE_DIR`` of one
-    run) and merge them with :func:`merge_qk_aperture_ranks`. ``aperture_dir`` may also be a
-    single rank dir / bare TP=1 dump. The expected rank count comes from the headers, so a
-    missing rank dir raises rather than returning a narrower layer."""
+    """Load every ``tp_rank_<r>/`` QK dump under ``aperture_dir`` and merge them."""
     from .tp_shard import TPShardError, discover_rank_dirs
 
     found = discover_rank_dirs(aperture_dir, QK_SIDECAR_NAME)
@@ -377,33 +276,7 @@ def load_qk_aperture_tp(aperture_dir: str, *, check_replicas: bool = False) -> d
 
 
 def merge_hs_aperture_ranks(rank_dirs, meta_paths=None, *, expected_layers=None) -> dict:
-    """Union per-rank HS aperture dumps of the TP LAYER shard into ONE artifact.
-
-    ``rank_dirs``: the ``tp_rank_<r>`` dirs of ONE capture, in any order. Each holds its rank's
-    round-robin share of the layers and a header naming it (``layer_shard`` / ``owned_layers``,
-    recomputed and checked here -- a header that lies is refused). ``meta_paths`` (optional,
-    aligned) overrides each rank's sidecar, as for the QK merge.
-
-    Returns :func:`load_multilayer_aperture_artifact`'s shape, ``{req_id: {layer (1-based):
-    Tensor}}``, layers ascending, byte-identical to a single-dir capture of the same layers.
-
-    ``expected_layers`` (1-based list, or True for all) is a GAP RELAXATION, NOT A FILTER. It
-    narrows WHICH RANKS must be present -- those owning one of its layers -- for a capture that
-    legitimately covered only some layers (e.g. a per-request disk delivery of a subset request),
-    and nothing else. It does not restrict what is RETURNED, and it cannot tell a subset capture
-    from a real loss: passing ``[1, 2]`` to a TP4 run whose rank 2 dir has been DELETED accepts
-    the remaining three ranks and returns their layers. A caller that asked for specific layers
-    must still check the ones it got.
-
-    Raises :class:`mia.graph.tp_shard.TPShardError`, never returning a partial union, on: a GAP
-    (a rank owning an expected layer is missing -- by default every owning rank must be present),
-    a DUPLICATE (two dirs of
-    one rank, or a (request, layer) present on two ranks), a rank holding a layer it does not own,
-    headers that disagree on geometry / dtype / row width, a mix of sharded and unsharded dirs, and
-    a request whose layers hold different row counts (the ranks captured different tokens).
-
-    A single dir whose header declares no layer shard (TP = 1, ``MIA_HS_TP_SHARD=0``) is read
-    as-is."""
+    """Union per-rank HS aperture dumps of the TP LAYER shard into ONE artifact."""
     from .tp_shard import (
         TPShardError, check_hs_shard_set, hs_expected_ranks, hs_requested_layers,
         hs_shard_from_header, merge_hs_layer_maps)
@@ -448,9 +321,6 @@ def merge_hs_aperture_ranks(rank_dirs, meta_paths=None, *, expected_layers=None)
 
 
 def _hs_replicas_equal(found, headers) -> None:
-    """``MIA_HS_CAPTURE_ALL_RANKS`` diagnostic: every rank ``0..tp_size-1`` present, holding the
-    same (request, layer) set as rank 0, each tensor BITWISE equal to rank 0's. Raises
-    ``TPShardError`` naming the first difference."""
     import torch as _torch
     from .tp_shard import TPShardError
 
@@ -479,21 +349,7 @@ def _hs_replicas_equal(found, headers) -> None:
 
 def load_hs_aperture_tp(aperture_dir: str, *, check_replicas: bool = False,
                         expected_layers=None) -> dict:
-    """Locate and load the HS capture of one run (``aperture_dir`` = its ``MIA_APERTURE_DIR``, or
-    one rank dir / a bare TP = 1 dump). Returns :func:`load_multilayer_aperture_artifact`'s shape.
-
-    * TP LAYER SHARD (headers carry ``owned_layers``; the default at TP > 1): every rank dir is
-      discovered -- a rank that captured nothing still has its header-only sidecar -- and unioned
-      with :func:`merge_hs_aperture_ranks` (a gap or duplicate raises ``TPShardError``).
-      ``expected_layers`` passes straight through, and is a gap RELAXATION rather than a filter --
-      see that function; it neither restricts the returned layers nor distinguishes a subset
-      capture from a lost rank dir.
-    * No layer shard (TP = 1, ``MIA_HS_TP_SHARD=0``): exactly ``tp_rank_0`` holds the capture. A
-      header saying ``tp_size > 1`` on a dir other than rank 0 means a rank that should have
-      written nothing wrote data; it is refused unless the header records the
-      ``MIA_HS_CAPTURE_ALL_RANKS`` diagnostic, in which case rank 0's copy is returned (the
-      replicas hold the same residual) and ``check_replicas=True`` first requires every rank's
-      copy to be BITWISE equal to rank 0's."""
+    """Load one run's HS capture from its aperture dir, a rank dir, or a bare TP=1 dump."""
     from .tp_shard import TPShardError, discover_rank_dirs, hs_shard_from_header
 
     found = discover_rank_dirs(aperture_dir, HS_SIDECAR_NAME)
@@ -515,3 +371,4 @@ def load_hs_aperture_tp(aperture_dir: str, *, check_replicas: bool = False,
     if check_replicas and any(h.get("capture_all_ranks", False) for h in headers):
         _hs_replicas_equal(found, headers)
     return load_multilayer_aperture_artifact(rank0[0])
+

@@ -47,11 +47,8 @@ from mia.utils.TokenHighlighter.grad_influence import (
 if TYPE_CHECKING:
     from vllm.config import ParallelConfig
 
-# pyright: reportOperatorIssue=false, reportArgumentType=false, reportIndexIssue=false, reportCallIssue=false, reportOptionalCall=false
-
 
 def _highlighter_active(scheduler_output: Any, model_runner: Any) -> bool:
-    """True when any scheduled request sets ``extra_args['highlighter_mode']`` (probe-style gate)."""
     if scheduler_output is not None:
         for nrd in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
             sp = getattr(nrd, "sampling_params", None)
@@ -71,7 +68,6 @@ def _highlighter_active(scheduler_output: Any, model_runner: Any) -> bool:
 def _iter_highlighter_extras(
     scheduler_output: Any, model_runner: Any
 ):
-    """Yield ``extra_args`` dicts for requests in the current scheduler step."""
     if scheduler_output is None:
         return
     for nrd in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
@@ -85,7 +81,6 @@ def _iter_highlighter_extras(
 
 
 def _apply_highlighter_config(worker: "HighlighterWorker", extra: dict) -> None:
-    """Apply per-request highlighter settings from ``extra_args['highlighter']``."""
     hl = extra.get("highlighter")
     if isinstance(hl, str):
         try:
@@ -122,7 +117,6 @@ def _apply_highlighter_config(worker: "HighlighterWorker", extra: dict) -> None:
 def _sync_highlighter_paths(
     worker: "HighlighterWorker", scheduler_output: Any, model_runner: Any
 ) -> None:
-    """Apply ``hook_dir`` / ``run_id`` / highlighter config from per-request ``extra_args``."""
     seen: set[tuple[str, str]] = set()
     for extra in _iter_highlighter_extras(scheduler_output, model_runner):
         _apply_highlighter_config(worker, extra)
@@ -145,7 +139,6 @@ def _sync_highlighter_paths(
 
 
 def _highlighter_mode(scheduler_output: Any, model_runner: Any) -> str:
-    """``capture`` or ``mitigate`` from ``extra_args['highlighter_mode']`` (default ``capture``)."""
     for nrd in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
         sp = getattr(nrd, "sampling_params", None)
         if sp and sp.extra_args:
@@ -163,22 +156,7 @@ def _highlighter_mode(scheduler_output: Any, model_runner: Any) -> str:
 
 
 class HighlighterWorker:
-    """Mixin injected into vLLM's GPU Worker via worker_extension_cls.
-
-    vLLM does Worker.__bases__ += (HighlighterWorker,) at runtime, so ``self`` is
-    the Worker instance. Registered as ``token_highlighter``.
-    ``highlighter_mode`` in ``SamplingParams.extra_args`` indicates capture vs mitigate per request.
-
-    **capture** — ``forward_attr`` (default): **extended** prefill schedules
-    ``prompt + target[:-1]`` in one forward when the full prompt fits the first scheduler chunk.
-    Suffix capture runs only when that is impossible (chunked prefill) or when a second
-    teacher forward is required; each case emits an explicit warning with detailed reasoning. Q/K/V hooks follow
-    ``QKCaptureWorker`` format (last-layer ``.attn`` inputs + ``get_query_metadata`` parsing).
-
-    **mitigate** — β-scaled prompt embeddings on prefill (embedding hook), then decode.
-
-    Callable via collective_rpc (``install_hooks``).
-  """
+    """Mixin injected into vLLM's GPU Worker via worker_extension_cls."""
 
     if TYPE_CHECKING:
         model_runner: Any
@@ -189,17 +167,10 @@ class HighlighterWorker:
     _input_embeddings: nn.Module
 
     def install_hooks(self):
-        """Wrap ``execute_model`` and install the mitigate embedding hook.
-
-        Forward-attr + RoPE probe hooks are deferred to ``_ensure_capture_hooks``
-        on the first capture request, once ``extra_args['highlighter']`` is available.
-        This moves hook installation-specific parameters to the worker instance from the broader MIA plugin.
-        """
+        """Wrap ``execute_model`` and install the mitigate embedding hook."""
         if self._hooks_installed:
             return
 
-        # HighlighterWorker is not ported to vLLM's V2 model runner; refuse early
-        # with a clear message rather than silently no-opping later.
         raise UnsupportedRunnerError(
             "HighlighterWorker is not supported on vLLM's V2 model runner. "
             "Supported worker kinds are: capture_hs, capture_qk, steer. "
@@ -211,7 +182,6 @@ class HighlighterWorker:
             self._highlighter_execute_wrapped = True
             orig_execute = self.execute_model
 
-                # Wrap the execute_model method with custom highlighter.
             def execute_model(*args, **kwargs):
                 return self._highlighter_execute_model_step(orig_execute, *args, **kwargs)
 
@@ -219,13 +189,7 @@ class HighlighterWorker:
         self._hooks_installed = True
 
     def flush_disk(self, external_req_ids: list, run_id: str, hook_dir: str) -> bool:
-        """collective_rpc-compatible disk flush for save_to_disk requests.
-
-        The generic hook plugin calls ``flush_disk`` after sync ``LLM.generate``
-        when ``extra_args['save_to_disk']`` is set. Token Highlighter writes its
-        own artifact in ``_finish_capture``; this method bridges that API by
-        forcing a pending capture finalize against the caller-provided run path.
-        """
+        """collective_rpc-compatible disk flush for save_to_disk requests."""
         if hook_dir:
             self.hook_dir = hook_dir
         if self.hook_dir:
@@ -235,8 +199,6 @@ class HighlighterWorker:
             with open(self.run_id_file, "a") as f:
                 f.write(str(run_id) + "\n")
 
-        # If capture completion was deferred (common in transition from extended to suffix path),
-        # finish now so the caller can immediately load highlighter_activations.pt.
         if self._pending and (self._capture_finish_pending or capture_ready(self._cap.live)):
             self._capture_finish_pending = False
             self._finish_capture()
@@ -244,7 +206,6 @@ class HighlighterWorker:
         return False
 
     def _install_highlighter_state(self):
-        """Attach persistent state and the mitigate embedding hook."""
         self.hook_dir = None
         self.run_id_file = None
         self._model = getattr(self.model_runner, "model", None)
@@ -252,12 +213,10 @@ class HighlighterWorker:
             raise RuntimeError("HighlighterWorker requires model.")
 
         self._device = next(self._model.parameters()).device
-        # Default config values
         self.threshold_k = 2.0
         self.soft_beta = 0.4
         self._target_phrase: str | None = None
         self.reselect_drivers = False
-        # Token Highlighter-specific hook installation parameters
         self._require_attn_metadata = False
         self._allow_prerope_fallback = False
 
@@ -293,13 +252,10 @@ class HighlighterWorker:
         if emb is None:
             raise RuntimeError("Input embeddings not found in the model.")
         self._input_embeddings = emb
-        # Register the embedding_soft_hook to the input embeddings. Note that
-        # this is present even in "capture" mode but captured embeddings are only used in "mitigate" mode.
         self._input_embeddings.register_forward_hook(self._embedding_soft_hook)
         self._hooks: list = []
 
     def _ensure_capture_hooks(self) -> None:
-        """Install forward-attr + RoPE probe hooks (once), using synced config."""
         if self._capture_hooks_installed:
             return
         cap = self._cap
@@ -326,11 +282,6 @@ class HighlighterWorker:
         print("[highlighter] capture hooks installed (qkv + h + rope probe)")
 
     def _embedding_soft_hook(self, _module, _inputs, output):
-        """Swap mitigated prompt embedding rows during mitigate prefill.
-
-        Matches the incoming prefill token ids to a queued entry from ``_queue_soft_embeddings``.
-        In-place ``copy_`` overwrites driver rows before layers write mitigated KV.
-        """
         if not self._pending_soft or not torch.is_tensor(output):
             return output
         if not (_inputs and torch.is_tensor(_inputs[0])):
@@ -343,9 +294,8 @@ class HighlighterWorker:
                 continue
             seq_len = output.size(-2) if output.dim() == 3 else output.size(0)
             if output.dim() in (2, 3) and seq_len >= plen:
-                # Copy beta-scaled driver rows to the output
                 slot = output[:plen] if output.dim() == 2 else output[0, :plen]
-                slot.copy_(pending["soft_prompt_embeds"])  # beta-scaled driver rows
+                slot.copy_(pending["soft_prompt_embeds"])
                 del self._pending_soft[idx]
                 return output
         return output
@@ -357,16 +307,10 @@ class HighlighterWorker:
         *,
         soft_indices: list[int] | None = None,
     ) -> None:
-        """Queue β-scaled driver embeddings for the next matching mitigate prefill.
-
-        By default this uses analyzer-saved ``soft_indices`` from ``highlighter.pt``.
-        Set ``highlighter.reselect_drivers`` in config to recompute from scores.
-        """
         plen = len(prompt_ids)
         pt = torch.tensor(prompt_ids, dtype=torch.long, device=self._device).unsqueeze(0)
         reselect = self.reselect_drivers
         if reselect or soft_indices is None:
-            # Compute drivers from scores using the threshold_k parameter.
             drivers = flag_driver_tokens(scores, threshold_k=self.threshold_k)
         else:
             drivers = sorted({int(i) for i in soft_indices if 0 <= int(i) < plen})
@@ -375,7 +319,6 @@ class HighlighterWorker:
         rows = self._input_embeddings(pt).detach().squeeze(0).clone()
         if drivers: rows[drivers] = rows[drivers] * self.soft_beta
         soft = rows
-        # Queue the beta-scaled driver embeddings for the next matching mitigate prefill.
         self._pending_soft.append(
             {"prompt_ids": list(prompt_ids), "prompt_len": plen, "soft_prompt_embeds": soft}
         )
@@ -385,7 +328,6 @@ class HighlighterWorker:
         )
 
     def _mitigate_scores_run_id(self) -> str | None:
-        """Run id that owns ``highlighter.pt`` (from mitigate request ``extra_args``)."""
         for req in (getattr(self.model_runner, "requests", None) or {}).values():
             sp = getattr(req, "sampling_params", None)
             extra = sp.extra_args if sp else None
@@ -395,7 +337,6 @@ class HighlighterWorker:
         return None
 
     def _load_scores(self) -> None:
-        """Load ``highlighter.pt`` for mitigate (request run id, not latest RUN_ID.txt)."""
         if (self._scores_by_prompt or self._soft_indices_by_prompt) or not self.hook_dir:
             return
         run_id = self._mitigate_scores_run_id()
@@ -404,11 +345,9 @@ class HighlighterWorker:
                 run_id = [ln.strip() for ln in f if ln.strip()][-1]
         if not run_id:
             return
-        # Load the highlighter.pt artifact from the analyzer for the mitigate request.
         trace = load_highlighter_artifact(self.hook_dir, run_id, "highlighter.pt")
         if not trace:
             raise RuntimeError("No highlighter.pt found; run capture + analyze first.")
-        # Load the token scores and soft indices from the highlighter.pt artifact.
         for seq in trace.get("sequences", []):
             key = tuple(seq.get("token_ids", []))
             if key and seq.get("token_scores"):
@@ -416,7 +355,6 @@ class HighlighterWorker:
                 self._soft_indices_by_prompt[key] = list(seq.get("soft_indices", []))
 
     def _ensure_target_tensor(self) -> None:
-        """Resolve affirmation ``target_ids`` from per-request ``highlighter`` config."""
         if self._target_tensor is not None:
             return
         if not self.target_ids:
@@ -433,7 +371,6 @@ class HighlighterWorker:
         )
 
     def _reset_capture_style(self) -> None:
-        """Use extended capture unless ``highlighter.capture`` requests suffix mode."""
         raw = str(getattr(self, "_capture_style", "extended")).strip().lower()
         if raw not in ("extended", "suffix"):
             warnings.warn(
@@ -452,7 +389,6 @@ class HighlighterWorker:
         self._capture_style = raw
 
     def _announce_suffix_fallback(self, reason: str, *, trigger: str) -> None:
-        """Warn when suffix capture is required — always visible, never once-only."""
         banner = (
             "\n"
             "======== Token Highlighter: SUFFIX capture required ========\n"
@@ -472,14 +408,12 @@ class HighlighterWorker:
         )
 
     def _switch_to_suffix(self, reason: str, *, trigger: str) -> None:
-        """Centralized style transition + warning for suffix fallback."""
         self._announce_suffix_fallback(reason, trigger=trigger)
         self._capture_style = "suffix"
 
     def _merge_with_suffix_capture(
         self, prompt_ids: list[int], real_capture: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Run suffix teacher pass and merge with real prompt rows."""
         return merge_real_and_teacher_captures(
             len(prompt_ids), real_capture, self._suffix_teacher_capture(prompt_ids)
         )
@@ -487,7 +421,6 @@ class HighlighterWorker:
     def _require_suffix_for_chunked_prefill(
         self, scheduler_output: Any, pending: list[list[int]]
     ) -> None:
-        """Suffix is mandatory when vLLM chunks the first prefill (scheduled tokens < prompt len)."""
         if self._capture_style != "extended" or not self.target_ids:
             return
         for prompt_ids in pending:
@@ -505,11 +438,6 @@ class HighlighterWorker:
             return
 
     def _suffix_teacher_capture(self, prompt_ids: list[int]) -> dict[str, torch.Tensor]:
-        """Run suffix teacher forward + hooks; return full-length tensors via ``expand_suffix_capture``.
-
-        Temporary hooks avoid mixing with ``_cap.live`` during normal prefill. Prompt
-        activations still come from ``slice_real_prefill_capture`` in ``_capture_for_prompt``.
-        """
         captured: dict[str, torch.Tensor] = {}
         hooks = register_forward_attr_hooks(
             self._model,
@@ -532,11 +460,6 @@ class HighlighterWorker:
         return expand_suffix_capture(len(prompt_ids), captured)
 
     def _capture_for_prompt(self, prompt_ids: list[int]) -> dict[str, torch.Tensor]:
-        """Build one ``prompt + target[:-1]`` activation dict for the analyzer.
-
-        Extended: single slice from ``_cap.live``. Suffix: real prompt slice + teacher
-        pass merged. Called from ``_finish_capture`` after prefill completes.
-        """
         if (
             self.target_ids
             and self._capture_style == "extended"
@@ -568,17 +491,7 @@ class HighlighterWorker:
         )
 
     def _finish_capture(self) -> None:
-        """Slice hooks, write ``highlighter_activations.pt``, clear pending state following capture.
-
-        May run on the prefill step when extended capture is complete, or on the next
-        idle step when ``_capture_finish_pending`` was set (suffix path).
-        """
         self._ensure_target_tensor()
-        # Precompute the affirmation-loss gradient g = dL/dh^{L} (post final-norm) at the
-        # generation positions here, while the unembedding W_U is resident on-device. This
-        # small [n_gen, d_model] tensor is all the analyzer needs from W_U, so we ship it in
-        # the artifact instead of the ~hundreds-of-MB W_U matrix (avoids re-saving on every
-        # capture and re-loading on every analyze, improving wall-clock time and efficiency).
         w_u = lm_head_weight(self._model)
         target_ids = list(self.target_ids)
         sequences = []
@@ -595,12 +508,8 @@ class HighlighterWorker:
                     model=self._model,
                 )
                 cpu_capture["g_loss"] = g_loss.detach().cpu()
-                # FFN-aware boundary gradient at h_mid in the final decoder block.
-                # This replaces naive g_out in the analyzer attention paths.
                 start = len(prompt_ids) - 1
 
-                # Compute the gradient at the boundary of the final FFN
-                # Locate final norm module and project dL/dh_j through
                 norm = locate_final_norm(self._model)
                 g_out = g_loss
                 if norm is not None:
@@ -614,9 +523,6 @@ class HighlighterWorker:
                             capture["h_L"].device,
                             capture["h_L"].dtype,
                         )
-                # Compute dL/dh_mid = dL/dh_out + J_norm2^T J_ffn^T dL/dh_out
-                # where dL/dh_out is the gradient at the boundary of the final FFN
-                # (affirmation loss gradient wrt direct last layer hidden states)
                 g_mid = compute_mid_boundary_gradient(
                     capture,
                     len(prompt_ids),
@@ -624,7 +530,6 @@ class HighlighterWorker:
                     model=self._model,
                     device=capture["h_L"].device,
                 )
-                # Pass single gradient vector to analyzer via highlighter.pt for efficiency
                 cpu_capture["g_mid"] = g_mid.detach().cpu()
             sequences.append({
                 "token_ids": list(prompt_ids),
@@ -634,9 +539,6 @@ class HighlighterWorker:
             })
         self._pending.clear()
         runtime_rope_probe = self._cap.meta.get("rope_runtime_probe")
-        # Clear in place: the forward hooks captured references to these dicts at
-        # install time. Rebinding to new dicts would orphan the hooks so they write
-        # to a stale buffer while the worker reads an empty one.
         self._cap.live.clear()
         self._cap.meta.clear()
         weight_bundle = export_forward_attr_weights(
@@ -649,12 +551,6 @@ class HighlighterWorker:
     def _highlighter_execute_model_step(
         self, super_execute_model, *args, **kwargs
     ):
-        """Intercept scheduler steps for capture (extended/suffix) or mitigate (soft embeds).
-
-        One vLLM scheduling step per call. Capture: bump scheduler for extended
-        teacher prefill (default), run the worker forward, restore prompt boundary, finish when
-        hooks hold a full teacher sequence. Mitigate: queue soft embeddings for mitigated prefill.
-        """
         scheduler_output = args[0] if args else kwargs.get("execute_model_req")
         active = _highlighter_active(scheduler_output, self.model_runner)
         if active and scheduler_output is not None:
@@ -667,7 +563,6 @@ class HighlighterWorker:
             else "mitigate"
         )
 
-        # --- Mitigate: load scores, queue scaled embeddings, normal prefill + decode ---
         if active and mode == "mitigate":
             if new_prompts:
                 self._load_scores()
@@ -681,12 +576,6 @@ class HighlighterWorker:
                         )
             return super_execute_model(*args, **kwargs)
 
-        # Deferred finish: some capture paths mark completion pending and need one
-        # subsequent idle worker step to flush highlighter_activations.pt.
-        #
-        # Do not gate on mode=="capture": a common flow is capture -> analyze -> mitigate,
-        # where the next worker step may already be in mitigate mode. If we only flush
-        # in capture mode, the artifact can remain unwritten and analyzer sees no file.
         if (
             self._capture_finish_pending
             and getattr(self.model_runner, "execute_model_state", None) is None
@@ -713,15 +602,12 @@ class HighlighterWorker:
             )
         )
         if capturing and new_prompts:
-            # Clear in place (not rebind): hooks hold references to these dicts from
-            # install time; rebinding orphans them and loses all captures.
             cap.live.clear()
             cap.meta.clear()
 
         if capturing and scheduler_output is not None:
             self._require_suffix_for_chunked_prefill(scheduler_output, pending)
 
-        # --- Extended: patch scheduler + token row, then restore after forward ---
         extend_plans = []
         orig_update_states = None
         use_extended = capturing and self.target_ids and self._capture_style == "extended"
@@ -747,7 +633,6 @@ class HighlighterWorker:
         cap.active = capturing
         try:
             out = super_execute_model(*args, **kwargs)
-            # Batch meta is recorded from Q/K/V hooks during the forward (on_qkv).
         finally:
             cap.active = False
             if orig_update_states is not None:
@@ -756,7 +641,6 @@ class HighlighterWorker:
                 restore_teacher_prefill_state(runner, extend_plans)
                 self._extended_req_ids.update(p.req_id for p in extend_plans)
 
-        # --- Post-prefill: finish capture or defer suffix merge on next idle step ---
         if pending and mode == "capture":
             done = all(prompt_prefill_done(runner, p) for p in pending)
             if not done or n_tok == 0:
@@ -766,8 +650,6 @@ class HighlighterWorker:
             ):
                 self._finish_capture()
             elif capture_ready(cap.live):
-                # Extended path: prompt activations captured; teacher rows completed in
-                # _capture_for_prompt via an announced suffix teacher forward if needed.
                 self._capture_finish_pending = True
             elif was_capturing:
                 raise RuntimeError(
@@ -779,3 +661,4 @@ class HighlighterWorker:
 
 HighlighterCaptureWorker = HighlighterWorker
 HighlighterSoftWorker = HighlighterWorker
+

@@ -1,12 +1,4 @@
-"""Spotlight Worker Mixin — attention steering via token span highlighting.
-
-Injected into vLLM's GPU Worker at runtime via worker_extension_cls.
-Hook installation is triggered by collective_rpc("install_hooks") after model load.
-Per-request activation is controlled via SamplingParams.extra_args["spotlight"].
-
-Paper: Venakteswaran and Contractor, EACL 2026
-       https://aclanthology.org/2026.eacl-long.174/
-"""
+"""Spotlight worker: attention steering toward emphasized token spans."""
 import logging
 import math
 from typing import TYPE_CHECKING, Any
@@ -33,11 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightWorker:
-    """Mixin injected into vLLM's GPU Worker via worker_extension_cls.
-
-    vLLM does Worker.__bases__ += (SpotlightWorker,) at runtime,
-    so `self` is the Worker instance. Methods are callable via collective_rpc.
-    """
+    """Mixin injected into vLLM's GPU Worker via worker_extension_cls."""
 
     if TYPE_CHECKING:
         model_runner: Any
@@ -46,16 +34,11 @@ class SpotlightWorker:
     _spotlight_hooks_installed: bool = False
 
     def install_hooks(self):
-        """Install Spotlight forward hooks on .attn modules. Idempotent.
-
-        Called via collective_rpc("install_hooks") after model load.
-        """
+        """Install Spotlight forward hooks on .attn modules."""
         if self._spotlight_hooks_installed:
             return
         self._spotlight_hooks_installed = True
 
-        # SpotlightWorker is not ported to vLLM's V2 model runner; refuse early
-        # with a clear message rather than silently no-opping later.
         raise UnsupportedRunnerError(
             "SpotlightWorker is not supported on vLLM's V2 model runner. "
             "Supported worker kinds are: capture_hs, capture_qk, steer. "
@@ -83,15 +66,12 @@ class SpotlightWorker:
             attn_scale=attn_scale,
         )
 
-        # Per-batch cache to avoid re-resolving requests on every hook fire
         self._spotlight_batch_cache_key = None
         self._spotlight_batch_entries = None
 
         def _resolve_batch(req_ids, bs, query_start_loc, seq_lens):
-            """Resolve which requests in this batch have spotlight params."""
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
 
-            # Only apply during initial prefill (query_len == seq_len for all)
             is_initial_prefill = torch.all(query_lens == seq_lens).item()
             if not is_initial_prefill:
                 if not getattr(self, '_spotlight_chunked_warned', False):
@@ -124,12 +104,7 @@ class SpotlightWorker:
             return entries
 
         def spotlight_attention_hook(module, input_tuple, output, *, module_name=None):
-            """Forward hook that applies Spotlight bias during initial prefill.
-
-            input_tuple[0] = Q [total_tokens, hidden_size]
-            input_tuple[1] = K [total_tokens, kv_dim]
-            input_tuple[2] = V [total_tokens, kv_dim]
-            """
+            """Forward hook that applies Spotlight bias during initial prefill."""
             if torch.cuda.is_current_stream_capturing():
                 return None
 
@@ -139,7 +114,6 @@ class SpotlightWorker:
                 return None
 
 
-            # Reuse resolved-request list within the same forward step
             cache_key = id(metadata)
             if self._spotlight_batch_cache_key != cache_key:
                 query_start_loc, seq_lens = get_query_metadata(metadata)
@@ -187,12 +161,10 @@ class SpotlightWorker:
 
                     orig_dtype = Q_batch.dtype
 
-                    # Reshape to [num_heads, qlen, head_dim] and upcast to float32
                     Q_batch = Q_batch.reshape(qlen, num_h, head_dim).transpose(0, 1).float()
                     K_batch = K_batch.reshape(qlen, num_kv, head_dim).transpose(0, 1).float()
                     V_batch = V_batch.reshape(qlen, num_kv, head_dim).transpose(0, 1).float()
 
-                    # Handle grouped-query attention
                     if num_h != num_kv:
                         n_rep = num_h // num_kv
                         K_batch = repeat_kv(K_batch.unsqueeze(0), n_rep).squeeze(0)
@@ -200,7 +172,6 @@ class SpotlightWorker:
 
                     logits = torch.matmul(Q_batch, K_batch.transpose(-1, -2)) * attn_scale
 
-                    # Apply causal mask
                     causal_mask = torch.triu(
                         torch.full((qlen, qlen), float('-inf'),
                                    device=logits.device, dtype=torch.float32),
@@ -208,14 +179,12 @@ class SpotlightWorker:
                     )
                     logits = logits + causal_mask.unsqueeze(0)
 
-                    # Apply Spotlight bias
-                    logits_4d = logits.unsqueeze(0)  # [1, heads, qlen, qlen]
+                    logits_4d = logits.unsqueeze(0)
                     modified_weights = compute_spotlight_bias(
                         logits_4d, [span_ranges], target_proportion=alpha
                     )
                     modified_weights = modified_weights.squeeze(0)
 
-                    # Compute attention output: weights @ V
                     attn_out = torch.matmul(modified_weights, V_batch)
                     attn_out = attn_out.transpose(0, 1).reshape(qlen, -1)
                     all_outputs.append(attn_out.to(orig_dtype))
@@ -226,7 +195,6 @@ class SpotlightWorker:
                 logger.error(f"Spotlight hook error: {e}", exc_info=True)
                 return None
 
-        # Install hooks on .attn modules
         self._spotlight_hooks = []
         matched = []
         for name, module, _layer_num in iter_matched_modules(model, match_attn):
@@ -237,3 +205,4 @@ class SpotlightWorker:
             matched.append(name)
 
         logger.info(f"Installed {len(self._spotlight_hooks)} Spotlight hooks on: {matched[:3]}...")
+

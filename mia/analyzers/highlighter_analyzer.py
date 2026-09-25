@@ -1,3 +1,4 @@
+"""Token Highlighter analyzer: scores prompt tokens from forward-attribution captures."""
 import os
 import glob
 from typing import Any, Callable, Dict, Optional
@@ -13,7 +14,6 @@ from mia.utils.TokenHighlighter.utils import (
 
 
 def _latest_run_id(run_id_file: str) -> str:
-    """Return the most recent non-empty run id from ``MIA_RUN_ID`` file."""
     with open(run_id_file, "r") as f:
         ids = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
     if not ids:
@@ -22,11 +22,7 @@ def _latest_run_id(run_id_file: str) -> str:
 
 
 class HighlighterAnalyzer:
-    """Score activations from capture worker; optional custom ``loss_grad_fn``.
-
-    When ``highlighter_activations.pt`` includes ``weight_bundle`` (saved by the vLLM
-    worker at capture), scoring uses pure tensor math — no ``from_pretrained``.
-    """
+    """Score activations from the capture worker; optional custom ``loss_grad_fn``."""
 
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
         self.hook_dir = hook_dir
@@ -72,9 +68,6 @@ class HighlighterAnalyzer:
             plen = seq.get("prompt_len", len(prompt_ids))
             target_ids = seq.get("target_ids") or []
             capture = {k: v for k, v in seq["capture"].items()}
-            # Modern bundles omit the large unembedding W_U and instead ship a tiny
-            # precomputed loss gradient g (dL/dh^N at generation positions) to save space/time.
-            # Feed it back through loss_grad_fn to approximate affirmation loss gradient.
             seq_loss_grad_fn = loss_grad_fn
             apply_final_norm_to_g = True
             g_mid = capture.pop("g_mid", None)
@@ -85,7 +78,6 @@ class HighlighterAnalyzer:
                         device=h_L.device, dtype=h_L.dtype
                     )
                 )
-                # g_mid is already in pre-attention (h_mid) space.
                 apply_final_norm_to_g = False
             elif g_loss is not None and seq_loss_grad_fn is None:
                 seq_loss_grad_fn = (
@@ -175,7 +167,6 @@ class HighlighterAnalyzer:
         scores: list[float],
         top_k: int,
     ) -> list[dict]:
-        """Format top-k scored tokens for analyzer output."""
         if top_k <= 0 or not scores:
             return []
         order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
@@ -187,3 +178,4 @@ class HighlighterAnalyzer:
             }
             for i in order
         ]
+

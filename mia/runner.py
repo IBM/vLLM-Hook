@@ -1,16 +1,4 @@
-"""The one place MIA knows what a vLLM model runner looks like.
-
-MIA targets vLLM 0.29's V2 model runner (`vllm.v1.worker.gpu.model_runner`) and nothing
-else. Two V2 facts drive this module:
-
-1. `InputBatch` is TRANSIENT — built and returned by `prepare_inputs`, never stored on
-   the runner. So per-step state is captured once, at the wrapper, into an immutable
-   `StepView` that is handed down explicitly. Nothing below this seam reaches into the
-   runner.
-2. `sampling_params.extra_args` — how a caller asks for capture or steering — reaches
-   the runner only inside `add_requests(scheduler_output)` and is then dropped. MIA
-   stashes it there, keyed by request id, and prunes on finish.
-"""
+"""Adapter that isolates every vLLM V2 model-runner access MIA makes."""
 from __future__ import annotations
 
 import dataclasses
@@ -26,24 +14,11 @@ _STASH_ATTR = "_mia_arg_stash"
 
 
 class UnsupportedRunnerError(MiaConfigurationError):
-    """Raised when MIA is installed against a runner it does not support.
-
-    Loud by design: the failure mode this replaces is silent — a V1 runner would
-    capture nothing and steer nothing while reporting success.
-
-    A ``MiaConfigurationError`` (hence a ``MiaRefusal``, and still a ``RuntimeError``) so the
-    defensive handler in ``graph/install.py::patch_worker_load_model`` re-raises it instead of
-    degrading to no-capture — which is what it did, silently, in graph mode. See mia/errors.py.
-    """
+    """Raised when MIA is installed against a runner it does not support."""
 
 
 def is_v2_runner(runner) -> bool:
-    """True iff `runner` is vLLM's V2 GPUModelRunner.
-
-    Discriminated by module path: V2 lives in the package `vllm.v1.worker.gpu.*`,
-    V1 in the module `vllm.v1.worker.gpu_model_runner`. Both classes are named
-    `GPUModelRunner`, so the name alone tells you nothing.
-    """
+    """True iff `runner` is vLLM's V2 GPUModelRunner."""
     return type(runner).__module__.startswith(_V2_MODULE_PREFIX)
 
 
@@ -57,7 +32,7 @@ def require_v2_runner(runner) -> None:
 
 
 def install_request_arg_stash(runner) -> dict[str, dict]:
-    """Keep `sampling_params.extra_args` alive past `add_requests`. Idempotent."""
+    """Keep `sampling_params.extra_args` alive past `add_requests`."""
     existing = getattr(runner, _STASH_ATTR, None)
     if existing is not None:
         return existing
@@ -88,11 +63,7 @@ def install_request_arg_stash(runner) -> dict[str, dict]:
 
 @dataclasses.dataclass(frozen=True)
 class StepView:
-    """Everything MIA needs about ONE step, read once, immutable thereafter.
-
-    Index `i` is a batch row throughout: `req_ids[i]` owns `num_scheduled_tokens[i]`
-    tokens starting at `query_start_loc_np[i]`.
-    """
+    """Immutable per-step snapshot of everything MIA reads from the runner."""
 
     req_ids: list[str]
     num_reqs: int
@@ -113,18 +84,7 @@ class StepView:
 
 
 def step_view(runner, input_batch, stash: Mapping[str, dict]) -> StepView:
-    """Snapshot the transient V2 `InputBatch` into a `StepView`.
-
-    Every array is sliced to `num_reqs`: V2's buffers are allocated at `max_num_reqs`
-    and the tail rows hold stale values from previous steps.
-
-    `prompt_len_np` is NOT one of `InputBatch`'s own fields (its `prompt_lens` field is
-    `None` outside R-SWA). It lives on the runner's persistent `req_states`, indexed by a
-    per-request SLOT that is a different numbering than the batch row `i` -- `input_batch
-    .idx_mapping_np[i]` is the slot for row `i` (the same indirection `model_runner.py`
-    itself uses for `prefill_len_np`/`num_computed_prefill_tokens`), so row `i`'s prompt
-    length is `runner.req_states.prompt_len.np[idx_mapping_np[i]]`.
-    """
+    """Snapshot the transient V2 `InputBatch` into a `StepView`."""
     n = int(input_batch.num_reqs)
     block_tables = getattr(getattr(runner, "block_tables", None), "input_block_tables", ())
     idx_mapping_np = input_batch.idx_mapping_np[:n]
@@ -142,3 +102,4 @@ def step_view(runner, input_batch, stash: Mapping[str, dict]) -> StepView:
         block_tables=tuple(bt[:n] for bt in block_tables),
         extra_args=stash,
     )
+

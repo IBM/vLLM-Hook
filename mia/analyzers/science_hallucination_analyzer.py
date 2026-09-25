@@ -1,3 +1,4 @@
+"""Science hallucination analyzer: classifies captured hidden states with a trained probe."""
 import json
 import os
 import torch
@@ -8,22 +9,14 @@ from mia.shm_utils import load_from_shm
 
 
 class ScienceHallucinationAnalyzer:
-
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
         self.hook_dir = hook_dir
         self._clf = None
-        # Settable by the driver: e.g.
-        #   llm.analyzer.default_clf_path = "/path/to/clf.joblib"
         self.default_clf_path: Optional[str] = None
-        # Settable by the driver e.g.
-        #   llm.analyzer.default_model_id = "meta-llama/Llama-3.1-8B-Instruct".
         self.default_model_id: Optional[str] = None
-        # Cached final-RMSNorm params, keyed by model_id.
         self._norm_cache: Dict[str, Tuple[torch.Tensor, float]] = {}
 
     def _fetch_final_norm(self, model_id: str) -> Tuple[torch.Tensor, float]:
-        """Read (weight, eps) for the model's final RMSNorm straight from the
-        HF cache snapshot. Cached per model_id."""
         if model_id in self._norm_cache:
             return self._norm_cache[model_id]
         from huggingface_hub import snapshot_download
@@ -96,3 +89,4 @@ class ScienceHallucinationAnalyzer:
         if peak_gpu_mb is not None:
             out["peak_gpu_mb"] = peak_gpu_mb
         return out
+

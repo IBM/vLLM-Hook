@@ -1,45 +1,10 @@
-"""The user-facing optimization surface for FULL CUDA-graph mode.
-
-ONE table (``PUBLIC_LEVERS``) is the whole public API. Everything else the package reads from
-the environment is INTERNAL — tuning constants (aperture depths, poll intervals, queue sizes),
-regime-specific levers that are not a default win, and diagnostics that deliberately corrupt or
-perturb. Those keep working for anyone who knows the name; they are simply not part of the
-supported surface and are not accepted here.
-
-Two ways to set a lever, in precedence order:
-
-1. **Environment variable** — always wins. Every existing ``run_*.sh`` keeps working unchanged.
-2. **Config file** — an ``"optimizations"`` block in ``model_configs/<use_case>/<model>.json``,
-   alongside the ``hidden_states`` / ``params`` / ``hookq`` / ``steering`` sections::
-
-       {
-         "model_info":     {"name": "Qwen/Qwen2-1.5B-Instruct"},
-         "hidden_states":  {"layers": [], "mode": "last_token"},
-         "optimizations":  {"artifact_dtype": "int8"}
-       }
-
-3. Unset in both -> the shipped default below.
-
-**Defaults are the proven stack.** A lever ships ON only where a GPU measurement says it is a
-gain; the rest ship OFF and stay toggleable. Nothing here is lossy or behavior-changing by
-default: captured values are byte-identical to the eager path unless you opt into
-``artifact_dtype``.
-
-**Scope.** ``load_config`` runs in the DRIVER before ``LLM(...)`` spawns the workers, so the env
-it sets is inherited by every worker process. That makes the config block an OFFLINE
-(``MiaLLM``) path: ``vllm serve`` never parses a config file, so serve callers set the env
-directly (which is the same knob).
-"""
+"""The public optimization levers (PUBLIC_LEVERS), set from env or a config file."""
 
 from __future__ import annotations
 
 import os
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-# key -> (env var, shipped default, one-line doc)
-#
-# Shipped default is what you get with the key absent AND the env unset. "on"/"off" are plain
-# booleans; "auto" means the lever decides per request; "native" means no transform.
 PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
     "batched_egress": (
         "MIA_BATCHED_EGRESS", "on",
@@ -50,10 +15,9 @@ PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
         "MIA_STEER_FUSED", "on",
         "Fuse the buffer-mode steer op into one Triton kernel. Idle decode tax 0.56 -> 0.10 "
         "ms/step (~5.4x). Falls back to the aten reference on any error. NOT byte-identical: "
-        "GPU-measured (LSF 1703642, Phi-3-mini fp16, adjust_rs) the fused kernel's projection "
-        "reduction moves the steered next-token logprobs max|d| = 2.34e-02 vs the aten path, "
-        "on a steering effect of 7.72e-01 (~3%). '=0' reproduces the eager forward-hook steer "
-        "BIT-EXACTLY (0.000e+00). Use '=0' when steering must be bit-reproducible.",
+        "the fused projection reduction moves steered next-token logprobs by up to ~2.3e-02 vs "
+        "the aten path (~3% of the steering effect). '=0' reproduces the eager forward-hook "
+        "steer bit-exactly; use it when steering must be bit-reproducible.",
     ),
     "compact_kall": (
         "MIA_QK_COMPACT_KALL", "auto",
@@ -81,7 +45,7 @@ PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
     ),
     "aperture_mmap": (
         "MIA_APERTURE_MMAP", "off",
-        "Capture-aperture durable sink. 'off' (default since 2026-08-14) writes each layer's raw file "
+        "Capture-aperture durable sink. 'off' (default) writes each layer's raw file "
         "with plain open(ab)+write(), which RELEASES the GIL; 'on' memcpys into a pre-sized "
         "MAP_SHARED mapping, which holds it for the whole copy on the drain consumer thread. Same "
         "bytes either way -- byte-identical, a scheduling choice only. Off recovered ~98% of the "
@@ -97,29 +61,19 @@ PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
         "per-step transient cannot CUDA-OOM at high batch. MIN-ONLY -- it only ever LOWERS the "
         "budget, so it is byte-identical when the derived cap >= what vLLM would use. 'auto' derives "
         "from model dims + GPU + aperture; an int pins the cap (still min'd); off/unset leaves the budget "
-        "untouched. Opt-in (default off) pending a serve/cb A/B; default-ON auto is the intended end.",
+        "untouched. Opt-in (default off).",
     ),
 }
 
 _TRUE = ("1", "true", "on", "yes")
 _FALSE = ("0", "false", "off", "no")
-# Values that mean "use the built-in default" -> leave the env unset rather than forcing a value.
 _DEFER = ("auto", "default", "native")
 
 
 def _to_env_value(key: str, value: Any) -> Optional[str]:
-    """Map a JSON config value to an env string, or None = leave unset (built-in default).
-
-    Booleans and the usual on/off spellings collapse to "1"/"0". ``artifact_dtype`` is a
-    free-form dtype name, so anything unrecognized passes through for the quant module to
-    validate -- except the off-spellings, which mean "native" (unset), not the string "0".
-    """
     if value is None:
         return None
     if key == "aperture_max_batched_tokens":
-        # Tri-state: 'auto' (or any truthy spelling) enables derivation; an int pins the cap and
-        # passes through; off-spellings leave the env UNSET (the OFF default). Handled before the
-        # generic _DEFER path, which would wrongly map 'auto' -> unset for this opt-in lever.
         if isinstance(value, bool):
             return "auto" if value else None
         s = str(value).strip().lower()
@@ -139,23 +93,14 @@ def _to_env_value(key: str, value: Any) -> Optional[str]:
         elif s in _FALSE:
             truthy = False
         else:
-            return str(value)          # e.g. artifact_dtype: "int8"
+            return str(value)
     if key == "artifact_dtype":
-        # This lever has no "0" state: off means native, i.e. the env stays unset.
         return "1" if truthy else None
     return "1" if truthy else "0"
 
 
 def apply_optimizations(config_data: Mapping[str, Any]) -> Dict[str, str]:
-    """Apply a config file's ``optimizations`` block to the environment. Returns what it set.
-
-    Precedence: an explicit env var ALWAYS wins (so a run script overrides the config file, and
-    every existing harness is unaffected). Unknown keys raise -- a typo that silently changed
-    nothing is the failure mode this table exists to prevent.
-
-    Must run BEFORE the workers are spawned; ``MiaLLM.__init__`` calls ``load_config`` before
-    ``LLM(...)`` for exactly that reason.
-    """
+    """Apply a config file's ``optimizations`` block to the environment."""
     opts = (config_data or {}).get("optimizations") or {}
     if not isinstance(opts, dict):
         raise ValueError(
@@ -172,21 +117,16 @@ def apply_optimizations(config_data: Mapping[str, Any]) -> Dict[str, str]:
         env_name = PUBLIC_LEVERS[key][0]
         env_value = _to_env_value(key, value)
         if env_value is None:
-            continue                    # 'auto'/'native' -> defer to the built-in default
+            continue
         if env_name in os.environ:
-            continue                    # explicit env wins
+            continue
         os.environ[env_name] = env_value
         applied[key] = env_value
     return applied
 
 
 def env_is_on(key: str) -> bool:
-    """Resolve a boolean public lever: the env if set, else the shipped default in the table.
-
-    Call this instead of re-spelling ``os.environ.get(NAME, "1") == "1"`` at the use site, so the
-    table above is the SINGLE source of truth for the default rather than a second copy that can
-    drift out of agreement with the code.
-    """
+    """Resolve a boolean public lever: env if set, else the shipped default."""
     env_name, default, _doc = PUBLIC_LEVERS[key]
     raw = os.environ.get(env_name)
     if raw is None:
@@ -205,3 +145,4 @@ def describe() -> str:
 
 
 __all__ = ["PUBLIC_LEVERS", "apply_optimizations", "env_is_on", "describe"]
+

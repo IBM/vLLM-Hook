@@ -1,3 +1,4 @@
+"""CoRe reranker analyzer: document relevance from captured Q/K attention."""
 import torch
 from typing import Dict, List, Tuple, Optional
 import glob
@@ -7,11 +8,6 @@ from mia._profiler import PROF
 from mia.run_utils import load_and_merge_qk_cache
 
 class CorerAnalyzer:
-
-    # Capability declaration read by MiaLLM admission. "qk" => CoRe needs raw Q/K (its
-    # two-pass calibration reshapes query-span x key and merges prefixes; it rejects
-    # pre-softmaxed scores), so auto-select must never substitute score for it. Flip to
-    # "either" only after a CoRe-from-scores rewrite + scale reconciliation.
     ACCEPTS = "qk"
 
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
@@ -23,13 +19,7 @@ class CorerAnalyzer:
         analyzer_spec: Optional[Dict] = None,
         run_ids: Optional[List[str]] = None,
     ) -> Optional[Dict]:
-        """Analyze document relevance using QK artifacts from two generate() passes.
-
-        Args:
-            analyzer_spec: dict with 'query_spec' and 'na_spec' token ranges.
-            run_ids: [doc_run_id, na_run_id] — the run IDs from the document
-                pass and the NA (not-applicable) pass respectively.
-        """
+        """Analyze document relevance using QK artifacts from two generate() passes."""
         if run_ids is None or len(run_ids) < 2:
             raise ValueError("CorerAnalyzer.analyze: pass run_ids=[doc_run_id, na_run_id].")
 
@@ -40,14 +30,11 @@ class CorerAnalyzer:
         if not isinstance(analyzer_spec['na_spec'], list):
             analyzer_spec['na_spec'] = [analyzer_spec['na_spec']]
 
-        # document cache processing
         doc_run_id = run_ids[-2]
-        # turn list of tuples to tuple of lists
         doc_span, query_start, after_instruct, query_end = tuple(map(list, zip(*analyzer_spec['query_spec'])))
         with PROF.timed("analyzer.corer.score_doc"):
             tok_scores, prefill = self.score_documents(doc_run_id, doc_span, query_start, after_instruct, query_end)
 
-        # NA cache
         na_run_id = run_ids[-1]
         _, query_start, after_instruct, query_end = tuple(map(list, zip(*analyzer_spec['na_spec'])))
         with PROF.timed("analyzer.corer.score_na"):
@@ -74,16 +61,16 @@ class CorerAnalyzer:
             sorted_results = torch.sort(doc_scores, descending=True)
             batch_scores.append(sorted_results.values.tolist())
             batch_ranking.append(sorted_results.indices.tolist())
-        
+
         del tok_score, tok_score_na, tok_scores, tok_scores_na, calibrated_score, threshold, tok_mask
         torch.cuda.empty_cache()
-        
+
         return {
             'scores': batch_scores,
             'ranking': batch_ranking,
         }
-    
-    
+
+
     def score_documents(
         self,
         run_id: str,
@@ -93,27 +80,20 @@ class CorerAnalyzer:
         query_end_tok_idx,
         past_prefill: Optional[Dict] = None
     ) -> List[torch.Tensor]:
-        
         cache = load_and_merge_qk_cache(self.hook_dir, run_id)
         config = cache["config"]
-        # Score capture is not supported by CoRe: its two-pass calibration needs the
-        # query-span x key reshape from raw Q/K (and prefix-merge), not a pre-softmaxed
-        # single-head score. Use QK capture (the default) for CoRe reranking.
         if any("scores" in e for e in cache["qk_cache"].values()):
             raise NotImplementedError(
                 "CorerAnalyzer requires QK capture (qk_capture='qk'); attention-score "
                 "capture (v0.6.0) is only consumed by AttntrackerAnalyzer.")
         bs = len(next(iter(cache["qk_cache"].values()))['q'])
 
-        # Check if k_all is already fully reconstructed (worker did prefix cache reconstruction).
-        # When prefix caching is active, k_all is much longer than q (worker prepended cached keys).
-        # When prefix caching is off, k_all and q have the same length per request.
         first_layer = list(cache["qk_cache"].keys())[0]
         k_all_full = False
         if past_prefill is not None:
             na_k = cache["qk_cache"][first_layer]['k_all'][0].shape[0]
             na_q = cache["qk_cache"][first_layer]['q'][0].shape[0]
-            k_all_full = na_k > na_q  # worker reconstructed prefix, k_all is longer than q
+            k_all_full = na_k > na_q
 
         if past_prefill is not None and not k_all_full:
             qk_cache = {}
@@ -140,7 +120,6 @@ class CorerAnalyzer:
             qk_cache = cache["qk_cache"]
         prefill_qk_cache = {}
 
-        # loop through all layers and compute attention scores
         all_layer = []
         all_key_cache = []
         all_query_cache = []
@@ -148,19 +127,16 @@ class CorerAnalyzer:
         for module_name, qk_data in qk_cache.items():
             layer_num = qk_data['layer_num']
 
-            k_all = qk_data['k_all']    # [seq_len, 1024]
+            k_all = qk_data['k_all']
 
             if past_prefill is not None and not k_all_full:
-                # Legacy path: q was merged with prefill, use relative indices
                 q_query = [qk_data['q'][i][:query_end_tok_idx[i]-query_start_tok_idx[i]+1, :] for i in range(bs)]
             else:
-                # k_all is full (either no past_prefill or worker already reconstructed prefix).
-                # q may only have new tokens — compute offset from k_all vs q lengths.
                 q_query = []
                 for i in range(bs):
                     q_len = qk_data['q'][i].shape[0]
                     k_len = k_all[i].shape[0]
-                    offset = k_len - q_len  # number of prefix-cached tokens not in q
+                    offset = k_len - q_len
                     qs = max(0, query_start_tok_idx[i] - offset)
                     qe = max(0, query_end_tok_idx[i] - offset) + 1
                     q_query.append(qk_data['q'][i][qs:qe, :])
@@ -171,38 +147,33 @@ class CorerAnalyzer:
                     'k_all': [qk_data['k_all'][i][:after_instruct[i]+1, :] for i in range(bs)],
                     'layer_num': layer_num
                 }
-            
+
             k_heads, q_heads = [], []
             for i in range(bs):
                 query_len = q_query[i].shape[0]
                 seq_len = k_all[i].shape[0]
-                
+
                 q_head = q_query[i].view(query_len, config["num_attention_heads"], config["head_dim"])
-                q_head = q_head.permute(1, 0, 2)  # [num_heads, query_len, head_dim]
+                q_head = q_head.permute(1, 0, 2)
                 q_heads.append(q_head)
 
                 k_head = k_all[i].view(seq_len, config["num_key_value_heads"], config["head_dim"])
-                k_head = k_head.permute(1, 0, 2)  # [num_kv_heads, seq_len, head_dim]
+                k_head = k_head.permute(1, 0, 2)
                 k_heads.append(k_head)
 
             all_layer.append(layer_num)
             all_query_cache.append(q_heads)
             all_key_cache.append(k_heads)
-        
-        # below follows https://github.com/linhhtran/CoRe-Reranking/blob/77da0ab2087d508c8ac0b10f6dbfb7a93ff7f189/experiments/src/reranker_calib.py#L141
-        # attention score from all heads
+
         batch_doc_results = []
         for j in range(bs):
-            if self.layer_to_heads is not None: # not tested yet
+            if self.layer_to_heads is not None:
                 attn_weights = []
                 for i in range(len(all_key_cache)):
                     attn_weights.append((self.get_attn_all(all_key_cache[i][j], all_query_cache[i][j])).mean(-2))
-                # del all_key_cache, all_query_cache
-                # torch.cuda.empty_cache()
                 attn_weights = torch.stack(attn_weights)
                 attn_weights = attn_weights.sum(0).sum(0)
-            
-            # attention score from retrieval heads
+
             else:
                 selected_key_cache = [inner[j] for inner in all_key_cache]
                 j_all_key_cache = torch.stack(selected_key_cache).squeeze(1)
@@ -215,19 +186,18 @@ class CorerAnalyzer:
             for i, span in enumerate(doc_span[j]):
                 per_doc_results[i] = attn_weights[span[0]:span[1]+1].to('cpu')
             batch_doc_results.append(per_doc_results)
-            
+
         del attn_weights, all_key_cache, all_query_cache
         torch.cuda.empty_cache()
 
         return batch_doc_results, prefill_qk_cache
-    
+
     def get_attn_all(self, key_states, query_states):
         num_heads, q_len, head_dim = query_states.size()
         num_key_value_heads = key_states.size(0)
         num_key_value_groups = num_heads // num_key_value_heads
         kv_seq_len = key_states.size(-2)
 
-        # expand key head to match query head
         key_states = key_states.unsqueeze(1).expand(num_key_value_heads, num_key_value_groups, kv_seq_len, head_dim)
         key_states = key_states.reshape(num_heads, kv_seq_len, head_dim)
 
@@ -236,7 +206,6 @@ class CorerAnalyzer:
         del key_states, query_states
         torch.cuda.empty_cache()
 
-        # apply mask
         causal_mask = torch.ones_like(attn_weights.transpose(-1,-2))
         causal_mask = torch.triu(causal_mask, diagonal=-(kv_seq_len-q_len))
         causal_mask = causal_mask.transpose(-1,-2)
@@ -256,11 +225,9 @@ class CorerAnalyzer:
         num_key_value_groups = num_heads // num_key_value_heads
         kv_seq_len = key_states.size(-2)
 
-        # expand key head to match query head
         key_states = key_states.unsqueeze(2).expand(num_layers, num_key_value_heads, num_key_value_groups, kv_seq_len, head_dim)
         key_states = key_states.reshape(num_layers, num_heads, kv_seq_len, head_dim)
 
-        # extract retrieval heads
         layer_idx_to_position = {layer: i for i, layer in enumerate(self.layer_to_heads.keys())}
         key_states = torch.cat([
             key_states[layer_idx_to_position[layer_idx], head_indices]
@@ -273,12 +240,10 @@ class CorerAnalyzer:
         ], dim=0)
         torch.cuda.empty_cache()
 
-        # compute attention
         attn_weights = torch.matmul(query_states, key_states.transpose(-2,-1)) / math.sqrt(head_dim)
         del key_states, query_states
         torch.cuda.empty_cache()
 
-        # apply mask
         causal_mask = torch.ones_like(attn_weights.transpose(-1,-2))
         causal_mask = torch.triu(causal_mask, diagonal=-(kv_seq_len-q_len))
         causal_mask = causal_mask.transpose(-1,-2)

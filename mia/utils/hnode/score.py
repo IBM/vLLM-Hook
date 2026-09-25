@@ -1,14 +1,4 @@
-"""Numpy-only scorer for a trained H-Node probe.
-
-Used by ``HNodeHallucinationAnalyzer`` at inference and standalone for evaluation.
-Keeps a hard dependency only on numpy so it loads in the vLLM worker process
-without dragging in sklearn.
-
-Method: "H-Node Attack and Defense in Large Language Models"
-        Yocam, Vaidyan, Wang, 2026 — https://arxiv.org/abs/2603.26045
-Config-building (probe training) code:
-        https://github.com/Samarpit-bhatia/hnode-probe-builder
-"""
+"""Numpy-only scorer for a trained H-Node probe."""
 from __future__ import annotations
 
 import json
@@ -71,9 +61,9 @@ def _sigmoid(z: np.ndarray) -> np.ndarray:
 
 @dataclass
 class HallucinationScore:
-    probability: float        # P(hallucinated) from probe
-    h_node_excess: float      # mean max(0, h_j - baseline_j) over H-Nodes
-    margin: float             # raw logit (signed distance from decision boundary)
+    probability: float
+    h_node_excess: float
+    margin: float
 
 
 class HNodeProbe:
@@ -81,11 +71,9 @@ class HNodeProbe:
 
     def __init__(self, artifact: ProbeArtifact):
         self.artifact = artifact
-        # Cached for speed
         self._w = artifact.weights.astype(np.float32)
         self._b = float(artifact.bias)
         self._mean = artifact.scaler_mean.astype(np.float32)
-        # Guard against zero-variance dims that StandardScaler leaves at scale=1.
         self._scale = np.where(artifact.scaler_scale == 0, 1.0, artifact.scaler_scale).astype(np.float32)
         self._h_idx = artifact.h_node_indices.astype(np.int64)
         self._h_base = artifact.h_node_baselines.astype(np.float32)
@@ -99,10 +87,7 @@ class HNodeProbe:
         return self.artifact.best_layer
 
     def score(self, activations: np.ndarray) -> List[HallucinationScore]:
-        """Score a batch. ``activations`` has shape (batch, hidden_size).
-
-        Returns one ``HallucinationScore`` per row.
-        """
+        """Score a batch."""
         h = activations.astype(np.float32, copy=False)
         if h.ndim == 1:
             h = h[None, :]
@@ -133,3 +118,4 @@ def score_activations(
     if isinstance(activations, np.ndarray):
         return probe.score(activations)
     return probe.score(np.stack([np.asarray(a) for a in activations]))
+

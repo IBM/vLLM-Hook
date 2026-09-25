@@ -1,3 +1,4 @@
+"""Hidden-states analyzer: loads captured hidden states and applies a reduction."""
 import os
 import torch
 from typing import Dict, List, Optional
@@ -8,7 +9,6 @@ from mia.shm_utils import load_from_shm
 
 
 class HiddenStatesAnalyzer:
-
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
         self.hook_dir = hook_dir
 
@@ -34,7 +34,6 @@ class HiddenStatesAnalyzer:
                 if reduce == "none":
                     result[layer_name] = tensors
                 elif reduce == "mean":
-                    # meaningful for all_tokens mode: average over sequence dim
                     result[layer_name] = [
                         t.mean(dim=0) if t.dim() > 1 else t for t in tensors
                     ]
@@ -49,3 +48,4 @@ class HiddenStatesAnalyzer:
         if peak_gpu_mb is not None:
             out["peak_gpu_mb"] = peak_gpu_mb
         return out
+

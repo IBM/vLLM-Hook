@@ -1,37 +1,4 @@
-"""Hallucination-detection analyzer (H-Node probe).
-
-Sits next to ``HiddenStatesAnalyzer`` / ``ScienceHallucinationAnalyzer`` in the
-plugin registry: consumes the last-token hidden states captured by
-``HSCaptureWorker`` and applies a pre-trained H-Node probe to produce a
-hallucination probability per prompt.
-
-Follows the post-refactor analyzer contract (same shape as
-``ScienceHallucinationAnalyzer``):
-
-    analyze(analyzer_spec=None, run_id=None, probes=None)
-
-Hidden states are sourced from one of three places:
-  - ``probes`` dict (in-memory RPC path, ``output[0].probes``)
-  - shared memory (``MIA_USE_SHM=1``)
-  - disk artifacts merged by ``load_and_merge_hs_cache`` (``run_id``)
-
-Usage (in-memory / RPC path)::
-
-    llm = MiaLLM(
-        model=...,
-        worker_name="capture_hs",
-        analyzer_name="hnode_hallucination",
-        config_file="model_configs/hnode_hallucination/<model>.infer.json",
-        ...,
-    )
-    output = llm.generate(prompts, SamplingParams(max_tokens=1))
-    result = llm.analyze(
-        probes=output[0].probes,
-        analyzer_spec={"probe_path": "cache/hnode_probe/probe.npz", "threshold": 0.5},
-    )
-    # -> {"probabilities": [...], "h_node_excess": [...], "margins": [...],
-    #     "best_layer": int, "verdicts": ["grounded"|"hallucinated", ...]}
-"""
+"""Hallucination-detection analyzer (H-Node probe)."""
 from __future__ import annotations
 
 import os
@@ -44,11 +11,8 @@ from mia.shm_utils import load_from_shm
 
 
 class HNodeHallucinationAnalyzer:
-
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
         self.hook_dir = hook_dir
-        # The probe is loaded lazily on first analyze() call. Hot-reloaded if
-        # analyzer_spec carries a different probe_path.
         self._probe = None
         self._probe_path: Optional[str] = None
 
@@ -89,7 +53,6 @@ class HNodeHallucinationAnalyzer:
             cache = load_and_merge_hs_cache(self.hook_dir, run_id)
             hs_cache = cache["hs_cache"]
 
-        # Find the module whose 1-based layer_num matches the probe's best layer.
         target_module = None
         for module_name, entry in hs_cache.items():
             if int(entry["layer_num"]) == probe.best_layer:
@@ -104,11 +67,7 @@ class HNodeHallucinationAnalyzer:
                 f"to include layer {probe.best_layer} in 'hidden_states.layers'."
             )
 
-        # unpack_hidden_states normalizes both the RPC (single stacked tensor)
-        # and disk (list of tensors) formats into a list of per-pass tensors.
         tensors: List[torch.Tensor] = unpack_hidden_states(hs_cache[target_module])
-        # last_token mode: each tensor is (hidden,). all_tokens mode: (seq, hidden)
-        # — keep last token only. Stack to (batch, hidden).
         rows = [t if t.dim() == 1 else t[-1] for t in tensors]
         batch = torch.stack(rows).float().cpu().numpy()
 
@@ -129,3 +88,4 @@ class HNodeHallucinationAnalyzer:
         if peak_gpu_mb is not None:
             out["peak_gpu_mb"] = peak_gpu_mb
         return out
+

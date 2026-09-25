@@ -1,11 +1,4 @@
-"""
-Spotlight attention steering utilities - backend-agnostic tensor operations.
-Extracted from agent-lifecycle-toolkit for reuse in MIA.
-
-**Paper**: [Venakteswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)
-
-Implementation: Q/K capture with logit-direct bias application.
-"""
+"""Spotlight attention-steering utilities: backend-agnostic tensor operations."""
 import logging
 from typing import List, Optional, Sequence, Tuple, Union
 import math
@@ -22,21 +15,7 @@ def find_span(
     emph_string: str,
     offset_mapping: Sequence[Tuple[int, int]],
 ) -> Tuple[int, int]:
-    """
-    Get start and end token indices of an emphasized text span within a prompt.
-
-    Args:
-        prompt: The full text prompt
-        emph_string: The text span to find (must be present in prompt)
-        offset_mapping: Tokenizer offset mapping (from return_offsets_mapping=True)
-
-    Returns:
-        (token_start, token_end + 1) — indices suitable for slicing token lists
-
-    Raises:
-        ValueError: if emph_string not found in prompt
-        AssertionError: if span indices could not be located
-    """
+    """Get start and end token indices of an emphasized text span within a prompt."""
     if emph_string not in prompt:
         raise ValueError(f'"{emph_string}" not found in "{prompt}"')
 
@@ -65,25 +44,13 @@ def get_span_ranges(
     emph_strings: List[str] | List[List[str]],
     offset_mappings: Sequence[Sequence[Tuple[int, int]]],
 ) -> List[List[Tuple[int, int]]]:
-    """
-    Find start and end token indices for all emphasized spans across all prompts.
-
-    Args:
-        prompts: List of input prompts
-        emph_strings: Either a flat list of spans (applied to all prompts)
-                     or a list of lists (one list per prompt)
-        offset_mappings: Tokenizer offset mappings for each prompt
-
-    Returns:
-        List of span-range lists: one list per prompt, each containing (start, end) tuples
-    """
+    """Find start and end token indices for all emphasized spans across all prompts."""
     if isinstance(prompts, str):
         prompts = [prompts]
 
     if len(emph_strings) == 0:
         emph_strings = []
     elif isinstance(emph_strings[0], str):
-        # Flat list: apply same spans to all prompts
         emph_strings = [[s] for s in emph_strings]
 
     assert len(prompts) == len(emph_strings), (
@@ -112,21 +79,9 @@ def compute_attention_scores(
     key: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """
-    Compute scaled dot-product attention scores and apply softmax.
-
-    Args:
-        query: Query tensor, shape [batch, num_heads, seq_len, head_dim]
-        key: Key tensor, shape [batch, num_heads, seq_len, head_dim]
-        scale: Scaling factor, typically 1.0 / sqrt(head_dim)
-
-    Returns:
-        Attention weights after softmax, shape [batch, num_heads, seq_len, seq_len]
-    """
-    # Compute logits: Q @ K^T * scale
+    """Compute scaled dot-product attention scores and apply softmax."""
     logits = torch.matmul(query, key.transpose(-2, -1)) * scale
 
-    # Apply softmax over the sequence dimension
     return F.softmax(logits, dim=-1, dtype=torch.float32)
 
 
@@ -134,16 +89,7 @@ def apply_attention_weights(
     attn_weights: torch.Tensor,
     value: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Apply attention weights to value states.
-
-    Args:
-        attn_weights: Attention weights, shape [batch, num_heads, seq_len, seq_len]
-        value: Value tensor, shape [batch, num_heads, seq_len, head_dim]
-
-    Returns:
-        Attention output, shape [batch, num_heads, seq_len, head_dim]
-    """
+    """Apply attention weights to value states."""
     return torch.matmul(attn_weights, value)
 
 
@@ -153,22 +99,9 @@ def reshape_attn_output(
     seq_len: int,
     hidden_size: int,
 ) -> torch.Tensor:
-    """
-    Reshape attention output from multihead to single vector.
-
-    Args:
-        output: Attention output, shape [batch, num_heads, seq_len, head_dim]
-        batch_size: Batch size
-        seq_len: Sequence length
-        hidden_size: Total hidden size (num_heads * head_dim)
-
-    Returns:
-        Reshaped output, shape [batch, seq_len, hidden_size]
-    """
-    # Transpose from [batch, heads, seq, dim] to [batch, seq, heads, dim]
+    """Reshape attention output from multihead to single vector."""
     output = output.transpose(1, 2).contiguous()
 
-    # Reshape to [batch, seq, hidden_size]
     return output.view(batch_size, seq_len, hidden_size)
 
 def compute_spotlight_bias(
@@ -176,29 +109,7 @@ def compute_spotlight_bias(
     span_ranges: List[List[Tuple[int, int]]],
     target_proportion: float,
 ) -> torch.Tensor:
-    """
-    Apply Spotlight attention biasing (matches reference implementation).
-
-    Reference: agent-lifecycle-toolkit SpotLightComponent.create_attention_bias_hook
-
-    Algorithm (per batch item):
-    1. Compute attention weights via softmax(logits)
-    2. Compute current_proportion = sum of attention on span / total
-    3. If current_proportion < target_proportion:
-       a. Convert weights to log-domain: log(weights + eps)
-       b. Add bias = log(target / current) to span positions
-       c. Re-normalize with softmax
-    4. Only increases attention toward span (never decreases)
-
-    Args:
-        logits: Raw attention logits, shape [batch, num_heads, q_len, k_len]
-        span_ranges: List of span-range lists (one per batch item)
-        target_proportion: Target proportion of attention on span (0.0 to 1.0)
-
-    Returns:
-        Modified attention weights (post-softmax), same shape as logits
-    """
-    # Compute baseline attention weights
+    """Apply Spotlight attention biasing (matches reference implementation)."""
     attn_weights = F.softmax(logits, dim=-1)
     modified_weights = attn_weights.clone()
 
@@ -206,7 +117,6 @@ def compute_spotlight_bias(
         if not ranges:
             continue
 
-        # Create union mask for emphasized token positions
         union_mask = torch.zeros(
             modified_weights.size(-1),
             device=modified_weights.device,
@@ -214,16 +124,14 @@ def compute_spotlight_bias(
         )
         for start, end in ranges:
             union_mask[start:end] = 1.0
-        union_mask = union_mask.view(1, 1, -1)  # [1, 1, k_len]
+        union_mask = union_mask.view(1, 1, -1)
 
-        # Current proportion: global across all heads and query positions
         current_proportion = (
             modified_weights[batch_idx] * union_mask
         ).sum() / modified_weights[batch_idx].sum()
 
         logger.debug(f"current={current_proportion:.4f}, target={target_proportion:.4f}, steer={current_proportion < target_proportion}")
 
-        # Only steer upward (matching reference implementation)
         if current_proportion < target_proportion:
             bias_value = torch.log(
                 torch.tensor(
@@ -234,8 +142,7 @@ def compute_spotlight_bias(
             )
             bias_mask = union_mask * bias_value
 
-            # Apply bias in log-domain of attention weights, then re-softmax
-            attn_logits = logits[batch_idx].float()  # Use original logits for bias application
+            attn_logits = logits[batch_idx].float()
             attn_logits = attn_logits + bias_mask
             modified_weights[batch_idx] = F.softmax(
                 attn_logits, dim=-1, dtype=torch.float32
@@ -251,16 +158,7 @@ def compute_spotlight_bias(
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Repeat key/value heads to match number of query heads (for grouped-query attention).
-
-    Args:
-        hidden_states: KV tensor, shape [batch, num_kv_heads, seq_len, head_dim]
-        n_rep: Number of times to repeat each KV head
-
-    Returns:
-        Repeated tensor, shape [batch, num_kv_heads * n_rep, seq_len, head_dim]
-    """
+    """Repeat key/value heads to match number of query heads (for grouped-query attention)."""
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -270,10 +168,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-# ============================================================================
-# User-facing convenience function
-# ============================================================================
-
 def generate_with_spotlight(
     llm,
     prompts: Union[str, List[str]],
@@ -282,29 +176,9 @@ def generate_with_spotlight(
     sampling_params: Optional[SamplingParams] = None,
     **kwargs
 ):
-    """
-    Generate with Spotlight attention steering toward emphasized spans.
-
-    Standalone function that works with any MiaLLM instance configured
-    with worker_name="spotlight".
-
-    Args:
-        llm: A MiaLLM instance with worker_name="spotlight"
-        prompts: Input prompt(s)
-        emph_strings: Text span(s) to emphasize:
-            - Single string: applied to all prompts
-            - List of strings: applied to all prompts
-            - List of lists: one list per prompt
-        alpha: Target attention proportion (0.0-1.0)
-        sampling_params: vLLM SamplingParams
-        **kwargs: Additional vLLM generate kwargs (max_tokens, temperature, etc.)
-
-    Returns:
-        vLLM RequestOutput objects
-    """
+    """Generate with Spotlight attention steering toward emphasized spans."""
     import copy
 
-    # Normalize inputs
     if isinstance(prompts, str):
         prompts = [prompts]
 
@@ -313,7 +187,6 @@ def generate_with_spotlight(
     elif isinstance(emph_strings[0], str):
         emph_strings = [emph_strings] * len(prompts)
 
-    # Apply chat template if available (instruct models)
     if hasattr(llm.tokenizer, 'chat_template') and llm.tokenizer.chat_template:
         templated_prompts = []
         for p in prompts:
@@ -324,7 +197,6 @@ def generate_with_spotlight(
             templated_prompts.append(templated)
         prompts = templated_prompts
 
-    # Tokenize prompts with offset mappings
     tokenized = llm.tokenizer(
         prompts,
         return_tensors="pt",
@@ -333,10 +205,8 @@ def generate_with_spotlight(
     )
     offset_mappings = tokenized.pop("offset_mapping")
 
-    # Convert text spans to token ranges
     span_ranges = get_span_ranges(prompts, emph_strings, offset_mappings)
 
-    # Build per-request SamplingParams with spotlight config in extra_args
     base_params = sampling_params or SamplingParams(**kwargs)
     sp_list = []
     for i in range(len(prompts)):
@@ -349,10 +219,6 @@ def generate_with_spotlight(
         sp.extra_args = extra
         sp_list.append(sp)
 
-    # _plugin's generate-patch gate only checks for output_hidden_states /
-    # output_qk / steer, so it never lazily installs the Spotlight forward hooks.
-    # Install them ourselves before generating -- same workaround as
-    # generate_with_highlighter (utils/TokenHighlighter/utils.py).
     engine = getattr(llm, "llm", llm)
     if not getattr(engine, "_mia_installed", False):
         install_hooks = getattr(engine, "collective_rpc", None)
@@ -366,3 +232,4 @@ def generate_with_spotlight(
         sampling_params=sp_list,
         use_hook=True,
     )
+
