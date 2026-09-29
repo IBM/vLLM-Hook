@@ -1,0 +1,16 @@
+{
+    "model_info": {
+        "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct"
+    },
+    "params": {
+        "important_heads": [
+            [
+                22,
+                12
+            ]
+        ]
+    },
+    "hookq": {
+        "hookq_mode": "last_token"
+    }
+}

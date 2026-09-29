@@ -18,6 +18,7 @@ from vllm_hook_plugins.utils.TokenHighlighter.utils import (
 )
 from vllm_hook_plugins.analyzers.highlighter_analyzer import HighlighterAnalyzer
 from vllm_hook_plugins.analyzers.hnode_hallucination_analyzer import HNodeHallucinationAnalyzer
+from vllm_hook_plugins.analyzers.attnlink_analyzer import AttnLinkAnalyzer
 
 
 def register_plugins():
@@ -30,6 +31,7 @@ def register_plugins():
     PluginRegistry.register_worker("token_highlighter",   HighlighterWorker)
 
     # Register analyzers
+    PluginRegistry.register_analyzer("attnlink",              AttnLinkAnalyzer)
     PluginRegistry.register_analyzer("attn_tracker",          AttntrackerAnalyzer)
     PluginRegistry.register_analyzer("core_reranker",         CorerAnalyzer)
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
@@ -47,6 +49,7 @@ __all__ = [
     "SpotlightWorker",
     "HighlighterWorker",
     "AttntrackerAnalyzer",
+    "AttnLinkAnalyzer",
     "CorerAnalyzer",
     "HiddenStatesAnalyzer",
     "ScienceHallucinationAnalyzer",
