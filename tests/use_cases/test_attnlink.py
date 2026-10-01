@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
 from demo_attnlink import INPUT_SEQ, evaluate_ranking, prepare_prompt
-from vllm_hook_plugins.analyzers.attnlink_analyzer import AttnLinkAnalyzer, select_columns
+from mia.analyzers.attnlink_analyzer import AttnLinkAnalyzer, select_columns
 
 
 class CharacterTokenizer:
@@ -55,7 +55,7 @@ class TestAttnLink(unittest.TestCase):
         entry["q"] = list(entry["q"].unbind(0))
         entry["k_all"] = list(entry["k_all"].unbind(0))
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
-                "VLLM_HOOK_USE_SAFETENSORS": "0", "VLLM_HOOK_ASYNC_SAVE": "0"}):
+                "MIA_USE_SAFETENSORS": "0"}):
             run = Path(folder) / "test_run"
             run.mkdir()
             torch.save(disk, run / "qk.pt")

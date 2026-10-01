@@ -326,17 +326,17 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.8,
                         help="Select the shortest prefix reaching this candidate probability mass.")
     args = parser.parse_args()
-    from vllm_hook_plugins.analyzers.attnlink_analyzer import select_columns
+    from mia.analyzers.attnlink_analyzer import select_columns
     # Validate selection settings before loading the model.
     select_columns([1.0], args.temperature, args.top_p)
     out_dir = args.out_dir or Path("cache") / ("attnlink_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f"))
     out_dir.mkdir(parents=True, exist_ok=False)
 
     from vllm import SamplingParams
-    from vllm_hook_plugins import HookLLM
+    from mia import MiaLLM
 
-    llm = HookLLM(
-        model=args.model, worker_name="probe_hook_qk", analyzer_name="attnlink",
+    llm = MiaLLM(
+        model=args.model, worker_name="capture_qk", analyzer_name="attnlink",
         config_file=str(CONFIG), hook_dir=str(out_dir / "hooks"),
         dtype="bfloat16", tensor_parallel_size=1, enforce_eager=True,
         enable_prefix_caching=False, enable_chunked_prefill=False,
@@ -356,7 +356,7 @@ def main():
             raise RuntimeError("Inference token IDs differ from span-alignment token IDs.")
         probes = getattr(outputs[0], "probes", None)
         if probes is None:
-            raise RuntimeError("QK probes are missing; check the stock Hook installation.")
+            raise RuntimeError("QK probes are missing; check the stock MIA installation.")
         spec.update(temperature=args.temperature, top_p=args.top_p)
         result = llm.analyze(analyzer_spec=spec, probes=probes)
         ap, gold = evaluate_ranking(spec["candidates"], result["ranking"], POSITIVE_COLS)
@@ -383,7 +383,7 @@ def main():
                   "execution": "eager", "prompt_tokens": len(ids), "average_precision": ap,
                   "input_sha256": hashlib.sha256(INPUT_SEQ.encode()).hexdigest(),
                   "versions": {name: importlib.metadata.version(name) for name in
-                               ("vllm", "vllm-hook-plugins", "torch", "transformers")},
+                               ("vllm", "mia", "torch", "transformers")},
                   "selection": selection, "ranking": ranking}
         (out_dir / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"\nQuestion: {question}\nModel: {MODEL} | layer 22 / head 12")
