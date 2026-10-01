@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import pickle
 from pathlib import Path
 from collections.abc import AsyncIterator, Callable
@@ -87,7 +88,6 @@ def _decompress(data: bytes) -> Any:
 
 
 def _aperture_per_request_mode() -> bool:
-    import os
     return (os.environ.get("MIA_APERTURE_PER_REQUEST") == "1"
             and os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1")
 
@@ -137,7 +137,6 @@ def _trim_probes(probes: dict, key: str, expected_len: int) -> None:
 
 def _stable_artifact_files(run_dir: str) -> list:
     import glob
-    import os
     try:
         return sorted(
             f for f in glob.glob(os.path.join(run_dir, "**", "*"), recursive=True)
@@ -152,7 +151,6 @@ _ARTIFACT_POLL_S = 0.005
 
 
 def _flushed_rank_dirs(results, run_id: str, hook_dir: str):
-    import os
     if not isinstance(results, (list, tuple)) or any(r is True for r in results):
         return None
     from mia.graph.tp_shard import parse_rank_dir, rank_dir_name
@@ -174,19 +172,17 @@ def _artifact_barrier_state(run_dir: str, rank_dirs) -> "tuple[list, bool]":
 
 
 def _log_barrier_timeout(run_id: str, rank_dirs) -> None:
-    import os
     if not rank_dirs or len(rank_dirs) < 2:
         return
     missing = [os.path.basename(d) for d in rank_dirs if not _stable_artifact_files(d)]
     if missing:
-        print(f"[hookplugin/disk] durability barrier TIMEOUT after {_ARTIFACT_WAIT_S:.0f}s for "
+        print(f"[mia/disk] durability barrier TIMEOUT after {_ARTIFACT_WAIT_S:.0f}s for "
               f"run_id {run_id!r}: {len(rank_dirs) - len(missing)}/{len(rank_dirs)} rank "
               f"artifact(s) landed, missing {missing}. The run's artifact is INCOMPLETE; the QK "
               f"loader will refuse it until every rank's shard is on disk.", flush=True)
 
 
 def _resolve_sink(extra: dict) -> str:
-    import os
     env = os.environ.get("MIA_SINK", "").lower()
     if env == "drop":
         return "drop"
@@ -199,7 +195,6 @@ def _resolve_sink(extra: dict) -> str:
 
 async def _await_disk_artifact(run_id: str, hook_dir: str, rank_dirs=None) -> bool:
     import asyncio
-    import os
     run_dir = os.path.join(hook_dir, run_id)
     prev = None
     for _ in range(max(2, int(_ARTIFACT_WAIT_S / _ARTIFACT_POLL_S))):
@@ -215,7 +210,6 @@ async def _await_disk_artifact(run_id: str, hook_dir: str, rank_dirs=None) -> bo
 
 
 def _wait_disk_artifact(run_id: str, hook_dir: str, rank_dirs=None) -> bool:
-    import os
     import time
     run_dir = os.path.join(hook_dir, run_id)
     prev = None
@@ -235,7 +229,6 @@ _APERTURE_DELIVER_POLL_S = 0.005
 
 
 def _aperture_deliver_timeout_s() -> float:
-    import os
     try:
         return max(0.1, float(os.environ.get("MIA_APERTURE_DELIVER_TIMEOUT_S", "30") or "30"))
     except (TypeError, ValueError):
@@ -259,7 +252,7 @@ async def _await_aperture_per_request(engine, request_id, hs_layers=None):
             if len(parts) >= _expected_probe_parts(parts, hs_layers):
                 return merge_probe_parts(parts, hs_layers)
         if time.monotonic() >= deadline:
-            print(f"[hookplugin/aperture] BLOCK-UNTIL-HELD TIMEOUT after {timeout:.1f}s waiting for RPC "
+            print(f"[mia/aperture] BLOCK-UNTIL-HELD TIMEOUT after {timeout:.1f}s waiting for RPC "
                   f"per-request delivery of {request_id!r} ({len(collected)} rank part(s) held); "
                   f"leaving probes unset (raise MIA_APERTURE_DELIVER_TIMEOUT_S if the off-loop "
                   f"consumer is merely slow, else it is a bug)", flush=True)
@@ -285,7 +278,7 @@ def _collect_aperture_per_request_sync(rpc, request_id, hs_layers=None):
         if deadline is None:
             deadline = time.monotonic() + _aperture_deliver_timeout_s()
         elif time.monotonic() >= deadline:
-            print(f"[hookplugin/aperture] PER-REQUEST DELIVERY INCOMPLETE for {request_id!r} after "
+            print(f"[mia/aperture] PER-REQUEST DELIVERY INCOMPLETE for {request_id!r} after "
                   f"{_aperture_deliver_timeout_s():.1f}s: {len(parts)} of "
                   f"{_expected_probe_parts(parts, hs_layers)} rank part(s) held "
                   f"(tp_rank(s) {sorted(collected)}); leaving probes unset -- the held part(s) are "
@@ -344,7 +337,7 @@ async def _await_aperture_disk_confirm(engine, request_id) -> bool:
         if staged and all(r is True for r in staged):
             return True
         if time.monotonic() >= deadline:
-            print(f"[hookplugin/aperture] DISK-CONFIRM TIMEOUT after {timeout:.1f}s waiting for offload "
+            print(f"[mia/aperture] DISK-CONFIRM TIMEOUT after {timeout:.1f}s waiting for offload "
                   f"delivery of {request_id!r}; the client dest file may be incomplete (raise "
                   f"MIA_APERTURE_DELIVER_TIMEOUT_S, or check the offload worker)", flush=True)
             return False
@@ -352,13 +345,12 @@ async def _await_aperture_disk_confirm(engine, request_id) -> bool:
 
 
 def _warn_profile_aperture_conflict() -> None:
-    import os
     if getattr(_warn_profile_aperture_conflict, "_warned", False):
         return
     if (os.environ.get("MIA_PROFILE_MODE") == "1"
             and os.environ.get("MIA_APERTURE_PER_REQUEST") == "1"):
         _warn_profile_aperture_conflict._warned = True
-        print("[hookplugin/aperture] WARNING: MIA_PROFILE_MODE=1 AND MIA_APERTURE_PER_REQUEST=1 "
+        print("[mia/aperture] WARNING: MIA_PROFILE_MODE=1 AND MIA_APERTURE_PER_REQUEST=1 "
               "are BOTH set -- this is a misconfiguration. Profile mode must pair with the "
               "shared-file / disk Component-1 drain, NOT the host-buffer per-request route (which "
               "leaks host RAM -- rows demux into an index nothing retrieves -- and misreports the "
@@ -389,7 +381,6 @@ def _note_vllm_version() -> None:
 
 
 def _worker_kind(worker_ext) -> str:
-    import os
     env_w = parse_mia_worker_env(os.environ.get("MIA_WORKER"))
     cls_kind = _kind_from_extension(worker_ext)
     if env_w is not None:
@@ -422,7 +413,6 @@ def _dtype_element_size(dt) -> int:
 
 
 def _autocap_setting():
-    import os
     from mia.graph.aperture_sizing import parse_autocap_setting
     return parse_autocap_setting(os.environ.get("MIA_APERTURE_MAX_BATCHED_TOKENS"))
 
@@ -467,7 +457,6 @@ def _hs_layers_per_rank(config, n_layers: int) -> int:
 
 
 def _derive_safe_max_batched_tokens(config, worker_kinds):
-    import os
     from vllm.platforms import current_platform
     from mia.graph.aperture_sizing import (
         resolve_aperture_bytes_auto, resolve_aperture_bytes, per_token_row_bytes,
@@ -533,7 +522,6 @@ _COMPILE_CACHE_STAMP_KEY = "mia_graph_capture"
 
 
 def _mia_source_id() -> str:
-    import os
     import subprocess
 
     cached = getattr(_mia_source_id, "_cached", None)
@@ -582,7 +570,6 @@ def _mia_source_id() -> str:
 
 def mia_graph_layout(engine_args, worker_kind: str) -> dict:
     """The MIA state that shapes the compiled graph but is invisible to vLLM's cache key."""
-    import os
 
     kind = str(worker_kind)
     tp_size = int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
@@ -704,7 +691,6 @@ def _cudagraph_mode_name(cudagraph_mode) -> str:
 
 
 def _patched_create_engine_config(self, *args, **kwargs):
-    import os
     if not self.worker_extension_cls:
         worker_type = parse_mia_worker_env(os.environ.get("MIA_WORKER")) or DEFAULT_MIA_WORKER
         self.worker_extension_cls = _WORKER_EXT_BY_KIND[worker_type]
@@ -870,7 +856,6 @@ def _emit_capture_evidence(engine, output, extra, wants_hs, wants_qk, gen_tokens
 
 
 def _maybe_storage_route(engine, prompt, extra, max_tokens) -> bool | None:
-    import os
     from mia.optimizations import env_is_on
     if not env_is_on("storage_router"):
         return None
@@ -882,7 +867,7 @@ def _maybe_storage_route(engine, prompt, extra, max_tokens) -> bool | None:
         n = getattr(_maybe_storage_route, "_dbg_n", 0)
         if n < 20:
             _maybe_storage_route._dbg_n = n + 1
-            print(f"[hookplugin/router] {msg}", flush=True)
+            print(f"[mia/router] {msg}", flush=True)
 
     wants_qk = extra.get("output_qk") is not None
     wants_hs = extra.get("output_hidden_states") is not None
@@ -937,12 +922,10 @@ def _maybe_storage_route(engine, prompt, extra, max_tokens) -> bool | None:
 
 
 def _profile_mode() -> bool:
-    import os
     return os.environ.get("MIA_PROFILE_MODE") == "1"
 
 
 def _aperture_route_thresholds(worker_kind: str = "hs") -> "tuple[int, int]":
-    import os
     from mia.run_utils import rpc_disk_crossover_kb
     derived = int(rpc_disk_crossover_kb(worker_kind) * 1024)
     t_rpc = int(os.environ.get("MIA_ROUTER_T_RPC", derived))
@@ -1070,7 +1053,7 @@ def _log_analyze_deferred(action: str) -> None:
     n = getattr(_log_analyze_deferred, "_n", 0)
     if n < 4:
         _log_analyze_deferred._n = n + 1
-        print(f"[hookplugin/aperture-router] analyze_where={action!r}: server-side CPU analyze is "
+        print(f"[mia/aperture-router] analyze_where={action!r}: server-side CPU analyze is "
               f"deferred to Task 12; delivering RAW (client analyzes client-side)", flush=True)
 
 
@@ -1166,10 +1149,9 @@ async def _patched_generate(
         _aperture_route = _decide_aperture_route(
             self, prompt, extra, getattr(effective_params, "max_tokens", 0))
         if _aperture_route is not None and _aperture_route.transport == "disk":
-            import os as _os_route
             run_id = extra.get("run_id") or request_id
             hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
-            dest = _os_route.path.join(hook_dir, str(run_id))
+            dest = os.path.join(hook_dir, str(run_id))
             with PROF.timed("rpc.route_aperture_to_disk"):
                 await self.collective_rpc("route_aperture_to_disk", args=(request_id, dest))
 
@@ -1178,16 +1160,14 @@ async def _patched_generate(
         _aperture_route_qk = _decide_aperture_route_qk(
             self, prompt, extra, getattr(effective_params, "max_tokens", 0))
         if _aperture_route_qk is not None and _aperture_route_qk.transport == "disk":
-            import os as _os_route
             run_id = extra.get("run_id") or request_id
             hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
-            dest = _os_route.path.join(hook_dir, str(run_id))
+            dest = os.path.join(hook_dir, str(run_id))
             with PROF.timed("rpc.route_aperture_to_disk"):
                 await self.collective_rpc("route_aperture_to_disk", args=(request_id, dest))
 
     if wants_qk and "qk_capture" not in extra and _engine_tp_size(self) <= 1:
-        import os as _os
-        if _os.environ.get("MIA_QK_AUTO_SELECT") == "1":
+        if os.environ.get("MIA_QK_AUTO_SELECT") == "1":
             try:
                 _dims = _qk_model_dims(self)
                 _plen = _prompt_token_len(prompt)
@@ -1203,7 +1183,7 @@ async def _patched_generate(
                     _n = getattr(_patched_generate, "_d2_log_n", 0)
                     if _n < 8:
                         _patched_generate._d2_log_n = _n + 1
-                        print(f"[hookplugin/D2] serve auto-select qk_capture={_pick} "
+                        print(f"[mia/qk-select] serve auto-select qk_capture={_pick} "
                               f"(S={_plen} mode={extra.get('hookq_mode','all_tokens')})",
                               flush=True)
             except Exception:  # noqa: BLE001
@@ -1321,11 +1301,10 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
     for _sp in params_list:
         _refuse_unsupported_tp_request(self, _sp.extra_args or {})
 
-    import os as _os
-    if (needs_hooks and _os.environ.get("MIA_STORAGE_ROUTER") == "1"
+    if (needs_hooks and os.environ.get("MIA_STORAGE_ROUTER") == "1"
             and not getattr(_patched_llm_generate, "_router_warned", False)):
         _patched_llm_generate._router_warned = True
-        print("[hookplugin] MIA_STORAGE_ROUTER is serve-only; the offline "
+        print("[mia] MIA_STORAGE_ROUTER is serve-only; the offline "
               "LLM.generate path honors each request's explicit save_to_disk.",
               flush=True)
 
@@ -1343,7 +1322,6 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
 
     if needs_hooks:
-        import os
 
         disk_by_run: dict = {}
 

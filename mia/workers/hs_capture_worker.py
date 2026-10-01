@@ -32,7 +32,7 @@ _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 def _aperture_disk_dbg(msg: str) -> None:
     if os.environ.get("MIA_APERTURE_DEBUG") == "1":
-        print(f"[hookplugin/aperture-disk] {msg}", flush=True)
+        print(f"[mia/aperture-disk] {msg}", flush=True)
 
 _CENSUS_ON = os.environ.get("MIA_CAPTURE_CENSUS") == "1"
 

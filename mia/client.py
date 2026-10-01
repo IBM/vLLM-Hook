@@ -1,8 +1,10 @@
 """MiaClient: OpenAI-compatible client for vllm serve with probe capture and analysis."""
 from __future__ import annotations
 
+import glob
 import json
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -121,7 +123,6 @@ class MiaClient:
 
 
     def _wait_artifact_dir(self, run_id, timeout_s: float = 10.0, poll_s: float = 0.05) -> bool:
-        import os, time, glob
         base = os.path.join(self._hook_dir, run_id)
         prev = None
         deadline = time.time() + timeout_s

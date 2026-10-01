@@ -206,7 +206,7 @@ def _scores_from_qk_entry(entry: dict, conf: dict, dtype: torch.dtype = torch.fl
 
 def _aperture_disk_dbg(msg: str) -> None:
     if os.environ.get("MIA_APERTURE_DEBUG") == "1":
-        print(f"[hookplugin/aperture-disk] {msg}", flush=True)
+        print(f"[mia/aperture-disk] {msg}", flush=True)
 
 
 def _worker_tp_rank(worker) -> int:

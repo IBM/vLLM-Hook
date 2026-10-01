@@ -29,16 +29,16 @@ def _run_transfer_with_retries(transfer_fn, req_id: str, src_path: str, dest: st
         attempts += 1
         try:
             if _aperture_debug():
-                print(f"[hookplugin/aperture-disk] offload START req_id={req_id!r} src={src_path!r} "
+                print(f"[mia/aperture-disk] offload START req_id={req_id!r} src={src_path!r} "
                       f"dest={dest!r} attempt={attempts}", flush=True)
             transfer_fn(src_path, dest)
             if _aperture_debug():
-                print(f"[hookplugin/aperture-disk] offload DONE  req_id={req_id!r} dest={dest!r}",
+                print(f"[mia/aperture-disk] offload DONE  req_id={req_id!r} dest={dest!r}",
                       flush=True)
             return True
         except Exception as e:  # noqa: BLE001
             if _aperture_debug():
-                print(f"[hookplugin/aperture-disk] offload ERROR req_id={req_id!r} src={src_path!r} "
+                print(f"[mia/aperture-disk] offload ERROR req_id={req_id!r} src={src_path!r} "
                       f"dest={dest!r} attempt={attempts}: {e!r}", flush=True)
             if attempts >= max_retries:
                 print(f"[offload-process] transfer FAILED for {req_id!r} after "

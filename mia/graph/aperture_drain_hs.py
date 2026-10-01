@@ -6,6 +6,7 @@ import logging
 import mmap
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -106,7 +107,6 @@ class _MmapLayerWriter:
             self._fh = None
 
 
-import re as _re
 
 
 def _aperture_debug() -> bool:
@@ -114,7 +114,7 @@ def _aperture_debug() -> bool:
 
 
 def _dbg(msg: str) -> None:
-    print(f"[hookplugin/aperture-disk] {msg}", flush=True)
+    print(f"[mia/aperture-disk] {msg}", flush=True)
 
 
 def _stamp_file_row(entries: List[LayerEntry], cursor_before: Dict[int, int],
@@ -291,7 +291,7 @@ def _match_disk_route(rid: str, route_keys) -> Optional[str]:
 
 
 def _sanitize_req_id(req_id: str) -> str:
-    s = _re.sub(r"[^A-Za-z0-9._-]", "_", str(req_id))
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", str(req_id))
     return s or "req"
 
 
