@@ -59,6 +59,7 @@ if __name__ == "__main__":
         trust_remote_code=True,
         dtype=torch.float16,
         enforce_eager=not GRAPH_MODE,
+        compilation_config={"cudagraph_mode": "FULL"} if GRAPH_MODE else None,
         enable_prefix_caching=False,
         enable_hook=True,
         tensor_parallel_size=1,
