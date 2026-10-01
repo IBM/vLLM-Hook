@@ -19,6 +19,7 @@ from mia.utils.TokenHighlighter.utils import (
 )
 from mia.analyzers.highlighter_analyzer import HighlighterAnalyzer
 from mia.analyzers.hnode_hallucination_analyzer import HNodeHallucinationAnalyzer
+from mia.analyzers.attnlink_analyzer import AttnLinkAnalyzer
 
 
 def register_plugins():
@@ -28,6 +29,7 @@ def register_plugins():
     PluginRegistry.register_worker("spotlight",     SpotlightWorker)
     PluginRegistry.register_worker("token_highlighter",   HighlighterWorker)
 
+    PluginRegistry.register_analyzer("attnlink",              AttnLinkAnalyzer)
     PluginRegistry.register_analyzer("attn_tracker",          AttntrackerAnalyzer)
     PluginRegistry.register_analyzer("core_reranker",         CorerAnalyzer)
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
@@ -45,6 +47,7 @@ __all__ = [
     "SpotlightWorker",
     "HighlighterWorker",
     "AttntrackerAnalyzer",
+    "AttnLinkAnalyzer",
     "CorerAnalyzer",
     "HiddenStatesAnalyzer",
     "ScienceHallucinationAnalyzer",
