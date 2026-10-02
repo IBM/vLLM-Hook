@@ -184,7 +184,7 @@ detokenize-then-retokenize is not an identity.
 cached prefix means the second pass captures nothing for those tokens.
 
 
-## 2. Pick a worker and analyzer
+## 3. Pick a worker and analyzer
 
 `worker_name` decides what is captured. `analyzer_name` decides what happens to it, and is
 optional — omit it if you only want the raw tensors.
@@ -206,7 +206,7 @@ optional — omit it if you only want the raw tensors.
 | `science_hallucination` | `demo_scihal.py` |
 | `token_highlighter` | `demo_token_highlighter.py` (not supported on vLLM 0.29) |
 
-## 3. Write the config
+## 4. Write the config
 
 One JSON under `model_configs/<use_case>/<model_name>.json`. Only the section matching your
 worker is read.
@@ -226,7 +226,7 @@ For steering use `"steering": {"method": "add_vector", "coefficient": 1.0, "opti
 
 Copy the closest existing file in `model_configs/` rather than writing one from scratch.
 
-## 4. Get your data back
+## 5. Get your data back
 
 Two paths. **Pick one — mixing them silently returns nothing.**
 
@@ -245,7 +245,7 @@ Under `save_to_disk=True`, `out[0].probes` is always `None`.
 For raw tensors with no analysis, use the `hidden_states` analyzer with `reduce="none"` — it
 returns what was captured, unchanged.
 
-## 5. Optional: FULL CUDA-graph mode
+## 6. Graph mode for an in-process demo
 
 The server runs under CUDA graphs by default (§1). For an **in-process** demo the env var
 still gates it, because the plugin forces eager without it:
@@ -259,7 +259,7 @@ An in-process demo must also pass `enforce_eager=False` and
 vLLM would otherwise resolve to. Without the env var the plugin forces eager regardless. See
 `demo_capture_aperture.py`.
 
-## 6. Gotchas
+## 7. Gotchas
 
 - Set the `mp.set_start_method` / env lines **before** importing `vllm`.
 - Run from the repo root — config and vector paths are relative to it.
@@ -269,12 +269,12 @@ vLLM would otherwise resolve to. Without the env var the plugin forces eager reg
 - Profiler counters need `MIA_PROFILE=1`; without it they are no-ops.
 - Performance levers: `from mia.optimizations import describe; print(describe())`.
 
-## 7. Notebooks
+## 8. Notebooks
 
 `notebooks/` has the same demos in notebook form; see [notebooks/README.md](../../notebooks/README.md)
 for the kernel setup.
 
-## 8. Running the included demos
+## 9. Running the included demos
 
 Run every demo from the repo root, e.g. `python examples/demo_hiddenstate.py`. A few need more:
 
