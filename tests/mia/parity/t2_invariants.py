@@ -429,7 +429,7 @@ _GPU_ROUTING_REL_BAND = _band("MIA_T2_GPU_ROUTING_BAND", "1e-2",
 #    neither arm reproduces itself boot-to-boot, and the cross-arm delta is the SAME
 #    magnitude as the within-arm delta -- the noise floor exceeds the signal this gate was
 #    built to measure. Bit-exact (`compare_artifacts.compare`, absolute max|d|) counts, from
-#    the raw artifacts under `/proj/dmfexp/fangyunh/mia_parity/1710884/d4b/{A1,A2,A3,B1,B2,B3}`
+#    the raw artifacts under `that job’s artifacts (A1,A2,A3,B1,B2,B3)
 #    (A = eager forward-hook, B = aperture; 33-request width-32 batch, layer0/15/31):
 #
 #      same-arm:  A1-vs-A2 24 problems max|d|=3.281e-02 | A1-vs-A3 48, 3.281e-02 |

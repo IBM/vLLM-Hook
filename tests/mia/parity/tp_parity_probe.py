@@ -287,12 +287,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
-#: Local HF hub caches known to hold the study's models (read-only). The first that has the
-#: model wins unless --hf-cache is given; none found -> the environment's own HF cache.
-KNOWN_HF_CACHES = (
-    "/proj/dmfexp/fangyunh/vLLM-Hook-offload/home_hf_cache/hub",
-    "/proj/dmfexp/fangyunh/vLLM-Hook-offload/hf_cache",
-    "/u/fangyunh/modelscale/hf_cache",
+#: Extra read-only HF hub caches to search before falling back to the environment's own.
+#: The first that has the model wins unless --hf-cache is given. Empty by default: set
+#: MIA_EXTRA_HF_CACHES to a colon-separated list of directories on a machine where the
+#: models live outside HF_HOME, rather than hard-coding one site's paths here.
+KNOWN_HF_CACHES = tuple(
+    p for p in os.environ.get("MIA_EXTRA_HF_CACHES", "").split(os.pathsep) if p
 )
 
 #: Fixed, greedy prompts. Different lengths (so no two requests are interchangeable) and

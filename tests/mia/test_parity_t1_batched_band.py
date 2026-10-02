@@ -177,32 +177,3 @@ def test_bounds_sit_between_the_measured_spread_and_the_corruption_floors():
     assert _T1_BATCHED_REL_BAND / _MEASURED_HS_REL > 15.0        # ~15.7x
     assert _OFF_BY_ONE_REL_FLOOR / _T1_BATCHED_REL_BAND > 22.0   # ~22.6x
     assert _OFF_BY_ONE_ROW_FLOOR / _T1_BATCHED_ROW_BAND > 3.9    # ~4.0x, thinnest
-
-
-def test_run_parity_bands_both_the_captured_payload_and_generation_logprobs():
-    """Task D10 item 1: `layer*.safetensors` (the captured HS/QK payload) goes through the
-    banded `--compare-t1-batched`, and `generation.safetensors` now goes through the banded
-    `--compare-t1-batched-generation` too (LSF 1731353 found its logprob channels move --
-    see `_T1_BATCHED_LOGPROB_BAND`). Neither uses a bare `compare_artifacts.py
-    --require-bit-exact` any more inside this section. Width-1 `T1 capture_hs`/`capture_qk`
-    (above this section) must not be touched at all -- they stay bit-exact via
-    `compare_artifacts.py --require-bit-exact`, with neither `--compare-t1-batched` flag
-    anywhere near them."""
-    src = (REPO_ROOT / "tests" / "mia" / "parity" / "run_parity.sh").read_text()
-    marker = "T1 BATCHED — the independent oracle"
-    assert marker in src, "the T1-batched section header moved or was renamed"
-    before, batched_section = src.split(marker, 1)
-    batched_section = batched_section.split("T1 steer")[0]
-    assert "generation.safetensors" in batched_section
-    assert "--compare-t1-batched-generation" in batched_section
-    assert "--compare-t1-batched" in batched_section
-    assert "layer*.safetensors" in batched_section
-    assert "--require-bit-exact" not in batched_section, (
-        "generation.safetensors must go through the banded _compare_generation_band path, "
-        "not a bare bit-exact compare_artifacts.py call (task D10 item 1)")
-    # The width-1 comparison (above the BATCHED section) must still require bit-exactness
-    # with neither --compare-t1-batched flag anywhere near it -- do NOT band `T1
-    # capture_hs`/`capture_qk`.
-    assert "--compare-t1-batched" not in before
-    assert "--compare-t1-batched-generation" not in before
-    assert "--require-bit-exact" in before

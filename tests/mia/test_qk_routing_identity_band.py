@@ -34,8 +34,8 @@ from tests.mia.parity.t2_invariants import (  # noqa: E402
     _compare_replay_band,
 )
 
-# Measured directly on the LSF 1710884 artifacts (`/proj/dmfexp/fangyunh/mia_parity/1710884/
-# d4b/{A1,A2,A3,B1,B2,B3}`), with `_compare_replay_band`'s own metric, over all 3 same-arm-A,
+# Measured directly on the LSF 1710884 artifacts (`that job’s artifacts (
+# A1,A2,A3,B1,B2,B3)), with `_compare_replay_band`'s own metric, over all 3 same-arm-A,
 # 3 same-arm-B and 3 matched-boot cross-arm (A1/B1, A2/B2, A3/B3) pairs on the qk_small
 # `layer*.safetensors` artifacts (q, k_full; 198 float tensors per pair):
 #   worst tensor-global relative (max|a-b|/max|a|): 1.446e-03

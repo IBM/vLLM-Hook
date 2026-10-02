@@ -3,13 +3,13 @@
 Recorded run, reproduce with:
 
 ```
-cd /u/fangyunh/vLLM-Hook
-/proj/dmfexp/fangyunh/envs/mia_v029/bin/python tests/mia/perf/host_build_bench.py
+cd <repo root>
+python tests/mia/perf/host_build_bench.py
 ```
 
 Hermetic: no GPU, no vLLM engine, plugin SHA irrelevant (pure Python/numpy/torch host
 code under `mia/graph/`, timed against a synthetic `StepView` — see `make_fake_step` in
-`host_build_bench.py`). Environment: `/proj/dmfexp/fangyunh/envs/mia_v029` (torch
+`host_build_bench.py`). Environment: the pinned vLLM 0.29 environment (torch
 2.13.0+cu130, numpy 2.3.5), 128-core login node. iters=200, repeats=5 (median of
 repeats reported — see `_timed_ms`).
 

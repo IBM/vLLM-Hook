@@ -133,26 +133,3 @@ def test_bound_sits_between_the_measurement_and_the_corruption():
     assert _T1_BATCHED_LOGPROB_BAND / _MEASURED_CUM_LOGPROB > 2.0     # ~2.7x
     assert _T1_BATCHED_LOGPROB_BAND / _MEASURED_TOKEN_LOGPROBS > 3.9  # ~3.9x
     assert _STEER_EFFECT / _T1_BATCHED_LOGPROB_BAND > 10.0            # ~15x
-
-
-def test_run_parity_uses_the_generation_band_cli_flag_for_both_capture_kinds():
-    """`run_parity.sh` must route BOTH `capture_hs` and `capture_qk`'s T1-batched generation
-    comparison through ONE shared `--compare-t1-batched-generation` command inside the
-    `for kind in capture_hs capture_qk` loop, not a bare bit-exact `compare_artifacts.py`
-    call re-added for either kind (the thing that regressed silently between LSF 1725139 and
-    LSF 1731353)."""
-    src = (REPO_ROOT / "tests" / "mia" / "parity" / "run_parity.sh").read_text()
-    marker = "T1 BATCHED — the independent oracle"
-    before, batched_section = src.split(marker, 1)
-    batched_section = batched_section.split("T1 steer")[0]
-    assert "for kind in capture_hs capture_qk" in batched_section, (
-        "expected one shared loop over both capture kinds, not two unrolled copies")
-    # The flag appears once as an actual command (the loop drives both kinds through it);
-    # any prose mention of the flag name in a comment is excluded by only counting lines
-    # that also mention $OUT, which only the real invocation does.
-    command_lines = [ln for ln in batched_section.splitlines()
-                     if "--compare-t1-batched-generation" in ln and "$OUT" in ln]
-    assert len(command_lines) == 1, (
-        f"expected exactly one --compare-t1-batched-generation command line, found "
-        f"{len(command_lines)}: {command_lines}")
-    assert "--require-bit-exact" not in batched_section

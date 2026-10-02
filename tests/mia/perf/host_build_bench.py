@@ -21,7 +21,7 @@ Ruling E-5, ``make_fake_step`` lives HERE, not in ``tests/mia/parity/capture_wor
 (that module is parity-only and must not grow a performance helper).
 
 Run:
-    /proj/dmfexp/fangyunh/envs/mia_v029/bin/python tests/mia/perf/host_build_bench.py
+    python tests/mia/perf/host_build_bench.py
 
 See ``tests/mia/perf/host_build_bench_results.md`` (committed alongside this file) for the
 last recorded run and the verdict it produced.

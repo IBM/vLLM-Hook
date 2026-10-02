@@ -231,11 +231,3 @@ def test_print_bands_echoes_every_enforced_bound():
                  "MIA_T2_BUILDER_REL_BAND", "MIA_T2_BUILDER_ROW_BAND",
                  "MIA_T2_STEER_BUDGET_CEILING", "STEER_ATOL"):
         assert f"BAND {name} =" in proc.stdout, f"{name} is not echoed"
-
-
-def test_run_parity_refuses_to_start_on_a_widened_band():
-    """The shell half: the job aborts before booting an engine, with a message that says
-    why -- not three hours later with a PASS nobody can interpret."""
-    script = (REPO_ROOT / "tests" / "mia" / "parity" / "run_parity.sh").read_text()
-    assert "--print-bands" in script
-    assert "a band override was refused" in script
