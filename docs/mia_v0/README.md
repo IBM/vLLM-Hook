@@ -1,9 +1,9 @@
-# 🪝 vLLM.hook
+# 🪝 MIA
 *A modular plugin library for vLLM.*
 
 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
-vLLM.hook is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
+MIA is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
 
 This includes dynamic analysis of:  
 - attention patterns  
@@ -50,7 +50,7 @@ Key takeaways:
 
 ## ⚠️ Known Limitations
 
-- **Runtime envelope.** vLLM-Hook requires vLLM 0.29.0 with its V2 model runner and `cudagraph_mode`
+- **Runtime envelope.** MIA requires vLLM 0.29.0 with its V2 model runner and `cudagraph_mode`
   `NONE` (`enforce_eager=True`) or `FULL`; `PIECEWISE` and `FULL_AND_PIECEWISE` are rejected at
   engine start. Spotlight and Token Highlighter are not supported on the V2 runner.
 - **Logprobs under FULL CUDA graphs.** Arming capture usually keeps generated token ids identical but can
@@ -78,7 +78,7 @@ the quickest way to exercise graph-mode capture on one machine. For the in-proce
 without CUDA graphs, upstream's `HookLLM` is unchanged and still available.
 
 Tensor parallelism (TP > 1) is supported for `capture_hs`, `capture_qk` and `steer`: each capturing
-rank writes its own `tp_rank_<r>/` directory and vLLM-Hook's loaders merge them. Pipeline parallelism is
+rank writes its own `tp_rank_<r>/` directory and MIA's loaders merge them. Pipeline parallelism is
 not supported, and Q/K `score` capture requires TP = 1.
 
 ---
@@ -96,13 +96,13 @@ cd ./vLLM-Hook
 
 ### 2. Create an environment and install
 
-vLLM-Hook is validated on **vLLM 0.29.0 with torch 2.13.0**:
+MIA is validated on **vLLM 0.29.0 with torch 2.13.0**:
 
 ```bash
 conda create -n mia_v029 python=3.12 pip
 conda activate mia_v029
 pip install vllm==0.29.0          # also installs torch 2.13.0
-pip uninstall -y torchcodec       # vLLM's audio/video decoder; vLLM-Hook does not use it
+pip uninstall -y torchcodec       # vLLM's audio/video decoder; MIA does not use it
 pip install -e . --no-deps        # the plugin itself, from the repo root
 pip install zstandard
 ```
@@ -234,6 +234,6 @@ We welcome contributions from the community!
 
 ## IBM ❤️ Open Source AI
 
-vLLM.hook has been started by IBM Research.
+MIA is built on vLLM.hook, which was started by IBM Research.
 - Built for the **vLLM** ecosystem  
 - Inspired by community efforts to make LLMs more interpretable and controllable  

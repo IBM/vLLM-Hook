@@ -1,4 +1,4 @@
-# vLLM-Hook supported configurations
+# MIA supported configurations
 
 This document enumerates the supported configs and how to invoke each from user code.
 
@@ -151,6 +151,60 @@ hook.generate(model=MODEL, messages=msgs, save_to_disk=True, run_id="run-2", max
 stats = hook.analyze(analyzer_spec={...})
 ```
 
+#### Three ways to send a prompt
+
+`generate` goes to `/v1/chat/completions`, so **the server applies the chat template** and the
+token layout is the server's. An analyzer that scores token spans cannot use it — the spans were
+computed against a different tokenization. Use the completions entry points for those:
+
+| Call | Endpoint | Template | Use it when |
+|---|---|---|---|
+| `generate(messages=[...])` | chat | server applies it | ordinary capture; you only need the text back |
+| `generate_tokens(ids)` | completions | none | an analyzer scores token spans, or you need a continuation |
+| `generate_text(prompt)` | completions | none | you templated the prompt yourself |
+
+Both completions calls take one sequence or a list of them; **a list shares one `run_id`**, the
+way a list passed to the in-process `generate` does.
+
+To check that the server prompted on the ids you meant — and to read back the ids it *generated*,
+which is what a second pass needs — ask vLLM for them:
+
+```python
+resp = hook.generate_tokens(ids, model=MODEL, max_tokens=1, save_to_disk=True,
+                            extra_body={"return_token_ids": True})
+assert list(resp.choices[0].prompt_token_ids) == list(ids)   # nothing re-tokenized
+continuation = list(resp.choices[0].token_ids)               # ids, never detokenized text
+```
+
+Rebuild a continuation from those ids, not from `choices[0].text`: detokenizing and
+re-tokenizing is not an identity, and the drift is silent.
+
+#### Per-request arguments
+
+| Argument | What it does | In-process equivalent |
+|---|---|---|
+| `save_to_disk=` | artifact to `hook_dir/<run_id>/` instead of riding back on the response | same |
+| `run_id=` | names the artifact directory; a batch shares one | same |
+| `steer=` | a steering config for this request alone | `extra_args["steer"]` |
+| `extra_xargs=` | any other per-request knob, e.g. `{"hooks_on": "both"}` | `SamplingParams.extra_args` |
+| `capture=False` | arm nothing — a plain request | `use_hook=False` |
+| `extra_body=` | vLLM's own request extensions, merged with MIA's `vllm_xargs` | — |
+
+`extra_xargs` values must be **scalars** unless the key is one the plugin JSON-decodes
+(`output_qk`, `output_hidden_states`, `steer`); a dict under any other key would reach the worker
+as a string and do nothing, so the client refuses it instead. On a collision in `extra_body`,
+MIA's own keys win — a caller cannot redirect `run_id` or `hook_dir`.
+
+`analyze(probes=...)` analyzes a payload you already hold, and `.tokenizer` gives the served
+model's tokenizer for computing spans (pass `tokenizer_for=<model id>` to the constructor).
+
+#### No prefix-cache reset over serve
+
+The in-process path calls `llm.llm_engine.reset_prefix_cache()` between captures of the same
+prompt. **vLLM 0.29 exposes no endpoint for that**, so if your run captures the same prefix twice
+— CoRer does — start the server with `--no-enable-prefix-caching`. A cached prefix means the
+second pass captures nothing for those tokens, and the run still looks like it worked.
+
 For activation steering there's no artifact to analyze, so a plain openai client suffices. Each request carries its own steer config as a JSON-encoded string under `vllm_xargs["steer"]` (vllm_xargs only allows scalar values; the plugin decodes the string back to a dict before the worker reads it). Different requests can use different configs:
 
 ```python
@@ -172,9 +226,9 @@ See [`examples/mia_v0/demo_actsteer_serve.py`](../../examples/mia_v0/demo_actste
 
 ---
 
-## You set nothing: what vLLM-Hook decides about the capture data path
+## You set nothing: what MIA decides about the capture data path
 
-vLLM-Hook picks the capture data path per request and per file, from the configuration it already has.
+MIA picks the capture data path per request and per file, from the configuration it already has.
 The defaults below are what a user gets without setting anything; each one names the measurement
 behind it and the env var that overrides it. Nothing here changes what is captured or the bytes
 that are written -- only which road they take.
@@ -204,7 +258,7 @@ and QK at almost any size, go to **disk**.
 
 **An explicit `save_to_disk` from the caller always wins.** The router fires only when the request
 carries no `save_to_disk` at all: an explicit value is a requirement (`true` = "I need the artifact
-FILE"), not a hint, and vLLM-Hook never overrides it.
+FILE"), not a hint, and MIA never overrides it.
 
 | env var | default | effect |
 |---|---|---|
@@ -223,7 +277,7 @@ retuning one MOVES the threshold -- the threshold is solved from them, never sto
 opens a raw file `O_DIRECT` only where it is legal (the row width is a multiple of the detected
 block size) **and** where it pays (the predicted write is at least **64 KiB** -- the
 low end of the band where the measurement can no longer tell the two apart; below it, at one
-writer thread, buffered wins decisively). vLLM-Hook predicts that size at install from the capture
+writer thread, buffered wins decisively). MIA predicts that size at install from the capture
 configuration alone, as an UPPER BOUND: an `all_tokens` capture writes up to a whole step of tokens
 per file and takes O_DIRECT; a `last_token` one writes at most a row per in-flight request, so it
 takes the buffered path only at low concurrency (below 8 concurrent requests at 8B, 4 at 70B).
@@ -236,6 +290,39 @@ same writer, one fd per file kept open for the request, always buffered (its 8-1
 inline on the drain thread with no writer pool, where O_DIRECT measures 1.65-1.74x slower per
 write). No setting selects this; `MIA_APERTURE_WRITE_MODE=legacy`
 reaches the old `tobytes` + open/append/close writer for an A/B.
+
+---
+
+## Sizing the capture aperture, and the GPU memory it costs
+
+The aperture is a **fixed** GPU allocation — fixed because a buffer that grows with traffic
+OOMs under load. It is taken in addition to vLLM's own KV-cache budget, so the two have to fit
+on the card together, and MIA checks that at engine start rather than letting the allocation
+fail later.
+
+| env var | default | effect |
+|---|---|---|
+| `MIA_APERTURE_GPU_BYTES` | **4 GiB** | the aperture's byte budget. **Per rank** at TP > 1, not per engine |
+| `MIA_APERTURE_MAX_BATCHED_TOKENS` | off | derive (`auto`) or pin `max_num_batched_tokens` so a heavy capture's per-step transient cannot OOM at high batch. MIN-ONLY: it never raises the budget, so it is byte-identical whenever the derived cap is the larger one |
+| `MIA_APERTURE_BACKPRESSURE_TIMEOUT_S` | `10` (s) | how long a step waits for the drain to free rows before `ApertureBackpressureError`. Capture blocks; it never silently drops rows. Raise it if a slow sink makes a heavy run trip the barrier |
+
+**The interaction to get right is `gpu_memory_utilization`.** It is vLLM's flag, not MIA's
+(`--gpu-memory-utilization` on the server), and it tells vLLM how much of the card to claim for
+weights and KV cache. The aperture comes out of what is *left*. Ask for too much of both and MIA
+refuses at engine start, naming the two numbers and what to lower:
+
+```
+aperture 4.00 GiB + gpu_memory_utilization=0.95 leaves no room (free margin 0.31 GiB):
+lower gpu_memory_utilization or MIA_APERTURE_GPU_BYTES
+```
+
+So on a crowded card, drop `--gpu-memory-utilization` (0.7 is what the demos use) or shrink the
+aperture; capturing fewer layers also lowers what a step needs. An explicit
+`MIA_APERTURE_GPU_BYTES` is always honoured — the auto path only chooses when you set nothing.
+
+At TP > 1 the budget is per rank, which is cheaper than it sounds for hidden states: a step costs
+`max_num_batched_tokens × ceil(L / tp) × hidden × 2` on each rank, so 2.5 GiB for
+Llama-3.1-70B at TP4 rather than 10 GiB.
 
 ---
 
