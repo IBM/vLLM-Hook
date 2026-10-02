@@ -82,12 +82,6 @@ detokenize-then-retokenize is not an identity.
 `--no-enable-prefix-caching`: 0.29 exposes no endpoint to reset the prefix cache, and a
 cached prefix means the second pass captures nothing for those tokens.
 
-### The three that are not server demos
-
-| Demo | Why |
-|---|---|
-| `demo_capture_aperture.py` | the local FULL-graph showcase: its determinism check needs two generations against one engine |
-| `demo_spotlight.py`, `demo_token_highlighter.py` | they do not run on 0.29 at all — MIA raises `UnsupportedRunnerError` on the V2 runner |
 
 ## 2. Pick a worker and analyzer
 
