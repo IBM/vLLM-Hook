@@ -1,22 +1,21 @@
 """Science hallucination demo: classify SciHal answers from captured hidden states.
-Runs in-process (`MiaLLM`) rather than over `vllm serve`: it prompts with exact token
-ids and checks the span alignment it depends on. The chat endpoint applies the model's
-chat template server-side, which re-tokenizes and would invalidate those spans. Serving
-it would need a pass-through chat template on the server.
+Runs over `vllm serve`. Both passes go through /v1/completions with exact token ids, and
+the second pass needs the token ids the FIRST one generated -- `return_token_ids` is how
+the server reports them, so the continuation is rebuilt from ids, never from detokenized
+text (detokenize-then-retokenize is not an identity).
 """
 import json
 import os
 import sys
 import multiprocessing as mp
-import torch
 
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("MIA_USE_SAFETENSORS", "1")
 
-from vllm import SamplingParams, TokensPrompt
-from mia import MiaLLM
+from mia import MiaClient
+from _serve import HS, require_server
 from _paths import config_path
 
 PROMPT_TEMPLATE_PREFIX = (
@@ -91,44 +90,38 @@ if __name__ == "__main__":
     model = "meta-llama/Llama-3.1-8B-Instruct"
     n_test = 9
 
-    dtype_map = {
-        'meta-llama/Llama-3.1-8B-Instruct': torch.float16
-    }
-
-    llm = MiaLLM(
-        model=model,
-        worker_name="capture_hs",
+    url = require_server(model, HS, max_model_len=8192)
+    client = MiaClient(
+        base_url=url,
         analyzer_name="science_hallucination",
         config_file=config_path(f'hidden_states/{model.split("/")[-1]}.json'),
-        download_dir=cache_dir,
         hook_dir=hook_dir,
-        gpu_memory_utilization=0.7,
-        max_model_len=8192,
-        trust_remote_code=True,
-        dtype=dtype_map[model],
-        enable_prefix_caching=True,
-        enable_hook=True,
-        tensor_parallel_size=1
+        tokenizer_for=model,
     )
 
-    tokenizer = llm.tokenizer
+    tokenizer = client.tokenizer
     train = load_scihal_split(cache_dir, "subtask1_train_batch3.json")
     few_shot_middle = build_few_shot_middle(train)
     test_cases = load_scihal_split(cache_dir, "subtask1_test.json")[:n_test]
     prompt_ids_list = [build_prompt_ids(tokenizer, few_shot_middle, q["claim"], q["reference"]) for q in test_cases]
 
-    gen_outputs = llm.generate(
-        [TokensPrompt(prompt_token_ids=ids) for ids in prompt_ids_list],
-        SamplingParams(temperature=0.0, max_tokens=1024),
-        use_hook=False,
+    # Pass 1: plain generation, nothing armed (`capture=False` == offline use_hook=False).
+    gen = client.generate_tokens(
+        prompt_ids_list, model=model, max_tokens=1024, temperature=0.0,
+        capture=False, extra_body={"return_token_ids": True},
     )
-    response_token_ids = [list(gen_output.outputs[0].token_ids) for gen_output in gen_outputs]
+    by_index = sorted(gen.choices, key=lambda c: c.index)
+    response_token_ids = [list(c.token_ids or []) for c in by_index]
+    if len(response_token_ids) != len(prompt_ids_list) or not all(response_token_ids):
+        raise RuntimeError(
+            "the server returned no generated token ids; pass return_token_ids and check "
+            "this is vLLM 0.29, where completion choices carry `token_ids`.")
 
-    capture_prompts = [
-        TokensPrompt(prompt_token_ids=list(p) + list(r[:-2]))
-        for p, r in zip(prompt_ids_list, response_token_ids)
-    ]
-    output = llm.generate(capture_prompts, SamplingParams(temperature=0.0, max_tokens=1), save_to_disk=True)
+    # Pass 2: re-prompt on prompt+response and capture the hidden states at that point.
+    capture_prompts = [list(p) + list(r[:-2])
+                       for p, r in zip(prompt_ids_list, response_token_ids)]
+    client.generate_tokens(capture_prompts, model=model, max_tokens=1, temperature=0.0,
+                           save_to_disk=True)
 
     config_file = config_path(f"hidden_states/{model.split('/')[-1]}.json")
     with open(config_file) as f:
@@ -150,7 +143,7 @@ if __name__ == "__main__":
         "clf_path": clf_path,
         "model_id": model,
     }
-    stats = llm.analyze(analyzer_spec=spec)
+    stats = client.analyze(analyzer_spec=spec)
 
     labels = stats["prediction_labels"]
     print("=" * 50)

@@ -65,17 +65,29 @@ Use a plain `openai` client and put the config in `vllm_xargs["steer"]`, JSON-en
 `client.generate(..., extra_xargs={"hooks_on": "both"})` — the serve-path equivalent of
 `SamplingParams.extra_args`.
 
-### Demos that stay in-process
+### Token-exact prompts
 
-Four do not use the server, and say why at the top of the file:
+`demo_corer.py`, `demo_attnlink.py` and `demo_scihal.py` score **token spans**, so they
+cannot let the server apply a chat template — that re-tokenizes and the spans stop meaning
+anything. They use `generate_tokens()`, which goes through `/v1/completions` with the exact
+ids, and they verify it: `return_token_ids` makes the server report the ids it actually
+prompted on, and `demo_attnlink.py` fails loudly if they differ from the ones its spans were
+aligned to.
+
+`demo_scihal.py` is the one to copy if you need a **continuation**: it rebuilds the second
+prompt from the token ids the first pass generated, never from the detokenized text, because
+detokenize-then-retokenize is not an identity.
+
+`demo_corer.py` captures the same prefix twice, so start its server with
+`--no-enable-prefix-caching`: 0.29 exposes no endpoint to reset the prefix cache, and a
+cached prefix means the second pass captures nothing for those tokens.
+
+### The three that are not server demos
 
 | Demo | Why |
 |---|---|
-| `demo_corer.py`, `demo_attnlink.py`, `demo_scihal.py` | they prompt with exact token ids and check span alignment; the chat endpoint re-templates server-side, which would invalidate the spans |
 | `demo_capture_aperture.py` | the local FULL-graph showcase: its determinism check needs two generations against one engine |
-
-`demo_spotlight.py` and `demo_token_highlighter.py` do not run on 0.29 at all — MIA raises
-`UnsupportedRunnerError` on the V2 runner.
+| `demo_spotlight.py`, `demo_token_highlighter.py` | they do not run on 0.29 at all — MIA raises `UnsupportedRunnerError` on the V2 runner |
 
 ## 2. Pick a worker and analyzer
 

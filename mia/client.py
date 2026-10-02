@@ -87,7 +87,22 @@ class MiaClient:
             else:
                 xargs[key] = value
 
-        return {"vllm_xargs": xargs} if xargs else None
+        return xargs
+
+    @staticmethod
+    def _body(xargs: Dict, extra_body: Optional[Dict]) -> Optional[Dict]:
+        """Merge MIA's `vllm_xargs` with a caller's own extra_body, without either losing.
+
+        A caller needs this for vLLM's own request extensions -- `return_token_ids` is the
+        one that matters here, since it is how a client learns the exact token ids a
+        request prompted on and generated.
+        """
+        body = dict(extra_body or {})
+        caller_xargs = body.pop("vllm_xargs", None) or {}
+        merged = {**caller_xargs, **xargs}
+        if merged:
+            body["vllm_xargs"] = merged
+        return body or None
 
     def _record(self, response, run_id: Optional[str], save_to_disk: Optional[bool]):
         try:
@@ -112,6 +127,7 @@ class MiaClient:
         extra_xargs: Optional[Dict] = None,
         steer: Optional[Dict] = None,
         capture: bool = True,
+        extra_body: Optional[Dict] = None,
         **openai_kwargs,
     ):
         """Send a chat completion with probe capture.
@@ -126,12 +142,13 @@ class MiaClient:
         that arms nothing.
         """
         run_id = run_id or str(uuid.uuid4())
-        extra_body = self._build_xargs(run_id, save_to_disk, extra_xargs, steer, capture)
+        body = self._body(
+            self._build_xargs(run_id, save_to_disk, extra_xargs, steer, capture), extra_body)
 
         PROF.incr("client.request.calls")
         with PROF.timed("client.request"):
             response = self._openai.chat.completions.create(
-                model=model, messages=messages, extra_body=extra_body, **openai_kwargs)
+                model=model, messages=messages, extra_body=body, **openai_kwargs)
 
         return self._record(response, run_id if capture else None,
                             save_to_disk if capture else False)
@@ -145,6 +162,7 @@ class MiaClient:
         extra_xargs: Optional[Dict] = None,
         steer: Optional[Dict] = None,
         capture: bool = True,
+        extra_body: Optional[Dict] = None,
         **openai_kwargs,
     ):
         """Capture against **exact token ids**, via the completions endpoint.
@@ -155,7 +173,7 @@ class MiaClient:
         the way a list passed to the offline ``generate`` does.
         """
         return self._completions(prompt_token_ids, model, save_to_disk, run_id,
-                                 extra_xargs, steer, capture, **openai_kwargs)
+                                 extra_xargs, steer, capture, extra_body, **openai_kwargs)
 
     def generate_text(
         self,
@@ -166,6 +184,7 @@ class MiaClient:
         extra_xargs: Optional[Dict] = None,
         steer: Optional[Dict] = None,
         capture: bool = True,
+        extra_body: Optional[Dict] = None,
         **openai_kwargs,
     ):
         """Capture against raw text, via the completions endpoint -- no chat template.
@@ -174,17 +193,18 @@ class MiaClient:
         list of strings, and a list shares one ``run_id``.
         """
         return self._completions(prompt, model, save_to_disk, run_id, extra_xargs, steer,
-                                 capture, **openai_kwargs)
+                                 capture, extra_body, **openai_kwargs)
 
     def _completions(self, prompt, model, save_to_disk, run_id, extra_xargs, steer,
-                     capture, **openai_kwargs):
+                     capture, extra_body=None, **openai_kwargs):
         run_id = run_id or str(uuid.uuid4())
-        extra_body = self._build_xargs(run_id, save_to_disk, extra_xargs, steer, capture)
+        body = self._body(
+            self._build_xargs(run_id, save_to_disk, extra_xargs, steer, capture), extra_body)
 
         PROF.incr("client.request.calls")
         with PROF.timed("client.request"):
             response = self._openai.completions.create(
-                model=model, prompt=prompt, extra_body=extra_body, **openai_kwargs)
+                model=model, prompt=prompt, extra_body=body, **openai_kwargs)
 
         return self._record(response, run_id if capture else None,
                             save_to_disk if capture else False)

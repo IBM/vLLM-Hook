@@ -1,13 +1,12 @@
 """CoRe reranker demo: rank documents by relevance from captured Q/K attention.
-Runs in-process (`MiaLLM`) rather than over `vllm serve`: it prompts with exact token
-ids and checks the span alignment it depends on. The chat endpoint applies the model's
-chat template server-side, which re-tokenizes and would invalidate those spans. Serving
-it would need a pass-through chat template on the server.
+Runs over `vllm serve`. The document and query spans the analyzer scores are character
+offsets turned into token offsets locally, so the prompt is tokenized here with
+`add_special_tokens=False` and sent as exact ids through /v1/completions -- no chat
+template, no added BOS, and therefore spans that still mean what they measured.
 """
 import os
 import sys
 import multiprocessing as mp
-import torch
 from typing import List
 
 mp.set_start_method("spawn", force=True)
@@ -15,8 +14,13 @@ os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("MIA_USE_SAFETENSORS", "1")
 
-from vllm import SamplingParams
-from mia import MiaLLM
+from mia import MiaClient
+from _serve import QK, require_server
+
+def _ids(tokenizer, text):
+    """Exact ids for `text`, with no special tokens -- the spans are offsets into THIS."""
+    return tokenizer(text, add_special_tokens=False).input_ids
+
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, documents: List[str]):
     retrieval_instruction = ' Here are some paragraphs:\n\n'
@@ -57,12 +61,6 @@ if __name__ == "__main__":
     hook_dir  = "/dev/shm/mia"
     model = 'mistralai/Mistral-7B-Instruct-v0.3'
 
-    dtype_map = {
-        'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
-        'ibm-granite/granite-3.1-8b-instruct': torch.float16,
-        'Qwen/Qwen2-1.5B-Instruct': torch.float
-    }
-
     config_dir = 'model_configs/core_reranker'
     config_file = f'{config_dir}/{model.split("/")[-1]}.json'
     if not os.path.isfile(config_file):
@@ -78,22 +76,17 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    llm = MiaLLM(
-        model=model,
-        worker_name="capture_qk",
+    url = require_server(model, QK)
+    client = MiaClient(
+        base_url=url,
         analyzer_name="core_reranker",
         config_file=config_file,
-        download_dir=cache_dir,
         hook_dir=hook_dir,
-        gpu_memory_utilization=0.7,
-        max_model_len=2048,
-        trust_remote_code=True,
-        dtype=dtype_map[model],
-        enforce_eager=True,
-        enable_prefix_caching=True,
-        enable_hook=True, 
-        tensor_parallel_size=1
+        tokenizer_for=model,
     )
+    # CoRer captures the same prefix twice (query, then 'N/A'), so start the server with
+    # --no-enable-prefix-caching: 0.29 exposes no endpoint to reset the cache between runs,
+    # and a cached prefix means the second pass captures nothing for those tokens.
 
     test_cases = [
         {
@@ -214,19 +207,18 @@ if __name__ == "__main__":
         query = case["query"]
         documents = case["documents"]
 
-        text, _, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
-        llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
-                     save_to_disk=True, run_id="corer-doc")
+        text, _, query_spec = apply_chat_template_and_get_ranges(client.tokenizer, model, query, documents)
+        client.generate_tokens(_ids(client.tokenizer, text), model=model, max_tokens=1,
+                               temperature=0.1, save_to_disk=True, run_id="corer-doc")
 
-        text, _, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
-        llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
-                     save_to_disk=True, run_id="corer-na")
+        text, _, na_spec = apply_chat_template_and_get_ranges(client.tokenizer, model, 'N/A', documents)
+        client.generate_tokens(_ids(client.tokenizer, text), model=model, max_tokens=1,
+                               temperature=0.1, save_to_disk=True, run_id="corer-na")
 
-        stats = llm.analyze(run_ids=["corer-doc", "corer-na"],
-                            analyzer_spec={'query_spec': query_spec, 'na_spec': na_spec})
+        stats = client.analyze(run_ids=["corer-doc", "corer-na"],
+                               analyzer_spec={'query_spec': query_spec, 'na_spec': na_spec})
         print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
 
-        llm.llm_engine.reset_prefix_cache()
 
 
     print("=" * 50)
@@ -239,20 +231,21 @@ if __name__ == "__main__":
         query = case["query"]
         documents = case["documents"]
 
-        text_query, _, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
-        text_na, _, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
+        text_query, _, query_spec = apply_chat_template_and_get_ranges(client.tokenizer, model, query, documents)
+        text_na, _, na_spec = apply_chat_template_and_get_ranges(client.tokenizer, model, 'N/A', documents)
 
         text_querys.append(text_query)
         query_specs.append(query_spec)        
         text_nas.append(text_na)
         na_specs.append(na_spec)
 
-    llm.generate(text_querys, SamplingParams(temperature=0.1, max_tokens=1),
-                 save_to_disk=True, run_id="corer-batch-doc")
-    llm.generate(text_nas, SamplingParams(temperature=0.1, max_tokens=1),
-                 save_to_disk=True, run_id="corer-batch-na")
+    client.generate_tokens([_ids(client.tokenizer, t) for t in text_querys], model=model,
+                           max_tokens=1, temperature=0.1, save_to_disk=True,
+                           run_id="corer-batch-doc")
+    client.generate_tokens([_ids(client.tokenizer, t) for t in text_nas], model=model,
+                           max_tokens=1, temperature=0.1, save_to_disk=True,
+                           run_id="corer-batch-na")
 
-    stats = llm.analyze(run_ids=["corer-batch-doc", "corer-batch-na"],
-                        analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
+    stats = client.analyze(run_ids=["corer-batch-doc", "corer-batch-na"],
+                           analyzer_spec={'query_spec': query_specs, 'na_spec': na_specs})
     print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
-    llm.llm_engine.reset_prefix_cache()

@@ -134,3 +134,21 @@ def test_analyze_accepts_probes_without_any_request(client):
 def test_tokenizer_without_a_model_id_says_what_to_do(client):
     with pytest.raises(RuntimeError, match="tokenizer_for"):
         client.tokenizer
+
+
+def test_caller_extra_body_survives_alongside_mia_xargs(client):
+    """`return_token_ids` is how a caller learns the exact ids; it must not be swallowed."""
+    client.generate_tokens([1, 2], model=MODEL, run_id="r",
+                           extra_body={"return_token_ids": True})
+    body = client._openai.last["extra_body"]
+    assert body["return_token_ids"] is True
+    assert body["vllm_xargs"]["run_id"] == "r"
+
+
+def test_mia_xargs_win_over_a_caller_key_of_the_same_name(client):
+    """MIA owns run_id/hook_dir; a caller cannot quietly redirect where artifacts land."""
+    client.generate_tokens([1], model=MODEL, run_id="mine",
+                           extra_body={"vllm_xargs": {"run_id": "theirs", "other": 1}})
+    xargs = client._openai.last_xargs()
+    assert xargs["run_id"] == "mine"
+    assert xargs["other"] == 1
