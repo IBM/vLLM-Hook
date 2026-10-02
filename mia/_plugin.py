@@ -172,7 +172,10 @@ def _artifact_barrier_state(run_dir: str, rank_dirs) -> "tuple[list, bool]":
 
 
 def _log_barrier_timeout(run_id: str, rank_dirs) -> None:
-    if not rank_dirs or len(rank_dirs) < 2:
+    if not rank_dirs:
+        print(f"[mia/disk] durability barrier TIMEOUT after {_ARTIFACT_WAIT_S:.0f}s for "
+              f"run_id {run_id!r}: no artifact landed. A loader will raise FileNotFoundError "
+              f"for this run_id -- the write did not finish, the run_id is not wrong.", flush=True)
         return
     missing = [os.path.basename(d) for d in rank_dirs if not _stable_artifact_files(d)]
     if missing:
@@ -1369,8 +1372,10 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
             for run_id, req_list in disk_by_run.items():
                 _, hook_dir = req_list[0]
                 with PROF.timed("disk.await_artifact"):
-                    _wait_disk_artifact(run_id, hook_dir, _flushed_rank_dirs(
+                    landed = _wait_disk_artifact(run_id, hook_dir, _flushed_rank_dirs(
                         flushed_by_run.get(run_id), run_id, hook_dir))
+                if not landed:
+                    PROF.incr("disk.await_artifact.timeout")
 
     return outputs
 

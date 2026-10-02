@@ -33,6 +33,8 @@ _RPC_SLOPE_MS_PER_KB = {"qk": 0.157, "hs": 0.03}
 _DISK_HANDOFF_MS = 20.0
 _DISK_SLOPE_MS_PER_KB = {"qk": 0.0078, "hs": 0.0022}
 
+_ARTIFACT_WAIT_S = float(os.environ.get("MIA_ARTIFACT_WAIT_S", "10") or 10)
+
 
 DEFAULT_GEN_LEN = 256
 
@@ -338,12 +340,14 @@ def load_and_merge_hs_cache(hook_dir: str, run_id: str) -> Dict[str, Any]:
     """Load all hidden-state artifacts for run_id and merge across TP ranks."""
     import torch
 
-    if os.environ.get("MIA_USE_SAFETENSORS", "0") == "1":
-        st_paths = _artifact_glob(hook_dir, run_id, "hidden_states.safetensors")
+    safetensors = os.environ.get("MIA_USE_SAFETENSORS", "0") == "1"
+    if safetensors:
+        st_paths = _artifact_glob(hook_dir, run_id, "hidden_states.safetensors", timeout=_ARTIFACT_WAIT_S)
         if st_paths:
             return _load_and_merge_hs_safetensors(hook_dir, run_id, st_paths)
 
-    paths = _artifact_glob(hook_dir, run_id, "hidden_states.pt")
+    paths = _artifact_glob(hook_dir, run_id, "hidden_states.pt",
+                           timeout=0.0 if safetensors else _ARTIFACT_WAIT_S)
     if not paths:
         raise FileNotFoundError(
             f"No hidden-state artifacts found for run_id={run_id} under {hook_dir}"
@@ -431,12 +435,14 @@ def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     """Load all QK shards for run_id and merge them into a single cache."""
     import torch
 
-    if os.environ.get("MIA_USE_SAFETENSORS", "0") == "1":
-        st_paths = _artifact_glob(hook_dir, run_id, "qk.safetensors")
+    safetensors = os.environ.get("MIA_USE_SAFETENSORS", "0") == "1"
+    if safetensors:
+        st_paths = _artifact_glob(hook_dir, run_id, "qk.safetensors", timeout=_ARTIFACT_WAIT_S)
         if st_paths:
             return _load_and_merge_qk_safetensors(hook_dir, run_id, st_paths)
 
-    paths = _artifact_glob(hook_dir, run_id, "qk.pt")
+    paths = _artifact_glob(hook_dir, run_id, "qk.pt",
+                           timeout=0.0 if safetensors else _ARTIFACT_WAIT_S)
     if not paths:
         raise FileNotFoundError(
             f"No Q/K cache artifacts found for run_id={run_id} under {hook_dir}"
