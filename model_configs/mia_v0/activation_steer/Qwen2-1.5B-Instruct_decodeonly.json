@@ -1,0 +1,16 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "qwen2-1.5b-attn-add_vector-decodeonly",
+        "model_id": "Qwen/Qwen2-1.5B-Instruct",
+        "note": "phase=decode: inert during prefill. Used as the NEGATIVE CONTROL leg — under a prefill-only harness (max_tokens=1) this must leave the output bit-identical to the unsteered base."
+    },
+    "steering": {
+        "method": "add_vector",
+        "coefficient": 1.0,
+        "optimal_layer": 14,
+        "vector_path": "steering_vectors/mia_v0/qwen2_dummy.pt",
+        "phase": "decode",
+        "positions": "all_tokens"
+    }
+}

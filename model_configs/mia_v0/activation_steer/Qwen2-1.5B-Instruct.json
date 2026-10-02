@@ -1,0 +1,15 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "qwen2-1.5b-attn",
+        "model_id": "Qwen/Qwen2-1.5B-Instruct",
+        "note": "Profiling-only steering config for Qwen2-1.5B. The vector at vector_path is a fixed random fp16 tensor (seed 0) — it does NOT correspond to any specific behavioural direction. Used solely to measure the cost of applied steering (matmul + add) in the profiling tool's R5 row. Not suitable for actual model-steering experiments."
+    },
+    "steering": {
+        "method": "add_vector",
+        "coefficient": 1.0,
+        "optimal_layer": 14,
+        "vector_path": "steering_vectors/mia_v0/qwen2_dummy.pt",
+        "apply_at_all_positions": true
+    }
+}

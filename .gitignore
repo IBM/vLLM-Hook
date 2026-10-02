@@ -1,0 +1,24 @@
+# Cache and runtime artifacts
+cache/
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+.DS_Store
+
+# debug output
+output*.txt
+
+# random test configs
+model_configs/**/*.RANDOM_TEST.json
+
+# capture-aperture dumps (MIA_APERTURE_DIR defaults to these RELATIVE paths)
+hs_aperture_dump/
+qk_aperture_dump/
+
+# Local-only, never pushed: agent instructions and planning specs
+CLAUDE.md
+.claude/
+docs/superpowers/
+.superpowers/
+
+ignore/

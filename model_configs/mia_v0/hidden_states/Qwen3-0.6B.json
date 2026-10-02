@@ -1,0 +1,4 @@
+{
+  "model_info": { "name": "Qwen/Qwen3-0.6B" },
+  "hidden_states": { "layers": [1, 2, 3, 4], "mode": "last_token" }
+}
