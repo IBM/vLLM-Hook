@@ -1,7 +1,5 @@
 # Spotlight: Attention Steering for Instruction Following
 
-> **Not supported on vLLM 0.29** (the worker raises `UnsupportedRunnerError`).
-
 **Paper**: [Venkateswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)  
 **Reference implementation**: [agent-lifecycle-toolkit SpotLightComponent](https://github.com/AgentToolkit/agent-lifecycle-toolkit/blob/main/altk/pre_llm/spotlight/spotlight.py)
 
@@ -9,7 +7,7 @@ Spotlight is an inference-time attention steering mechanism. It biases how a mod
 
 ## Architecture Overview
 
-Spotlight was implemented as a worker + utility function following the existing `QKCaptureWorker` + `MiaLLM` pattern as the primary reference.
+Spotlight was implemented as a worker + utility function following the existing `ProbeHookQKWorker` + `HookLLM` pattern as the primary reference.
 
 ### Key files
 
@@ -68,15 +66,15 @@ The reference hooks on HuggingFace's `self_attn` module with `output_attentions=
 
 ### Cross-process parameter passing
 
-vLLM V1 spawns worker processes via `multiprocessing.spawn`. The main process and worker share no memory. Following the pattern established by `QKCaptureWorker` (which uses `EXTRACT.flag` and `RUN_ID.txt` files), Spotlight passes parameters via the filesystem:
+vLLM V1 spawns worker processes via `multiprocessing.spawn`. The main process and worker share no memory. Following the pattern established by `ProbeHookQKWorker` (which uses `EXTRACT.flag` and `RUN_ID.txt` files), Spotlight passes parameters via the filesystem:
 
-- **Main process** (`generate_with_spotlight()`): writes `spotlight_params.json` to `MIA_DIR`
+- **Main process** (`generate_with_spotlight()`): writes `spotlight_params.json` to `VLLM_HOOK_DIR`
 - **Worker process** (`SpotlightWorker`): reads the file when the hook fires
 - **Flag file** (`EXTRACT.flag`): controls whether hooks are active
 
-### Reference: QKCaptureWorker
+### Reference: ProbeHookQKWorker
 
-The Spotlight worker was built using `QKCaptureWorker` as the architectural reference for:
+The Spotlight worker was built using `ProbeHookQKWorker` as the architectural reference for:
 
 - Hook registration pattern: `register_forward_hook` on `.attn` modules matched by regex
 - Metadata access: `get_forward_context().attn_metadata[layer_name].seq_lens`
@@ -86,12 +84,12 @@ The Spotlight worker was built using `QKCaptureWorker` as the architectural refe
 ## Quick Start
 
 ```python
-from mia import MiaLLM, generate_with_spotlight, register_plugins
+from vllm_hook_plugins import HookLLM, generate_with_spotlight, register_plugins
 register_plugins()
 
-llm = MiaLLM(
+llm = HookLLM(
     model="Qwen/Qwen2-1.5B-Instruct",
-    worker_name="spotlight",
+    worker_name="probe_spotlight",
     enforce_eager=True,           # Required — disables fused attention
     enable_chunked_prefill=False, # Required — Spotlight needs full prefill
 )

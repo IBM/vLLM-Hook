@@ -10,10 +10,6 @@ from pathlib import Path
 os.environ.setdefault("VLLM_USE_V1", "1")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
-from vllm import SamplingParams
-from mia import MiaLLM
-from mia.analyzers.attnlink_analyzer import select_columns
-
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 CONFIG = ROOT / "model_configs/attnlink/Qwen2.5-Coder-7B-Instruct.json"
@@ -239,22 +235,24 @@ account@trans
 
 """
 
-POSITIVE_COLS = ["client.client_id", "client.gender", "client.district_id",
-                 "district.district_id", "district.A2"]
-SOURCE = {
-    "conversion": "Unchanged input_seq, positive_cols, positive_tables and SQL from the "
-                  "AttnLink artifact; includes schema descriptions, copying instructions "
-                  "and column@table candidates.",
-    "dataset": "BIRD development split",
-    "dataset_sha256": "b3a3631495508a90eead7c0caaf92a63466a37ebeefa99ab8aa4b4a5a5009b1e",
-    "derived_from": "https://github.com/Songjw133/AttnLink",
-    "index": 128,
-    "license": "CC-BY-SA-4.0",
-    "url": "https://bird-bench.github.io/",
-}
+POSITIVE_COLS = ['client.client_id',
+ 'client.gender',
+ 'client.district_id',
+ 'district.district_id',
+ 'district.A2']
+SOURCE = {'conversion': 'Unchanged input_seq, positive_cols, positive_tables and SQL from the '
+               'AttnLink artifact; includes schema descriptions, copying instructions '
+               'and column@table candidates.',
+ 'dataset': 'BIRD development split',
+ 'dataset_sha256': 'b3a3631495508a90eead7c0caaf92a63466a37ebeefa99ab8aa4b4a5a5009b1e',
+ 'derived_from': 'https://github.com/Songjw133/AttnLink',
+ 'index': 128,
+ 'license': 'CC-BY-SA-4.0',
+ 'url': 'https://bird-bench.github.io/'}
 
 
-def prepare_prompt(tokenizer, input_seq: str) -> tuple:
+
+def prepare_prompt(tokenizer, input_seq):
     """Map identifiers in the final candidate block to full-prompt token spans."""
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": input_seq}], tokenize=False,
@@ -288,19 +286,19 @@ def prepare_prompt(tokenizer, input_seq: str) -> tuple:
                  "prompt_length": len(ids)}
 
 
-def column_ref(candidate: str) -> str:
+def column_ref(candidate):
     column, separator, table = candidate.rpartition("@")
     if not separator or not column or not table:
         raise ValueError(f"Invalid column@table identifier: {candidate!r}")
     return f"{table}.{column}".casefold()
 
 
-def gold_ref(value: str) -> str:
+def gold_ref(value):
     table, column = value.split(".", 1)
     return ".".join(part.strip().strip('`"[]').casefold() for part in (table, column))
 
 
-def evaluate_ranking(candidates: list, ranking: list, positive_cols: list) -> tuple:
+def evaluate_ranking(candidates, ranking, positive_cols):
     """Average precision over the complete ranking, with input-order tie breaks."""
     refs = [column_ref(c) for c in candidates]
     gold = {gold_ref(c) for c in positive_cols}
@@ -318,7 +316,7 @@ def evaluate_ranking(candidates: list, ranking: list, positive_cols: list) -> tu
     return total / len(gold), [ref in gold for ref in refs]
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL, help="Model ID or local path to the same model.")
     parser.add_argument("--out-dir", type=Path, default=None, help="New directory for this run.")
@@ -328,12 +326,17 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.8,
                         help="Select the shortest prefix reaching this candidate probability mass.")
     args = parser.parse_args()
+    from vllm_hook_plugins.analyzers.attnlink_analyzer import select_columns
+    # Validate selection settings before loading the model.
     select_columns([1.0], args.temperature, args.top_p)
     out_dir = args.out_dir or Path("cache") / ("attnlink_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f"))
     out_dir.mkdir(parents=True, exist_ok=False)
 
-    llm = MiaLLM(
-        model=args.model, worker_name="capture_qk", analyzer_name="attnlink",
+    from vllm import SamplingParams
+    from vllm_hook_plugins import HookLLM
+
+    llm = HookLLM(
+        model=args.model, worker_name="probe_hook_qk", analyzer_name="attnlink",
         config_file=str(CONFIG), hook_dir=str(out_dir / "hooks"),
         dtype="bfloat16", tensor_parallel_size=1, enforce_eager=True,
         enable_prefix_caching=False, enable_chunked_prefill=False,
@@ -353,7 +356,7 @@ def main() -> None:
             raise RuntimeError("Inference token IDs differ from span-alignment token IDs.")
         probes = getattr(outputs[0], "probes", None)
         if probes is None:
-            raise RuntimeError("QK probes are missing; check the stock MIA installation.")
+            raise RuntimeError("QK probes are missing; check the stock Hook installation.")
         spec.update(temperature=args.temperature, top_p=args.top_p)
         result = llm.analyze(analyzer_spec=spec, probes=probes)
         ap, gold = evaluate_ranking(spec["candidates"], result["ranking"], POSITIVE_COLS)
@@ -380,7 +383,7 @@ def main() -> None:
                   "execution": "eager", "prompt_tokens": len(ids), "average_precision": ap,
                   "input_sha256": hashlib.sha256(INPUT_SEQ.encode()).hexdigest(),
                   "versions": {name: importlib.metadata.version(name) for name in
-                               ("vllm", "mia", "torch", "transformers")},
+                               ("vllm", "vllm-hook-plugins", "torch", "transformers")},
                   "selection": selection, "ranking": ranking}
         (out_dir / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"\nQuestion: {question}\nModel: {MODEL} | layer 22 / head 12")

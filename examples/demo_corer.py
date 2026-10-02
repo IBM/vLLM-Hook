@@ -1,6 +1,4 @@
-"""CoRe reranker demo: rank documents by relevance from captured Q/K attention."""
 import os
-import sys
 import multiprocessing as mp
 import torch
 from typing import List
@@ -8,15 +6,17 @@ from typing import List
 mp.set_start_method("spawn", force=True)
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ.setdefault("MIA_USE_SAFETENSORS", "1")
+os.environ.setdefault("VLLM_HOOK_USE_SAFETENSORS", "1")
+os.environ.setdefault("VLLM_HOOK_ASYNC_SAVE", "1")
 
 from vllm import SamplingParams
-from mia import MiaLLM
+from vllm_hook_plugins import HookLLM
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, documents: List[str]):
     retrieval_instruction = ' Here are some paragraphs:\n\n'
     retrieval_instruction_late = 'Please find information that are relevant to the following query in the paragraphs above.\n\nQuery: '
 
+    # Build user content incrementally, tracking character positions for each doc/query
     content = retrieval_instruction
     doc_char_spans = []
     for i, doc in enumerate(documents):
@@ -35,6 +35,7 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
     messages = [{"role": "user", "content": content}]
     full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
+    # Find where the user content starts in the full text, then map char offsets to token indices
     content_start = full_text.index(content)
 
     def char_to_tok(char_pos):
@@ -45,39 +46,26 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
     after_retrieval_instruction_late = char_to_tok(after_instruct_char)
     query_end_idx = char_to_tok(query_end_char)
 
+    # Return full_text for offline (HookLLM) use and messages for serve (HookClient) use
     return full_text, messages, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
 
 if __name__ == "__main__":
-    cache_dir = "./cache/"
-    hook_dir  = "/dev/shm/mia"
-    model = 'mistralai/Mistral-7B-Instruct-v0.3'
 
+    cache_dir = "./cache/"
+    hook_dir  = "/dev/shm/vllm_hook" # None # 
+    model = 'ibm-granite/granite-3.1-8b-instruct'  # 'mistralai/Mistral-7B-Instruct-v0.3' # 'Qwen/Qwen2-1.5B-Instruct' #
+    
     dtype_map = {
         'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
         'ibm-granite/granite-3.1-8b-instruct': torch.float16,
         'Qwen/Qwen2-1.5B-Instruct': torch.float
     }
-
-    config_dir = 'model_configs/core_reranker'
-    config_file = f'{config_dir}/{model.split("/")[-1]}.json'
-    if not os.path.isfile(config_file):
-        available = sorted(os.listdir(config_dir)) if os.path.isdir(config_dir) else []
-        print(
-            f"[demo_corer] No core_reranker config for model '{model}'.\n"
-            f"  Expected: {config_file}\n"
-            f"  Available configs in {config_dir}/:\n"
-            + "".join(f"    - {name}\n" for name in available)
-            + "  Pick a `model` above with a matching config, or add one for this "
-              "model (do not guess important_heads/layer indices -- they must be "
-              "derived for the core_reranker task specifically)."
-        )
-        sys.exit(1)
-
-    llm = MiaLLM(
+    
+    llm = HookLLM(
         model=model,
-        worker_name="capture_qk",
+        worker_name="probe_hook_qk",
         analyzer_name="core_reranker",
-        config_file=config_file,
+        config_file=f'model_configs/core_reranker/{model.split("/")[-1]}.json',
         download_dir=cache_dir,
         hook_dir=hook_dir,
         gpu_memory_utilization=0.7,
@@ -87,9 +75,9 @@ if __name__ == "__main__":
         enforce_eager=True,
         enable_prefix_caching=True,
         enable_hook=True, 
-        tensor_parallel_size=1
+        tensor_parallel_size=1  # the number of gpus
     )
-
+        
     test_cases = [
         {
             "query": "Which magazine was started first Arthur's Magazine or First for Women?",
@@ -203,12 +191,13 @@ if __name__ == "__main__":
             ]
         }
     ]
-
+        
     for case in test_cases:
         print("=" * 50)
         query = case["query"]
         documents = case["documents"]
-
+        
+        # Apply chat template and get ranges
         text, _, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
         llm.generate(text, SamplingParams(temperature=0.1, max_tokens=1),
                      save_to_disk=True, run_id="corer-doc")
@@ -222,8 +211,12 @@ if __name__ == "__main__":
         print(f"Sorted document IDs and scores by CoRe-Reranking: {stats['ranking']}: {stats['scores']}")
 
         llm.llm_engine.reset_prefix_cache()
+        # # Runtime comparison with vllm without hooks
+        # llm.generate(text, temperature=0.1, max_tokens=1, use_hook=False)
+        # llm.llm_engine.reset_prefix_cache()
 
 
+    ### batch processing, beta mode, not fully tested
     print("=" * 50)
     print("Batch processing examples...")
     text_querys = []
@@ -233,7 +226,8 @@ if __name__ == "__main__":
     for case in test_cases:
         query = case["query"]
         documents = case["documents"]
-
+        
+        # Apply chat template and get ranges
         text_query, _, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, query, documents)
         text_na, _, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model, 'N/A', documents)
 
@@ -241,7 +235,7 @@ if __name__ == "__main__":
         query_specs.append(query_spec)        
         text_nas.append(text_na)
         na_specs.append(na_spec)
-
+    
     llm.generate(text_querys, SamplingParams(temperature=0.1, max_tokens=1),
                  save_to_disk=True, run_id="corer-batch-doc")
     llm.generate(text_nas, SamplingParams(temperature=0.1, max_tokens=1),

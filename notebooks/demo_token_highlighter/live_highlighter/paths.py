@@ -1,13 +1,13 @@
 """Path resolution for standalone installs and in-repo development.
 
-In the MIA repo the ``live_highlighter`` package lives at
+In the vLLM-Hook repo the ``live_highlighter`` package lives at
 ``notebooks/demo_token_highlighter/live_highlighter/``.
 
 Precedence for **writes** (``download_dir``, hook artifacts under ``_v1_qk_peeks``):
 
 1. ``cache_dir`` argument to :func:`resolve_runtime_paths`
 2. ``LIVE_HIGHLIGHTER_CACHE`` environment variable
-3. ``{repo_root}/cache`` when the MIA repo is detected
+3. ``{repo_root}/cache`` when the vLLM-Hook repo is detected
 4. ``~/.cache/live_highlighter`` (or ``$XDG_CACHE_HOME/live_highlighter``)
 
 **Model snapshot lookup** scans the write cache, repo cache, and common Hugging Face hub
@@ -45,7 +45,7 @@ class RuntimePaths:
     return configure_hf_cache(self.cache_dir)
 
   def hook_llm_kwargs(self, **overrides) -> dict:
-    """Keyword args for :class:`mia.MiaLLM` (override any field)."""
+    """Keyword args for :class:`vllm_hook_plugins.HookLLM` (override any field)."""
     base = {
       "model": self.model_path,
       "config_file": str(self.config_path),
@@ -75,10 +75,10 @@ class RuntimePaths:
 
 
 def find_repo_root(cwd: Path | str | None = None) -> Path | None:
-  """Return MIA repo root if ``mia`` and ``model_configs`` exist."""
+  """Return vLLM-Hook repo root if ``vllm_hook_plugins`` and ``model_configs`` exist."""
   start = Path(cwd or Path.cwd()).resolve()
   for root in (start, *start.parents):
-    if (root / "mia").is_dir() and (root / "model_configs").is_dir():
+    if (root / "vllm_hook_plugins").is_dir() and (root / "model_configs").is_dir():
       return root
   return None
 
@@ -206,7 +206,7 @@ def _resolve_config_path(
 
   raise FileNotFoundError(
     f"No highlighter config for {model_hub}. "
-    f"Set {ENV_CONFIG} or run from the MIA repo "
+    f"Set {ENV_CONFIG} or run from the vLLM-Hook repo "
     f"(expected model_configs/token_highlighter/{short}.json)."
   )
 
@@ -218,7 +218,7 @@ def resolve_runtime_paths(
   config_path: Path | str | None = None,
   cwd: Path | None = None,
 ) -> RuntimePaths:
-  """Resolve cache, config, and model snapshot paths for MiaLLM + visualizer."""
+  """Resolve cache, config, and model snapshot paths for HookLLM + visualizer."""
   repo_root = find_repo_root(cwd)
   write_cache = _resolve_cache_dir(explicit=cache_dir, repo_root=repo_root)
   model_path, snapshot_cache = find_model_path(

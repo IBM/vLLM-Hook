@@ -9,16 +9,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import pytest
 import torch
-
-# `mia` reaches `from vllm import LLM` via mia/llm.py, so guard the optional dependency here
-# rather than letting a missing vLLM ERROR collection for the whole suite.
-pytest.importorskip("vllm")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
 from demo_attnlink import INPUT_SEQ, evaluate_ranking, prepare_prompt
-from mia.analyzers.attnlink_analyzer import AttnLinkAnalyzer, select_columns
+from vllm_hook_plugins.analyzers.attnlink_analyzer import AttnLinkAnalyzer, select_columns
 
 
 class CharacterTokenizer:
@@ -60,7 +55,7 @@ class TestAttnLink(unittest.TestCase):
         entry["q"] = list(entry["q"].unbind(0))
         entry["k_all"] = list(entry["k_all"].unbind(0))
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
-                "MIA_USE_SAFETENSORS": "0"}):
+                "VLLM_HOOK_USE_SAFETENSORS": "0", "VLLM_HOOK_ASYNC_SAVE": "0"}):
             run = Path(folder) / "test_run"
             run.mkdir()
             torch.save(disk, run / "qk.pt")

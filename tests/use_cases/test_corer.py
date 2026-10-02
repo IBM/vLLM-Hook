@@ -3,10 +3,8 @@ import pytest
 import torch
 from typing import List
 
-pytest.importorskip("vllm")  # `import mia` pulls in vLLM (mia/llm.py); skip, never error the whole collection
-
-from mia import MiaLLM, register_plugins
-from tests.conftest import ensure_config_for_model, requires_gpu
+from vllm_hook_plugins import HookLLM, register_plugins
+from tests.conftest import ensure_config_for_model
 
 
 TEST_MODELS = [
@@ -65,23 +63,15 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
     return llm_prompt, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
 
 
-@pytest.mark.gpu
-@requires_gpu          # builds a real MiaLLM; see tests/conftest.py::requires_gpu
 @pytest.mark.parametrize("model_id", TEST_MODELS)
 def test_core_reranker(cache_dir, project_root, model_id):
-    """End-to-end CoRe reranking through a real MiaLLM engine.
-
-    GPU-only: it boots vLLM, so on a CPU-only node vLLM raises
-    "Device string must not be empty" before the test can assert anything. Skipped
-    (not failed) there by @requires_gpu -- see tests/conftest.py.
-    """
     register_plugins()
 
     cfg = ensure_config_for_model(project_root, "core_reranker", model_id)
 
-    llm = MiaLLM(
+    llm = HookLLM(
         model=model_id,
-        worker_name="capture_qk",
+        worker_name="probe_hook_qk",
         analyzer_name="core_reranker",
         config_file=str(cfg),
         download_dir=str(cache_dir),

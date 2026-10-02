@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from IPython.display import HTML, display
-from mia import MiaLLM, analyze_with_highlighter, generate_with_highlighter
+from vllm_hook_plugins import HookLLM, analyze_with_highlighter, generate_with_highlighter
 
 _ANALYZER = {"artifact_wait_seconds": 1.0}
 _ASSETS = Path(__file__).resolve().parent / "assets"
@@ -52,7 +52,7 @@ def _heatmap_iframe_html(payload: dict[str, Any], *, html_tpl: str, css: str, js
 
 
 class TokenHighlighterVisualizer:
-    def __init__(self, model: MiaLLM, highlighter_config: dict[str, Any]):
+    def __init__(self, model: HookLLM, highlighter_config: dict[str, Any]):
         self.model = model
         self.highlighter_config = dict(highlighter_config)
         self._html = (_ASSETS / "layout.html").read_text(encoding="utf-8")

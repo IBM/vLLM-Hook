@@ -1,14 +1,12 @@
 # Token Highlighter
 
-> **Not supported on vLLM 0.29** (the worker raises `UnsupportedRunnerError`).
-
-*MIA integration · June 2026*
+*vLLM-Hook integration · June 2026*
 
 **Paper.** [Token Highlighter: Inspecting and Mitigating Jailbreak Prompts for LLMs](https://arxiv.org/pdf/2412.18171) (arXiv:2412.18171)
 
 **Related docs.** [Gradient score derivation (PDF)](https://drive.google.com/uc?export=download&id=1gWZYZE7rgqT4GuHkmFMNJJz7RlLX4idR) (click to download) · [PDF Version](https://drive.google.com/uc?export=download&id=1LaLxYR63qnLurJI4_BpeInYw-k9IAB7A) (click to download) · [Interactive notebook](../../notebooks/demo_token_highlighter/live_highlighter/live_TH.ipynb)
 
-Token Highlighter ranks prompt tokens by their contribution to a fixed **affirmation target phrase** under teacher forcing, then optionally **mitigates** jailbreak-style completions by scaling selected **driver** embeddings by β < 1 at a subsequent prefill. This writeup covers the MIA integration: capture, offline scoring, driver selection, and embedding-level mitigation during inference.
+Token Highlighter ranks prompt tokens by their contribution to a fixed **affirmation target phrase** under teacher forcing, then optionally **mitigates** jailbreak-style completions by scaling selected **driver** embeddings by β < 1 at a subsequent prefill. This writeup covers the vLLM-Hook integration: capture, offline scoring, driver selection, and embedding-level mitigation during inference.
 
 ## Overview
 
@@ -49,12 +47,12 @@ Artifacts: `{hook_dir}/{run_id}/tp_rank_0/highlighter_activations.pt` and `highl
 
 | Component             | Role                                                                             |
 | --------------------- | -------------------------------------------------------------------------------- |
-| `MiaLLM`             | Single GPU engine; `generate_with_highlighter` wires mode, run id, hook dir, and config via `extra_args`. |
+| `HookLLM`             | Single GPU engine; `generate_with_highlighter` wires mode, run id, hook dir, and config via `extra_args`. |
 | `HighlighterWorker`   | Capture hooks, trace I/O, embedding soft-removal at mitigate prefill.            |
 | `HighlighterAnalyzer` | Closed-form `forward_attr` from disk traces.                                     |
 
 
-Capture and mitigate share one `MiaLLM` instance and one worker class. Mitigation is a later `generate_with_highlighter(..., mode="mitigate")` call that reuses the capture `run_id`.
+Capture and mitigate share one `HookLLM` instance and one worker class. Mitigation is a later `generate_with_highlighter(..., mode="mitigate")` call that reuses the capture `run_id`.
 
 Implementation: `workers/highlighter_worker.py`, `analyzers/highlighter_analyzer.py`, `utils/TokenHighlighter/`.
 
@@ -109,11 +107,11 @@ The scorer approximates ‖∂L_aff/∂xᵢ‖ by back-propagating through the *
 4. **Query path** and **residual identity term** for boundary token (final prompt token, whose query vector influences affirmation loss).
 5. Score for token xᵢ: L2 norm of the resulting vector.
 
-**Fidelity.** The last-block residual MLP branch is back-propagated analytically: from g_out = dL/dh_L we form g_mid = g_out + J_Norm2ᵀ J_MLPᵀ g_out (`compute_mid_boundary_gradient`), so the MLP Jacobian is no longer dropped. The closed form covers gated MLPs (SwiGLU/GeGLU, separate `gate_proj`/`up_proj` or fused `gate_up_proj`) and plain MLPs (GELU/ReLU), including input biases. On Qwen2-1.5B, validated against a seeded HuggingFace last-block autograd reference on vLLM's captured block input: g_out / g_mid relative L2 ≈ 0.16% (cosine ≈ 0.99999), block-input gradient relative L2 ≈ 2.6% (cosine ≈ 0.9996). Formal derivation: the Gradient score derivation PDF linked at the top.
+**Fidelity.** The last-block residual MLP branch is back-propagated analytically: from g_out = dL/dh_L we form g_mid = g_out + J_Norm2ᵀ J_MLPᵀ g_out (`compute_mid_boundary_gradient`), so the MLP Jacobian is no longer dropped. The closed form covers gated MLPs (SwiGLU/GeGLU, separate `gate_proj`/`up_proj` or fused `gate_up_proj`) and plain MLPs (GELU/ReLU), including input biases. On Qwen2-1.5B, validated with `examples/validate_scorer_agreement.py` (seeded HuggingFace last-block autograd on vLLM's captured block input): g_out / g_mid relative L2 ≈ 0.16% (cosine ≈ 0.99999), block-input gradient relative L2 ≈ 2.6% (cosine ≈ 0.9996). Formal derivation: `utils/TokenHighlighter/grad_influence.py`.
 
 ### Scorer validation
 
-Offline comparison against a seeded HuggingFace last-block autograd reference. The reference is seeded with vLLM's captured block input so the comparison measures last-block VJP fidelity, not vLLM-vs-HF forward divergence.
+Offline comparison against a seeded HuggingFace last-block autograd reference (`examples/validate_scorer_agreement.py`). The reference is seeded with vLLM's captured block input so the comparison measures last-block VJP fidelity, not vLLM-vs-HF forward divergence.
 
 
 | Metric                              | Qwen2-1.5B (3 prompts) |
@@ -184,7 +182,7 @@ Per-model defaults: `model_configs/token_highlighter/<model_short>.json`.
 
 ### Wrapper API (`generate_with_highlighter` / `analyze_with_highlighter`)
 
-Import from `mia` (or `mia.utils.TokenHighlighter.utils`). Load JSON defaults with `load_highlighter_config(path)` and pass `highlighter_config=hl_cfg` on each call.
+Import from `vllm_hook_plugins` (or `vllm_hook_plugins.utils.TokenHighlighter.utils`). Load JSON defaults with `load_highlighter_config(path)` and pass `highlighter_config=hl_cfg` on each call.
 
 
 | Parameter            | Role                                                     |
@@ -200,8 +198,8 @@ Import from `mia` (or `mia.utils.TokenHighlighter.utils`). Load JSON defaults wi
 ### Minimal API sequence
 
 ```python
-from mia import (
-    MiaLLM,
+from vllm_hook_plugins import (
+    HookLLM,
     analyze_with_highlighter,
     generate_with_highlighter,
     load_highlighter_config,
@@ -210,7 +208,7 @@ from mia import (
 hl_cfg = load_highlighter_config("model_configs/token_highlighter/Qwen2-1.5B-Instruct.json")
 hl_cfg["target_token_ids"] = tokenizer.encode(hl_cfg["target_phrase"], add_special_tokens=False)
 
-llm = MiaLLM(model=..., worker_name="token_highlighter", analyzer_name="token_highlighter", ...)
+llm = HookLLM(model=..., worker_name="token_highlighter", analyzer_name="token_highlighter", ...)
 
 out_cap = generate_with_highlighter(
     llm, prompt, mode="capture", highlighter_config=hl_cfg, temperature=0.0, max_tokens=32
@@ -225,7 +223,7 @@ out_mit = generate_with_highlighter(
 )
 ```
 
-Demos: `examples/demo_token_highlighter.py`, `notebooks/demo_token_highlighter/demo_token_highlighter.ipynb`, `notebooks/demo_token_highlighter/demo_token_highlighter_colab.ipynb`.
+Demos: `examples/demo_token_highlighter.py`, `notebooks/demo_token_highlighter.ipynb`, `notebooks/demo_token_highlighter_colab.ipynb`.
 
 ## Support and limitations
 

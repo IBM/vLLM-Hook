@@ -1,0 +1,248 @@
+import copy
+import os
+import json
+import uuid
+from typing import Optional, Dict, List
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+from vllm import LLM, SamplingParams
+from vllm_hook_plugins.registry import PluginRegistry
+from vllm_hook_plugins.run_utils import dispatch_disk_analyze
+from vllm_hook_plugins.shm_utils import teardown_shm
+
+class HookLLM:
+    def __init__(
+        self,
+        model: str,
+        worker_name: str = None,
+        analyzer_name: str = None,
+        config_file: str = None,
+        download_dir: str = '~/.cache',
+        enable_hook: bool = True,
+        hook_dir: str = None,
+        enforce_eager: bool = True,
+        **vllm_kwargs
+    ):
+
+        self.model_name = model
+        self.worker_name = worker_name
+        self.analyzer_name = analyzer_name
+        self.enable_hook = enable_hook
+        self.enforce_eager = enforce_eager
+
+        if hook_dir is not None:
+            HOOK_DIR = hook_dir
+        else:
+            HOOK_DIR = os.path.join(download_dir, '_v1_qk_peeks')
+        os.makedirs(HOOK_DIR, exist_ok=True)
+        self._hook_dir = HOOK_DIR
+
+        self.layer_to_heads = {}
+        self._output_layers = None       # set by load_config for HS worker
+        self._hookq_mode = "all_tokens"  # default; overridable in config
+        self._hs_mode = "last_token"     # default; overridable in config
+        self._steering_config: Optional[Dict] = None  # set by load_config for steer worker
+        if config_file:
+            self.load_config(config_file)
+
+        # (Optional) pre-allocate shared memory before worker subprocess is spawned.
+        self._hook_shm = None
+        if os.environ.get("VLLM_HOOK_USE_SHM", "0") == "1":
+            from vllm_hook_plugins.shm_utils import setup_shm
+            self._hook_shm = setup_shm(config_file, worker_name)
+
+        worker = None
+        if worker_name:
+            import vllm.plugins
+            vllm.plugins.load_general_plugins()
+            worker = PluginRegistry.get_worker(worker_name).path
+
+        self.llm = LLM(
+            model=model,
+            download_dir=download_dir,
+            worker_extension_cls=worker,
+            enforce_eager=enforce_eager,
+            **vllm_kwargs
+        )
+
+        self.tokenizer = self.llm.get_tokenizer()
+        self.llm_engine = self.llm.llm_engine
+
+        self.analyzer = None
+        if analyzer_name:
+            self.analyzer = PluginRegistry.get_analyzer(analyzer_name).analyzer
+            self.analyzer = self.analyzer(self._hook_dir, self.layer_to_heads)
+
+
+    def load_config(self, config_file: str):
+        with open(config_file, 'r') as f:
+            config_data = json.load(f)
+
+        if "params" in config_data and "important_heads" in config_data["params"]:
+            self.important_heads = config_data["params"]["important_heads"]
+            self.layer_to_heads = {}
+            for layer_idx, head_idx in self.important_heads:
+                if layer_idx not in self.layer_to_heads:
+                    self.layer_to_heads[layer_idx] = []
+                self.layer_to_heads[layer_idx].append(head_idx)
+
+        if "hookq" in config_data:
+            self._hookq_mode = config_data["hookq"]["hookq_mode"]
+
+        if "steering" in config_data:
+            # vector_path is taken as-is from the config (legacy: usually relative
+            # to the project root / current working directory).
+            self._steering_config = dict(config_data["steering"])
+
+        if "hidden_states" in config_data:
+            hs_cfg = config_data["hidden_states"]
+            layers = hs_cfg.get("layers", [])
+            self._hs_mode = hs_cfg.get("mode", "last_token")
+            self._output_layers = layers if layers else True
+
+    def _build_extra_args(self, save_to_disk: bool, run_id: str) -> dict:
+        """Build extra_args for the probe worker based on worker_name and config."""
+        extra = {}
+        if self.worker_name == "probe_hidden_states":
+            extra["output_hidden_states"] = self._output_layers if self._output_layers else True
+            extra["hs_mode"] = self._hs_mode
+        elif self.worker_name == "probe_hook_qk":
+            # Pass layer_to_heads dict for head-level metadata; worker uses keys for layer filtering.
+            extra["output_qk"] = self.layer_to_heads if self.layer_to_heads else True
+            extra["hookq_mode"] = self._hookq_mode
+        elif self.worker_name == "steer_hook_act":
+            extra["steer"] = self._steering_config
+        if save_to_disk:
+            extra["save_to_disk"] = True
+            extra["run_id"] = run_id
+            extra["hook_dir"] = self._hook_dir
+        return extra
+
+    def generate(
+        self,
+        prompts: List[str],
+        sampling_params=None,
+        use_hook: Optional[bool] = None,
+        save_to_disk: bool = False,
+        run_id: Optional[str] = None,
+        **kwargs
+    ):
+        hook = use_hook if use_hook is not None else self.enable_hook
+
+        if not isinstance(prompts, list):
+            prompts = [prompts]
+
+        if sampling_params is None:
+            sampling_params = SamplingParams(**kwargs)
+
+        if isinstance(sampling_params, list):
+            # list[SamplingParams] allows different hook params within requests
+            if len(sampling_params) != len(prompts):
+                raise ValueError(
+                    f"sampling_params list length ({len(sampling_params)}) "
+                    f"must match prompts length ({len(prompts)})"
+                )
+            sp_list = list(sampling_params)
+        else:
+            sp_list = [sampling_params] * len(prompts)
+
+        if hook and self.worker_name:
+            if run_id is None:
+                run_id = str(uuid.uuid4())
+            defaults = self._build_extra_args(save_to_disk, run_id)
+            new_sp_list = []
+            for sp in sp_list:
+                sp = copy.copy(sp)
+                extra = dict(sp.extra_args or {})
+
+                for k, v in defaults.items():
+                    extra.setdefault(k, v)  # insert-only-if-missing
+                sp.extra_args = extra
+                new_sp_list.append(sp)
+            sp_list = new_sp_list
+            # Store last run_id so analyze() can find the artifact without
+            # the caller needing to track it.
+            self._last_run_id = run_id
+        else:
+            # clear extra_args when use_hook=False
+            new_sp_list = []
+            for sp in sp_list:
+                if sp.extra_args:
+                    sp = copy.copy(sp)
+                    sp.extra_args = None
+                new_sp_list.append(sp)
+            sp_list = new_sp_list
+
+        # Pass through extra kwargs (e.g. use_tqdm) that aren't consumed above.
+        passthrough = {k: v for k, v in kwargs.items()
+                       if k not in ("temperature", "max_tokens", "top_p", "top_k",
+                                    "min_p", "n", "seed", "stop", "stop_token_ids",
+                                    "presence_penalty", "frequency_penalty",
+                                    "repetition_penalty")}
+        if all(sp is sp_list[0] for sp in sp_list):
+            # collapse to a single sp if they are all the same
+            outputs = self.llm.generate(prompts, sp_list[0], **passthrough)
+        else:
+            outputs = self.llm.generate(prompts, sp_list, **passthrough)
+
+        if hook and self.worker_name and not save_to_disk and len(outputs) > 1 and getattr(outputs[0], "probes", None) is not None:
+            # Merge per-request probes onto outputs[0] so callers always use
+            # output[0].probes regardless of batch size. q/k_all become lists
+            # of per-request tensors (unbind dim 0), matching the disk format
+            # that unpack_qk expects. k_all varies in seq_len so can't be cat'd.
+            all_probes = [o.probes for o in outputs]
+            merged = {k: v for k, v in all_probes[0].items() if k not in ("qk_cache", "hs_cache")}
+            for cache_key in ("qk_cache", "hs_cache"):
+                if cache_key not in all_probes[0]:
+                    continue
+                merged[cache_key] = {}
+                for layer in all_probes[0][cache_key]:
+                    first = all_probes[0][cache_key][layer]
+                    entry = {k: v for k, v in first.items() if k not in ("q", "k_all", "hidden_states")}
+                    for tensor_key in ("q", "k_all", "hidden_states"):
+                        if tensor_key not in first:
+                            continue
+                        entry[tensor_key] = [p[cache_key][layer][tensor_key][0] for p in all_probes]
+                    merged[cache_key][layer] = entry
+            outputs[0].probes = merged
+
+        return outputs
+
+    def analyze(
+        self,
+        analyzer_spec: Optional[Dict] = None,
+        probes: Optional[Dict] = None,
+        run_id: Optional[str] = None,
+        run_ids: Optional[List[str]] = None,
+    ) -> Optional[Dict]:
+        """Run the configured analyzer.
+
+        Two paths:
+        - In-memory: pass ``probes=output.probes`` from a generate() call that
+          used save_to_disk=False. The analyzer receives the RPC artifacts directly.
+        - Disk: pass ``run_id`` for single-pass analyzers (HS, AttnTracker), or
+          ``run_ids=[doc_run_id, na_run_id]`` for CoRer. Omitting both falls back
+          to the last generate()'s run_id.
+        """
+        if self.analyzer is None:
+            print("No analyzer configured")
+            return None
+
+        if probes is not None:
+            return self.analyzer.analyze(analyzer_spec=analyzer_spec, probes=probes)
+
+        # Disk path: resolve run_id from args or _last_run_id fallback.
+        effective_run_id = run_id or getattr(self, "_last_run_id", None)
+        return dispatch_disk_analyze(self.analyzer, analyzer_spec,
+                                     run_id=effective_run_id, run_ids=run_ids)
+
+    def close(self):
+        """Release resources owned by this wrapper."""
+        teardown_shm(getattr(self, "_hook_shm", None))
+        self._hook_shm = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

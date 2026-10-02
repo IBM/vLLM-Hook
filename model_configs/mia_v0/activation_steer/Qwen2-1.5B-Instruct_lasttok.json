@@ -1,0 +1,16 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "qwen2-1.5b-attn-add_vector-lasttok",
+        "model_id": "Qwen/Qwen2-1.5B-Instruct",
+        "note": "positions=last_token over both phases: last prompt token + every decode token. Parity fixture."
+    },
+    "steering": {
+        "method": "add_vector",
+        "coefficient": 1.0,
+        "optimal_layer": 14,
+        "vector_path": "steering_vectors/mia_v0/qwen2_dummy.pt",
+        "phase": "both",
+        "positions": "last_token"
+    }
+}

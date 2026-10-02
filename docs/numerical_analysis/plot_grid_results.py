@@ -1,8 +1,8 @@
 """
 Plot grid benchmark results: four metrics vs number of layers,
 one figure per prompt length, three lines per plot:
-  - MIA (last_token)
-  - MIA (all_tokens)
+  - vLLM-Hook (last_token)
+  - vLLM-Hook (all_tokens)
   - vLLM Eagle (native, last_token)
 
 Usage:
@@ -64,8 +64,8 @@ METRICS = [
 ]
 
 SERIES = [
-    ("hook",   "last_token", "MIA (last_token)",    "#1f77b4", "-",  "o"),
-    ("hook",   "all_tokens", "MIA (all_tokens)",    "#ff7f0e", "--", "s"),
+    ("hook",   "last_token", "vLLM-Hook (last_token)",    "#1f77b4", "-",  "o"),
+    ("hook",   "all_tokens", "vLLM-Hook (all_tokens)",    "#ff7f0e", "--", "s"),
     ("native", "all_tokens", "vLLM Eagle (native)",       "#2ca02c", "-.", "^"),
 ]
 
@@ -74,7 +74,7 @@ def plot_all(rows, prompt_lens, output_dir):
     n_rows = len(prompt_lens)
     n_cols = len(METRICS)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
-    fig.suptitle("MIA vs Native vLLM Eagle", fontsize=22)
+    fig.suptitle("vLLM-Hook vs Native vLLM Eagle", fontsize=22)
 
     for row_idx, prompt_len in enumerate(prompt_lens):
         for col_idx, (metric, std_col, ylabel) in enumerate(METRICS):

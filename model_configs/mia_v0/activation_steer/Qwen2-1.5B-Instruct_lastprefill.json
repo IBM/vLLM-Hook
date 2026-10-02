@@ -1,0 +1,16 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "qwen2-1.5b-attn-add_vector-lastprefill",
+        "model_id": "Qwen/Qwen2-1.5B-Instruct",
+        "note": "phase=prefill + positions=last_token: steers EXACTLY ONE token per request (the last prompt token). Same fixed random vector as Qwen2-1.5B-Instruct.json; parity fixture, not a behavioural direction."
+    },
+    "steering": {
+        "method": "add_vector",
+        "coefficient": 1.0,
+        "optimal_layer": 14,
+        "vector_path": "steering_vectors/mia_v0/qwen2_dummy.pt",
+        "phase": "prefill",
+        "positions": "last_token"
+    }
+}

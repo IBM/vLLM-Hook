@@ -1,24 +1,7 @@
 # Tests
 
-This directory contains model compatibility tests for the `mia` package.
+This directory contains model compatibility tests for the `vllm_hook_plugins` package.
 The tests validate that hooks, workers, and analyzers work correctly with vLLM models.
-
-## Layout
-
-```
-tests/
-├── conftest.py     shared fixtures, the `gpu` marker and `requires_gpu`
-├── use_cases/      one test per use case — these boot a real engine
-└── mia/            four checks on what the 0.29 port added
-    ├── test_plugin_config.py     engine-config policy: V2 runner, cudagraph mode, no PP
-    ├── test_runner_adapter.py    the V2 model-runner adapter contract
-    ├── test_graph_routing.py     per-step routing under CUDA graphs
-    └── test_tp_install.py        what each rank installs at tensor_parallel_size > 1
-```
-
-`use_cases/` is where a new worker or analyzer belongs — add a test there alongside your
-demo. `mia/` is deliberately small: four checks on the parts of the port that have no use
-case of their own, and that fail silently rather than loudly if they regress.
 
 These tests are **resource-aware** and do assume enough access to GPU resources. To reduce contention on shared systems:
 - tests use low `gpu_memory_utilization` values
@@ -33,21 +16,6 @@ From the project root:
 ```bash
 pytest -vv
 ```
-
-### The hermetic gate (no GPU needed)
-
-Tests that boot a real engine carry the `gpu` marker. To run everything else — the gate
-CI and code review use — select on the **marker**:
-
-```bash
-pytest tests/ -q -m "not gpu"
-```
-
-Use `-m`, **never `-k "not gpu"`**. `-k` is a substring filter over test ids, so it has no
-idea what a GPU test is and gets it wrong both ways: it lets the real-engine tests through
-(they fail on a CPU-only node with `RuntimeError: Device string must not be empty`) and it
-drops pure-CPU tests whose names merely contain "gpu", such as the GPU-*routing* checks,
-which need no GPU at all. See the comment in `tests/conftest.py`.
 
 Run only attention tracker tests:
 
