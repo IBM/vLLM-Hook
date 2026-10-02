@@ -48,23 +48,6 @@ Key takeaways:
 
 ---
 
-## ⚠️ Known Limitations
-
-- **Runtime envelope.** MIA requires vLLM 0.29.0 with its V2 model runner and `cudagraph_mode`
-  `NONE` (`enforce_eager=True`) or `FULL`; `PIECEWISE` and `FULL_AND_PIECEWISE` are rejected at
-  engine start. Spotlight and Token Highlighter are not supported on the V2 runner.
-- **Logprobs under FULL CUDA graphs.** Arming capture usually keeps generated token ids identical but can
-  move per-token logprobs (up to ~1.5e-2 for hidden-state capture, ~5e-7 for Q/K capture),
-  because the capture op changes what the compiler fuses. A near-tie greedy step can therefore
-  occasionally flip and change the rest of the text. Eager mode is bit-exact; use
-  `enforce_eager=True` when you need bit-reproducible logprobs.
-- **Fused steering kernel.** The default `MIA_STEER_FUSED=1` is not bit-identical to the
-  reference steering path; set `MIA_STEER_FUSED=0` for bit-exact steering.
-- **GPU routing.** `MIA_CAPTURE_GPU_ROUTING=1` (off by default) is not bit-reproducible against
-  host routing under FULL CUDA graphs.
-
----
-
 ## 🧩 Supported Configurations
 
 MIA targets the **server path** (`vllm serve` + `MiaClient`) under FULL CUDA graphs. Each use case
