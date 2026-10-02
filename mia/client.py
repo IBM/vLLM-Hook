@@ -22,6 +22,7 @@ class MiaClient:
         config_file: str,
         api_key: str = "EMPTY",
         hook_dir: str = None,
+        tokenizer_for: Optional[str] = None,
     ):
         from mia.registry import PluginRegistry
         from mia import register_plugins
@@ -44,7 +45,63 @@ class MiaClient:
         self._last_response: Any = None
         self._last_run_id: Optional[str] = None
         self._last_save_to_disk: bool = False
+        self._tokenizer_for = tokenizer_for
+        self._tokenizer = None
 
+
+    #: The only `vllm_xargs` keys the plugin JSON-decodes back into Python objects
+    #: (`_plugin.py`). A dict or list under any other key would arrive as a string and be
+    #: read as one, so this client refuses to send one rather than let it pass silently.
+    _JSON_DECODED_XARGS = ("output_qk", "output_hidden_states", "steer")
+
+    def _build_xargs(
+        self,
+        run_id: str,
+        save_to_disk: Optional[bool],
+        extra_xargs: Optional[Dict],
+        steer: Optional[Dict],
+        capture: bool,
+    ) -> Optional[Dict]:
+        """The `vllm_xargs` for one request, or None when it asks for nothing of MIA."""
+        xargs: Dict[str, Any] = {}
+        if capture:
+            xargs.update(self._build_extra_body()["vllm_xargs"])
+            os.makedirs(self._hook_dir, exist_ok=True)
+            xargs["run_id"] = run_id
+            xargs["hook_dir"] = self._hook_dir
+            if save_to_disk is not None:
+                xargs["save_to_disk"] = bool(save_to_disk)
+
+        if steer is not None:
+            xargs["steer"] = json.dumps(steer)
+
+        for key, value in (extra_xargs or {}).items():
+            if isinstance(value, (dict, list, tuple)):
+                if key not in self._JSON_DECODED_XARGS:
+                    raise ValueError(
+                        f"extra_xargs[{key!r}] is a {type(value).__name__}, but the plugin "
+                        f"only JSON-decodes {list(self._JSON_DECODED_XARGS)}; anything else "
+                        f"would reach the worker as a string. Pass a scalar, or use the "
+                        f"dedicated argument (steer=...) where one exists.")
+                xargs[key] = json.dumps(value)
+            else:
+                xargs[key] = value
+
+        return {"vllm_xargs": xargs} if xargs else None
+
+    def _record(self, response, run_id: Optional[str], save_to_disk: Optional[bool]):
+        try:
+            size = len(getattr(response, "_raw_response", None).text)  # type: ignore[union-attr]
+            PROF.gauge("client.response_bytes", size)
+        except Exception:
+            try:
+                PROF.gauge("client.response_bytes_est", len(response.model_dump_json()))
+            except Exception:
+                pass
+        self._last_response = response
+        self._last_run_id = run_id
+        self._last_save_to_disk = save_to_disk
+        return response
 
     def generate(
         self,
@@ -53,60 +110,117 @@ class MiaClient:
         save_to_disk: Optional[bool] = None,
         run_id: Optional[str] = None,
         extra_xargs: Optional[Dict] = None,
+        steer: Optional[Dict] = None,
+        capture: bool = True,
         **openai_kwargs,
     ):
-        """Send a chat completion request with probe capture.
+        """Send a chat completion with probe capture.
+
+        The server applies the model's chat template, so the token layout is the server's.
+        When an analyzer needs exact token spans, use :meth:`generate_tokens` instead.
 
         ``extra_xargs`` carries per-request knobs the config file does not cover -- the
         serve-path equivalent of ``SamplingParams.extra_args`` offline, e.g.
-        ``{"hooks_on": "both"}``. vLLM's ``vllm_xargs`` only accepts scalars, so dicts and
-        lists are JSON-encoded here, exactly as the plugin expects to decode them.
+        ``{"hooks_on": "both"}``. ``steer`` sends a steering config for this request alone.
+        ``capture=False`` is the equivalent of offline ``use_hook=False``: a plain request
+        that arms nothing.
         """
-        extra_body = self._build_extra_body()
-
         run_id = run_id or str(uuid.uuid4())
-        os.makedirs(self._hook_dir, exist_ok=True)
-        extra_body["vllm_xargs"].update({
-            "run_id": run_id,
-            "hook_dir": self._hook_dir,
-        })
-        if save_to_disk is not None:
-            extra_body["vllm_xargs"]["save_to_disk"] = bool(save_to_disk)
-        for key, value in (extra_xargs or {}).items():
-            extra_body["vllm_xargs"][key] = (
-                json.dumps(value) if isinstance(value, (dict, list)) else value)
+        extra_body = self._build_xargs(run_id, save_to_disk, extra_xargs, steer, capture)
 
         PROF.incr("client.request.calls")
         with PROF.timed("client.request"):
             response = self._openai.chat.completions.create(
-                model=model,
-                messages=messages,
-                extra_body=extra_body,
-                **openai_kwargs,
-            )
+                model=model, messages=messages, extra_body=extra_body, **openai_kwargs)
 
-        try:
-            size = len(getattr(response, "_raw_response", None).text)  # type: ignore[union-attr]
-            PROF.gauge("client.response_bytes", size)
-        except Exception:
-            try:
-                PROF.gauge("client.response_bytes_est",
-                           len(response.model_dump_json()))
-            except Exception:
-                pass
+        return self._record(response, run_id if capture else None,
+                            save_to_disk if capture else False)
 
-        self._last_response = response
-        self._last_run_id = run_id
-        self._last_save_to_disk = save_to_disk
-        return response
+    def generate_tokens(
+        self,
+        prompt_token_ids,
+        model: str,
+        save_to_disk: Optional[bool] = None,
+        run_id: Optional[str] = None,
+        extra_xargs: Optional[Dict] = None,
+        steer: Optional[Dict] = None,
+        capture: bool = True,
+        **openai_kwargs,
+    ):
+        """Capture against **exact token ids**, via the completions endpoint.
+
+        No chat template is applied, so the tokens the model sees are the tokens passed in
+        -- which is what an analyzer scoring token spans requires. Accepts one sequence
+        (``[int, ...]``) or a batch (``[[int, ...], ...]``); a batch shares one ``run_id``,
+        the way a list passed to the offline ``generate`` does.
+        """
+        return self._completions(prompt_token_ids, model, save_to_disk, run_id,
+                                 extra_xargs, steer, capture, **openai_kwargs)
+
+    def generate_text(
+        self,
+        prompt,
+        model: str,
+        save_to_disk: Optional[bool] = None,
+        run_id: Optional[str] = None,
+        extra_xargs: Optional[Dict] = None,
+        steer: Optional[Dict] = None,
+        capture: bool = True,
+        **openai_kwargs,
+    ):
+        """Capture against raw text, via the completions endpoint -- no chat template.
+
+        Use this for a prompt you have already templated yourself. Accepts one string or a
+        list of strings, and a list shares one ``run_id``.
+        """
+        return self._completions(prompt, model, save_to_disk, run_id, extra_xargs, steer,
+                                 capture, **openai_kwargs)
+
+    def _completions(self, prompt, model, save_to_disk, run_id, extra_xargs, steer,
+                     capture, **openai_kwargs):
+        run_id = run_id or str(uuid.uuid4())
+        extra_body = self._build_xargs(run_id, save_to_disk, extra_xargs, steer, capture)
+
+        PROF.incr("client.request.calls")
+        with PROF.timed("client.request"):
+            response = self._openai.completions.create(
+                model=model, prompt=prompt, extra_body=extra_body, **openai_kwargs)
+
+        return self._record(response, run_id if capture else None,
+                            save_to_disk if capture else False)
+
+    @property
+    def tokenizer(self):
+        """The served model's tokenizer, for computing the spans an analyzer scores.
+
+        Loaded locally and lazily; the offline entry point exposes the engine's own.
+        """
+        if self._tokenizer is None:
+            if not self._tokenizer_for:
+                raise RuntimeError(
+                    "no tokenizer bound: construct the client with "
+                    "tokenizer_for=<model id>, or load one yourself with "
+                    "transformers.AutoTokenizer.")
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_for)
+        return self._tokenizer
 
     def analyze(
         self,
         analyzer_spec: Optional[Dict] = None,
         run_id: Optional[str] = None,
         run_ids: Optional[List[str]] = None,
+        probes: Optional[Dict] = None,
     ) -> Optional[Dict]:
-        """Run the configured analyzer on the last generate() result."""
+        """Run the configured analyzer on the last generate() result.
+
+        ``probes`` analyzes a payload you already hold instead of the last response -- the
+        serve-path equivalent of passing ``probes=`` to the offline ``analyze``.
+        """
+        if probes is not None:
+            with PROF.timed("analyzer.kernel"):
+                return self.analyzer.analyze(analyzer_spec, probes=probes)
+
         if self._last_response is None:
             raise RuntimeError("No generate() call has been made yet.")
 
