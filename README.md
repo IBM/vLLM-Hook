@@ -1,9 +1,9 @@
-# 🪝 MIA
+# 🪝 vLLM.hook
 *A modular plugin library for vLLM.*
 
 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
-MIA is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
+vLLM.hook is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
 
 This includes dynamic analysis of:  
 - attention patterns  
@@ -17,7 +17,7 @@ This includes dynamic analysis of:
 
 - **July 24, 2026** — Featured in IBM Think: [*A new way of debugging open-weight models*](https://www.ibm.com/think/news/new-way-debugging-open-weight-models).
 
-- **July 6, 2026** — Presented at ICML 2026: [*MIA: Live Programming of Model Internals on vLLM*](https://icml.cc/virtual/2026/75729). (ICML registration and login are required to view the presentation.)
+- **July 6, 2026** — Presented at ICML 2026: [*vLLM-Hook: Live Programming of Model Internals on vLLM*](https://icml.cc/virtual/2026/75729). (ICML registration and login are required to view the presentation.)
 
 ---
 
@@ -39,18 +39,18 @@ This includes dynamic analysis of:
 
 ## 📊 Performance Analysis
 
-For a detailed benchmark comparing **MIA** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction (measured on vLLM 0.18), see [`docs/numerical_analysis/`](docs/numerical_analysis/README.md).
+For a detailed benchmark comparing **vLLM-Hook** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction (measured on vLLM 0.18), see [`docs/numerical_analysis/`](docs/numerical_analysis/README.md).
 
 Key takeaways:
-- MIA (`last_token`) offers significantly lower and prompt-length-invariant latency when only the final-position representation is needed
-- MIA (`all_tokens`) is numerically equivalent to Native Eagle while avoiding its GPU memory overhead
+- vLLM-Hook (`last_token`) offers significantly lower and prompt-length-invariant latency when only the final-position representation is needed
+- vLLM-Hook (`all_tokens`) is numerically equivalent to Native Eagle while avoiding its GPU memory overhead
 - Native Eagle requires loading a speculative decoding drafter model, reducing available KV cache
 
 ---
 
 ## ⚠️ Known Limitations
 
-- **Runtime envelope.** MIA requires vLLM 0.29.0 with its V2 model runner and `cudagraph_mode`
+- **Runtime envelope.** vLLM-Hook requires vLLM 0.29.0 with its V2 model runner and `cudagraph_mode`
   `NONE` (`enforce_eager=True`) or `FULL`; `PIECEWISE` and `FULL_AND_PIECEWISE` are rejected at
   engine start. Spotlight and Token Highlighter are not supported on the V2 runner.
 - **Logprobs under FULL CUDA graphs.** Arming capture usually keeps generated token ids identical but can
@@ -70,7 +70,7 @@ Key takeaways:
 Each use case (e.g. attention tracker, activation steering, hidden states extraction, etc) runs across a Cartesian product of configuration axes — execution path (`offline` / `vllm serve`), storage (`rpc` / `disk` / `shm`), and disk format (`pt` / `safetensors`). See [`docs/configs.md`](docs/configs.md) for code snippets showing how to select each config.
 
 Tensor parallelism (TP > 1) is supported for `capture_hs`, `capture_qk` and `steer`: each capturing
-rank writes its own `tp_rank_<r>/` directory and MIA's loaders merge them. Pipeline parallelism is
+rank writes its own `tp_rank_<r>/` directory and vLLM-Hook's loaders merge them. Pipeline parallelism is
 not supported, and Q/K `score` capture requires TP = 1.
 
 ---
@@ -88,14 +88,14 @@ cd ./vLLM-Hook
 
 ### 2. Create an environment and install
 
-MIA is validated on **vLLM 0.29.0 with torch 2.13.0**:
+vLLM-Hook is validated on **vLLM 0.29.0 with torch 2.13.0**:
 
 ```bash
 conda create -n mia_v029 python=3.12 pip
 conda activate mia_v029
 pip install vllm==0.29.0          # also installs torch 2.13.0
-pip uninstall -y torchcodec       # vLLM's audio/video decoder; MIA does not use it
-pip install -e . --no-deps        # MIA itself, from the repo root
+pip uninstall -y torchcodec       # vLLM's audio/video decoder; vLLM-Hook does not use it
+pip install -e . --no-deps        # the plugin itself, from the repo root
 pip install zstandard
 ```
 
@@ -226,6 +226,6 @@ We welcome contributions from the community!
 
 ## IBM ❤️ Open Source AI
 
-MIA has been started by IBM Research.
+vLLM.hook has been started by IBM Research.
 - Built for the **vLLM** ecosystem  
 - Inspired by community efforts to make LLMs more interpretable and controllable  

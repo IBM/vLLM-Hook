@@ -11,7 +11,7 @@
 <!-- List the files changed. -->
 
 The following files are **core infrastructure**. Please discuss with maintainers before modifying:
-`llm.py`, `_plugin.py`, `registry.py`, `client.py`, `run_utils.py`, `shm_utils.py`, `workers/_common.py`
+`hook_llm.py`, `_hook_plugin.py`, `registry.py`, `hook_client.py`, `run_utils.py`, `shm_utils.py`, `workers/_common.py`
 
 - [ ] I have NOT modified core files, OR I have discussed the change with maintainers
 - [ ] If I added a new worker/analyzer, I registered it in `__init__.py`
@@ -29,7 +29,7 @@ The following files are **core infrastructure**. Please discuss with maintainers
 <!-- Link any related issue: Closes #123 -->
 
 ## Contribution acknowledgement
-If this contribution is included in a future version of the MIA technical report, would you like to be credited as a co-author?
+If this contribution is included in a future version of the vLLM-Hook technical report, would you like to be credited as a co-author?
 
 - [ ] Yes, please include me as a contributor
 - [ ] No, thanks

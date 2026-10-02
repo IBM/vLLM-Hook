@@ -1,4 +1,4 @@
-# MIA supported configurations
+# vLLM-Hook supported configurations
 
 This document enumerates the supported configs and how to invoke each from user code.
 
@@ -177,9 +177,9 @@ See [`examples/demo_actsteer_serve.py`](../examples/demo_actsteer_serve.py) for 
 
 ---
 
-## You set nothing: what MIA decides about the capture data path
+## You set nothing: what vLLM-Hook decides about the capture data path
 
-MIA picks the capture data path per request and per file, from the configuration it already has.
+vLLM-Hook picks the capture data path per request and per file, from the configuration it already has.
 The defaults below are what a user gets without setting anything; each one names the measurement
 behind it and the env var that overrides it. Nothing here changes what is captured or the bytes
 that are written -- only which road they take.
@@ -209,7 +209,7 @@ and QK at almost any size, go to **disk**.
 
 **An explicit `save_to_disk` from the caller always wins.** The router fires only when the request
 carries no `save_to_disk` at all: an explicit value is a requirement (`true` = "I need the artifact
-FILE"), not a hint, and MIA never overrides it.
+FILE"), not a hint, and vLLM-Hook never overrides it.
 
 | env var | default | effect |
 |---|---|---|
@@ -228,7 +228,7 @@ retuning one MOVES the threshold -- the threshold is solved from them, never sto
 opens a raw file `O_DIRECT` only where it is legal (the row width is a multiple of the detected
 block size) **and** where it pays (the predicted write is at least **64 KiB** -- the
 low end of the band where the measurement can no longer tell the two apart; below it, at one
-writer thread, buffered wins decisively). MIA predicts that size at install from the capture
+writer thread, buffered wins decisively). vLLM-Hook predicts that size at install from the capture
 configuration alone, as an UPPER BOUND: an `all_tokens` capture writes up to a whole step of tokens
 per file and takes O_DIRECT; a `last_token` one writes at most a row per in-flight request, so it
 takes the buffered path only at low concurrency (below 8 concurrent requests at 8B, 4 at 70B).
