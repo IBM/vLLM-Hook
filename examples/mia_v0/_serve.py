@@ -25,10 +25,17 @@ def base_url() -> str:
 
 
 def serve_command(model: str, worker: str, *, graph: bool = False,
-                  max_model_len: int = 2048) -> str:
-    """The `vllm serve` invocation a demo needs, ready to paste."""
+                  max_model_len: int = 2048, tp: int = 1) -> str:
+    """The `vllm serve` invocation a demo needs, ready to paste.
+
+    `tp` > 1 adds `--tensor-parallel-size`. Capture shards across the ranks -- hidden states
+    by layer, Q/K by head -- and each rank writes its own `tp_rank_<r>/`. Note that
+    MIA_APERTURE_GPU_BYTES is a PER-RANK budget, so TP x N claims N times that much GPU.
+    """
     env = ["VLLM_WORKER_MULTIPROC_METHOD=spawn", f"MIA_WORKER={worker}"]
     args = [f"--max-model-len {max_model_len}", f"--port {_port()}"]
+    if int(tp) > 1:
+        args.append(f"--tensor-parallel-size {int(tp)}")
     if graph:
         # 0.29 defaults to FULL_AND_PIECEWISE, which MIA refuses; FULL must be explicit.
         env.append("MIA_ALLOW_CUDAGRAPH=1")
@@ -39,7 +46,7 @@ def serve_command(model: str, worker: str, *, graph: bool = False,
 
 
 def require_server(model: str, worker: str, *, graph: bool = False,
-                   max_model_len: int = 2048) -> str:
+                   max_model_len: int = 2048, tp: int = 1) -> str:
     """Return the base URL, or explain how to start the server and exit."""
     url = base_url()
     try:
@@ -47,7 +54,7 @@ def require_server(model: str, worker: str, *, graph: bool = False,
             served = {m.get("id") for m in json.loads(r.read()).get("data", [])}
     except (urllib.error.URLError, OSError, ValueError) as e:
         print(f"[mia] no server at {url} ({e}).\n\nStart one in another terminal:\n\n"
-              f"{serve_command(model, worker, graph=graph, max_model_len=max_model_len)}\n",
+              f"{serve_command(model, worker, graph=graph, max_model_len=max_model_len, tp=tp)}\n",
               file=sys.stderr)
         raise SystemExit(1)
 

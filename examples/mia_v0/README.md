@@ -3,6 +3,99 @@
 MIA installs into the **server**. The worker that captures or steers is `vllm serve`'s own
 worker, so a demo is a client: start a server, send requests, read back what was captured.
 
+## Getting started
+
+Install MIA from the repository root — [`docs/mia_v0/README.md`](../../docs/mia_v0/README.md)
+has the full environment (vLLM 0.29.0, torch 2.13.0, Python 3.12):
+
+```bash
+pip install -e . --no-deps && pip install zstandard
+```
+
+Then, in four steps:
+
+```bash
+# 1. start a server for the worker you want (hidden_states | qk | steer)
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve Qwen/Qwen2-1.5B-Instruct --max-model-len 2048 --port 8770 --enforce-eager
+
+# 2. confirm MIA loaded into it — this line comes from the server, not the client
+#    [graph/install_hs] HS aperture drain ON -> ...        (graph mode)
+
+# 3. run a demo against it, from the repository root
+python examples/mia_v0/demo_hiddenstate.py
+
+# 4. it prints a shape and a norm per captured layer
+```
+
+If step 1 is missing, step 3 does not fail obscurely: every demo probes the endpoint first and
+prints the exact `vllm serve` line it needs, then exits.
+
+### Where the captured data goes
+
+Two routes, and they put bytes in different places. Knowing which one you are on is the
+difference between finding your artifact and thinking nothing was captured.
+
+| Route | Location | Read it back with |
+|---|---|---|
+| in host memory (default for small artifacts) | nowhere on disk — it rides back on the response | `client.analyze(...)` |
+| disk (`save_to_disk=True`) | `<hook_dir>/<run_id>/`, default `hook_dir=/dev/shm/mia`; `tp_rank_<r>/` under TP | `client.analyze(...)`, which waits for the files |
+| FULL CUDA-graph capture | `$MIA_APERTURE_DIR/tp_rank_<r>/` — per-layer `hs_layer_<N>.raw` plus an `hs_aperture_meta.jsonl` sidecar | `mia.graph.aperture_reader.load_multilayer_aperture_artifact(run_dir)`, or `load_hs_aperture_tp(dir)` to union the ranks |
+
+**Set `MIA_APERTURE_DIR`.** Unset, it defaults to `./hs_aperture_dump` (or `./qk_aperture_dump`)
+**relative to the process's working directory** — and since everything here says to run from the
+repository root, that means inside your clone. An all-layers, all-tokens run writes tens of GB
+there. Both names are gitignored, so nothing gets committed, but a home filesystem with a quota
+will notice.
+
+In graph mode `analyze()` is **not** the way back: use the reader above. Each capturing rank
+logs its directory once at install (`... aperture drain ON -> <dir>`), so the server's own log
+tells you where it is going.
+
+### Did it actually capture anything?
+
+A run that captured nothing looks like a fast run, so check rather than assume:
+
+- **The artifact exists.** `ls <hook_dir>/<run_id>/` on the disk route, or
+  `ls $MIA_APERTURE_DIR/tp_rank_0/` in graph mode — you want `hs_layer_*.raw` **and** the
+  `.jsonl` sidecar. A sidecar with no entries means the drain never saw a row.
+- **The analyzer returned something.** `stats["hidden_states"]` empty is a failed capture, not
+  an empty model.
+- **The counters moved.** Start the server with `MIA_PROFILE=1` and read its log at shutdown:
+  `captured.bytes.hs` (or `.qk`) above zero is the only signal that proves rows were captured
+  and handed to the drain. Do not use a counter that merely proves the request finished.
+
+### Tensor parallelism
+
+Add `--tensor-parallel-size N` to the server command. Capture shards across the ranks — hidden
+states by **layer** (rank `r` takes layers where `i % N == r`), Q/K by **head** — and each rank
+writes its own `tp_rank_<r>/`, which the reader unions:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve meta-llama/Llama-3.1-70B \
+    --max-model-len 2048 --port 8770 --tensor-parallel-size 4 --enforce-eager
+```
+
+```python
+from mia.graph.aperture_reader import load_hs_aperture_tp
+per_request = load_hs_aperture_tp(os.environ["MIA_APERTURE_DIR"])   # refuses a gap or duplicate
+```
+
+Three things to know before you try it:
+
+- **`MIA_APERTURE_GPU_BYTES` is per rank**, so TP × 4 claims four times that much GPU in total.
+  Each rank checks its own budget against `gpu_memory_utilization`; see
+  [`docs/mia_v0/configs.md`](../../docs/mia_v0/configs.md) for the constraint.
+- **Q/K `score` capture requires TP = 1.** Raw Q/K shards fine; the rebuilt per-head scores do
+  not.
+- **Pipeline parallelism is refused**, not merely untested — under PP each rank holds only its
+  own stage's layers and the rest are identity placeholders that the layer matcher would hook
+  anyway, so capture would return zero-filled rows for every off-stage layer.
+
+Supported for `capture_hs`, `capture_qk` and `steer`. `_serve.py`'s helper takes `tp=` so a
+demo's printed command is runnable as-is.
+
 ## 1. Start a server
 
 One server serves one worker kind, chosen at launch with `MIA_WORKER`
