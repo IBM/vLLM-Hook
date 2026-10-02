@@ -50,16 +50,12 @@ def pytest_configure(config):
 #
 #   * It INCLUDED the real engine tests in tests/use_cases/, whose names say nothing about
 #     GPUs -- so they ran on a login node and the gate reported "11 failed" as routine.
-#   * It EXCLUDED six pure-CPU tests whose names merely CONTAIN "gpu":
-#     tests/test_parity_band_discrimination.py::test_gpu_routing_band_* (4) and
-#     tests/test_parity_band_index.py's [MIA_T2_GPU_ROUTING_BAND] parametrization (2) --
-#     the latter meaning the guard that enforces band documentation was silently skipping
-#     one of the fourteen bands it exists to police. Measured on a login node:
-#     -k "not gpu" -> 471 passed / 18 deselected;  -m "not gpu" -> 477 passed / 12.
+#   * It EXCLUDED pure-CPU tests whose names merely CONTAIN "gpu" -- the GPU-*routing*
+#     checks, which need no GPU at all.
 #
-# Now that the `gpu` marker is actually applied, marker selection is what "not gpu" was
-# always supposed to mean: `-m` deselects exactly the 12 marked tests and nothing else.
-# Do not reintroduce `-k` for this purpose.
+# The `gpu` marker is applied to the tests that boot a real engine, so marker selection is
+# what "not gpu" was always supposed to mean: `-m` deselects exactly those and nothing
+# else. Do not reintroduce `-k` for this purpose.
 
 
 def has_gpu() -> bool:

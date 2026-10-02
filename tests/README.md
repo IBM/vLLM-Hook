@@ -8,14 +8,17 @@ The tests validate that hooks, workers, and analyzers work correctly with vLLM m
 ```
 tests/
 ├── conftest.py     shared fixtures, the `gpu` marker and `requires_gpu`
-├── use_cases/      the per-use-case model compatibility tests
-└── mia/            tests for the CUDA-graph capture/steering internals
-    └── parity/     the correctness oracle: capture must not change generation
+├── use_cases/      one test per use case — these boot a real engine
+└── mia/            four checks on what the 0.29 port added
+    ├── test_plugin_config.py     engine-config policy: V2 runner, cudagraph mode, no PP
+    ├── test_runner_adapter.py    the V2 model-runner adapter contract
+    ├── test_graph_routing.py     per-step routing under CUDA graphs
+    └── test_tp_install.py        what each rank installs at tensor_parallel_size > 1
 ```
 
-`use_cases/` holds one test per use case and is where a new worker or analyzer belongs.
-`mia/` holds the tests for the capture aperture, routing, delivery and TP sharding — the
-machinery behind the use cases rather than a use case itself.
+`use_cases/` is where a new worker or analyzer belongs — add a test there alongside your
+demo. `mia/` is deliberately small: four checks on the parts of the port that have no use
+case of their own, and that fail silently rather than loudly if they regress.
 
 These tests are **resource-aware** and do assume enough access to GPU resources. To reduce contention on shared systems:
 - tests use low `gpu_memory_utilization` values
@@ -43,9 +46,8 @@ pytest tests/ -q -m "not gpu"
 Use `-m`, **never `-k "not gpu"`**. `-k` is a substring filter over test ids, so it has no
 idea what a GPU test is and gets it wrong both ways: it lets the real-engine tests through
 (they fail on a CPU-only node with `RuntimeError: Device string must not be empty`) and it
-drops pure-CPU tests whose names merely contain "gpu", such as the GPU-*routing* band
-checks in `test_parity_band_discrimination.py` and the `[MIA_T2_GPU_ROUTING_BAND]`
-parametrization in `test_parity_band_index.py`. See the comment in `tests/conftest.py`.
+drops pure-CPU tests whose names merely contain "gpu", such as the GPU-*routing* checks,
+which need no GPU at all. See the comment in `tests/conftest.py`.
 
 Run only attention tracker tests:
 
