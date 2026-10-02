@@ -3,18 +3,19 @@ import json
 import openai
 
 from _paths import config_path, vector_path
+from _serve import STEER, base_url, require_server
 
 
 if __name__ == "__main__":
-    base_url = "http://localhost:8770/v1"
     model = "microsoft/Phi-3-mini-4k-instruct"
+    require_server(model, STEER)
     cfg_file = config_path(f'activation_steer/{model.split("/")[-1]}-chinese.json')
 
     with open(cfg_file) as f:
         config = json.load(f)
     default_config = config["steering"]
 
-    client = openai.OpenAI(base_url=base_url, api_key="EMPTY")
+    client = openai.OpenAI(base_url=base_url(), api_key="EMPTY")
 
     test_case = [
         "Hello hello! Thank you for coming to our Expo talk today. I hope you enjoyed our talk so far. Do you have any questions?"

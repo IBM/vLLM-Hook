@@ -1,4 +1,9 @@
-"""CoRe reranker demo: rank documents by relevance from captured Q/K attention."""
+"""CoRe reranker demo: rank documents by relevance from captured Q/K attention.
+Runs in-process (`MiaLLM`) rather than over `vllm serve`: it prompts with exact token
+ids and checks the span alignment it depends on. The chat endpoint applies the model's
+chat template server-side, which re-tokenizes and would invalidate those spans. Serving
+it would need a pass-through chat template on the server.
+"""
 import os
 import sys
 import multiprocessing as mp

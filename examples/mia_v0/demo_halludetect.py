@@ -1,26 +1,16 @@
-"""H-Node hallucination detection demo (inference only)."""
+"""H-Node hallucination detection over `vllm serve` (inference only)."""
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 import sys
-from pathlib import Path
 
-_root = str(Path(__file__).resolve().parent.parent)
-if _root not in sys.path:
-    sys.path.append(_root)
+from mia import MiaClient
+from _paths import config_path
+from _serve import HS, chat, require_server
 
-import torch
-from vllm import SamplingParams
-
-mp.set_start_method("spawn", force=True)
-os.environ["VLLM_USE_V1"] = "1"
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
-CACHE_DIR = "./cache/"
-HOOK_DIR = "/dev/shm/mia"
-INFER_CFG = "model_configs/hnode_hallucination/Qwen2.5-1.5B-Instruct.infer.json"
+MODEL = os.environ.get("MIA_DEMO_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+INFER_CFG = config_path("hnode_hallucination/Qwen2.5-1.5B-Instruct.infer.json")
+GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
 
 PROBE_BASE_URL = (
     "https://raw.githubusercontent.com/Samarpit-bhatia/hnode-probe-builder/"
@@ -28,6 +18,15 @@ PROBE_BASE_URL = (
 )
 ART_DIR = "./cache/hnode_probe"
 PROBE_PATH = os.path.join(ART_DIR, "probe.npz")
+
+EXAMPLES = [
+    "Q: What is the capital of France?\nA: Paris",
+    "Q: What is the capital of France?\nA: London",
+    "Q: Who wrote Hamlet?\nA: William Shakespeare",
+    "Q: Who wrote Hamlet?\nA: Charles Dickens",
+    "Q: What is 2 + 2?\nA: 4",
+    "Q: What is 2 + 2?\nA: 5",
+]
 
 
 def ensure_probe():
@@ -52,61 +51,26 @@ def ensure_probe():
             )
 
 
-def _make_llm(config_file: str, analyzer_name: str = "hidden_states"):
-    from mia import MiaLLM
-
-    return MiaLLM(
-        model=MODEL,
-        worker_name="capture_hs",
-        analyzer_name=analyzer_name,
-        config_file=config_file,
-        download_dir=CACHE_DIR,
-        hook_dir=HOOK_DIR,
-        gpu_memory_utilization=0.85,
-        max_model_len=1024,
-        max_num_batched_tokens=2048,
-        trust_remote_code=True,
-        dtype=torch.float16,
-        enable_prefix_caching=False,
-        enable_hook=True,
-        tensor_parallel_size=1,
-        enforce_eager=True,
-    )
-
-
-def stage_detect():
+if __name__ == "__main__":
     ensure_probe()
-
-    examples = [
-        "Q: What is the capital of France?\nA: Paris",
-        "Q: What is the capital of France?\nA: London",
-        "Q: Who wrote Hamlet?\nA: William Shakespeare",
-        "Q: Who wrote Hamlet?\nA: Charles Dickens",
-        "Q: What is 2 + 2?\nA: 4",
-        "Q: What is 2 + 2?\nA: 5",
-    ]
-
-    print("Loading model with inference config (best layer only) + hallucination analyzer...")
-    llm = _make_llm(INFER_CFG, analyzer_name="hnode_hallucination")
+    url = require_server(MODEL, HS, graph=GRAPH, max_model_len=1024)
+    client = MiaClient(base_url=url, analyzer_name="hnode_hallucination",
+                       config_file=INFER_CFG)
 
     print("Running detection on example prompts...\n")
     run_id = "halludetect_detect"
-    llm.generate(examples, SamplingParams(temperature=0.0, max_tokens=1),
-                 save_to_disk=True, run_id=run_id)
-    result = llm.analyze(
-        analyzer_spec={"probe_path": PROBE_PATH, "threshold": 0.5},
-        run_id=run_id,
-    )
+    for prompt in EXAMPLES:
+        # One run_id for the whole set: the analyzer reduces over every artifact in it.
+        client.generate(messages=chat(prompt), model=MODEL, max_tokens=1,
+                        temperature=0.0, save_to_disk=True, run_id=run_id)
+
+    result = client.analyze(
+        analyzer_spec={"probe_path": PROBE_PATH, "threshold": 0.5}, run_id=run_id)
 
     print(f"Best layer: {result['best_layer']}  |  threshold: {result['threshold']}")
     print("-" * 78)
     for prompt, p, exc, verdict in zip(
-        examples, result["probabilities"], result["h_node_excess"], result["verdicts"]
+        EXAMPLES, result["probabilities"], result["h_node_excess"], result["verdicts"]
     ):
         line = prompt.replace("\n", "  ")
         print(f"[{verdict:>12s}]  P(hall)={p:.3f}  H-excess={exc:.3f}  |  {line}")
-
-
-if __name__ == "__main__":
-    stage_detect()
-

@@ -1,4 +1,7 @@
-"""Token Highlighter demo: find and soften the prompt tokens that drive a jailbreak."""
+"""Token Highlighter demo: find and soften the prompt tokens that drive a jailbreak.
+Not supported on vLLM 0.29's V2 runner -- MIA raises `UnsupportedRunnerError`. Kept for
+reference and for the pre-0.29 engine; the upstream copy in `examples/` is unchanged.
+"""
 import multiprocessing as mp
 import torch
 from transformers import AutoTokenizer

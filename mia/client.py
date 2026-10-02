@@ -52,9 +52,16 @@ class MiaClient:
         model: str,
         save_to_disk: Optional[bool] = None,
         run_id: Optional[str] = None,
+        extra_xargs: Optional[Dict] = None,
         **openai_kwargs,
     ):
-        """Send a chat completion request with probe capture."""
+        """Send a chat completion request with probe capture.
+
+        ``extra_xargs`` carries per-request knobs the config file does not cover -- the
+        serve-path equivalent of ``SamplingParams.extra_args`` offline, e.g.
+        ``{"hooks_on": "both"}``. vLLM's ``vllm_xargs`` only accepts scalars, so dicts and
+        lists are JSON-encoded here, exactly as the plugin expects to decode them.
+        """
         extra_body = self._build_extra_body()
 
         run_id = run_id or str(uuid.uuid4())
@@ -65,6 +72,9 @@ class MiaClient:
         })
         if save_to_disk is not None:
             extra_body["vllm_xargs"]["save_to_disk"] = bool(save_to_disk)
+        for key, value in (extra_xargs or {}).items():
+            extra_body["vllm_xargs"][key] = (
+                json.dumps(value) if isinstance(value, (dict, list)) else value)
 
         PROF.incr("client.request.calls")
         with PROF.timed("client.request"):

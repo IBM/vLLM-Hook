@@ -1,4 +1,7 @@
-"""Spotlight demo: steer attention toward emphasized prompt spans."""
+"""Spotlight demo: steer attention toward emphasized prompt spans.
+Not supported on vLLM 0.29's V2 runner -- MIA raises `UnsupportedRunnerError`. Kept for
+reference and for the pre-0.29 engine; the upstream copy in `examples/` is unchanged.
+"""
 import os
 import multiprocessing as mp
 import torch

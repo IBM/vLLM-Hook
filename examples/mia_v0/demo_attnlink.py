@@ -1,4 +1,9 @@
-"""Single-example AttnLink-U schema linking with the stock QK worker."""
+"""Single-example AttnLink-U schema linking with the stock QK worker.
+Runs in-process (`MiaLLM`) rather than over `vllm serve`: it prompts with exact token
+ids and checks the span alignment it depends on. The chat endpoint applies the model's
+chat template server-side, which re-tokenizes and would invalidate those spans. Serving
+it would need a pass-through chat template on the server.
+"""
 import argparse
 from datetime import datetime, timezone
 import hashlib

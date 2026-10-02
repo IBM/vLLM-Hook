@@ -1,4 +1,8 @@
-"""FULL CUDA-graph hidden-state capture demo, with evidence for the optimization levers."""
+"""FULL CUDA-graph hidden-state capture demo, with evidence for the optimization levers.
+Runs in-process (`MiaLLM`) on purpose: this is the local FULL-CUDA-graph showcase, and
+the determinism check below needs two generations against one engine. For the server
+path see the demos that use `MiaClient`.
+"""
 import os
 import multiprocessing as mp
 import time

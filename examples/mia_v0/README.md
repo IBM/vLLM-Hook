@@ -1,48 +1,81 @@
 # Building your own demo
 
-A demo is one Python file: configure an engine, generate, read back what was captured.
+MIA installs into the **server**. The worker that captures or steers is `vllm serve`'s own
+worker, so a demo is a client: start a server, send requests, read back what was captured.
 
-## 1. Skeleton
+## 1. Start a server
 
-Copy this. Set the multiprocessing start method and `VLLM_WORKER_MULTIPROC_METHOD` before the `vllm`
-import, or the engine starts with the wrong runtime.
+One server serves one worker kind, chosen at launch with `MIA_WORKER`
+(`hidden_states` · `qk` · `steer` — exact, no aliases):
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve Qwen/Qwen2-1.5B-Instruct \
+    --max-model-len 2048 --port 8770 --enforce-eager
+```
+
+For FULL CUDA graphs, add `MIA_ALLOW_CUDAGRAPH=1` and ask for the mode explicitly — 0.29
+defaults to `FULL_AND_PIECEWISE`, which MIA refuses:
+
+```bash
+MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve Qwen/Qwen2-1.5B-Instruct \
+    --max-model-len 2048 --port 8770 \
+    --compilation-config '{"cudagraph_mode": "FULL"}'
+```
+
+Every demo here prints the exact command it needs if nothing is listening.
+
+## 2. Skeleton
 
 ```python
 import os
-import multiprocessing as mp
-import torch
 
-mp.set_start_method("spawn", force=True)
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+from mia import MiaClient
+from _paths import config_path          # resolves MIA's configs, then upstream's
+from _serve import HS, chat, require_server
 
-from vllm import SamplingParams
-from mia import MiaLLM
+MODEL = "Qwen/Qwen2-1.5B-Instruct"
 
 if __name__ == "__main__":
-    llm = MiaLLM(
-        model="Qwen/Qwen2-1.5B-Instruct",
-        worker_name="capture_hs",     # what to capture
-        analyzer_name="hidden_states",         # what to do with it
-        config_file="model_configs/mia_v0/hidden_states/Qwen2-1.5B-Instruct.json",
-        download_dir="./cache/",
-        dtype=torch.float16,
-        gpu_memory_utilization=0.7,
-        max_model_len=2048,
-        enable_hook=True,
-        enforce_eager=True,
+    url = require_server(MODEL, HS)      # or exit with the server command
+    client = MiaClient(
+        base_url=url,
+        analyzer_name="hidden_states",                       # what to do with the capture
+        config_file=config_path("hidden_states/Qwen2-1.5B-Instruct.json"),
     )
 
-    out = llm.generate("The capital of France is",
-                       SamplingParams(temperature=0.0, max_tokens=10),
-                       save_to_disk=True)
-    stats = llm.analyze(analyzer_spec={"reduce": "none"})
+    response = client.generate(messages=chat("The capital of France is"), model=MODEL,
+                               max_tokens=10, temperature=0.0, save_to_disk=True)
+    stats = client.analyze(analyzer_spec={"reduce": "none"})
 
-    print(out[0].outputs[0].text)
+    print(response.choices[0].message.content)
     for layer, tensors in sorted(stats["hidden_states"].items()):
         print(layer, tuple(tensors[0].shape))
 ```
 
-Run from the repo root: `python examples/mia_v0/my_demo.py`.
+Run from the repo root: `python examples/mia_v0/my_demo.py`. Override the endpoint with
+`MIA_DEMO_BASE_URL`.
+
+**Steering needs no `MiaClient`** — it produces no artifact, so there is nothing to analyze.
+Use a plain `openai` client and put the config in `vllm_xargs["steer"]`, JSON-encoded
+(`vllm_xargs` takes scalars only). See `demo_actsteer.py`.
+
+**Per-request knobs** that the config file does not cover go through
+`client.generate(..., extra_xargs={"hooks_on": "both"})` — the serve-path equivalent of
+`SamplingParams.extra_args`.
+
+### Demos that stay in-process
+
+Four do not use the server, and say why at the top of the file:
+
+| Demo | Why |
+|---|---|
+| `demo_corer.py`, `demo_attnlink.py`, `demo_scihal.py` | they prompt with exact token ids and check span alignment; the chat endpoint re-templates server-side, which would invalidate the spans |
+| `demo_capture_aperture.py` | the local FULL-graph showcase: its determinism check needs two generations against one engine |
+
+`demo_spotlight.py` and `demo_token_highlighter.py` do not run on 0.29 at all — MIA raises
+`UnsupportedRunnerError` on the V2 runner.
 
 ## 2. Pick a worker and analyzer
 
