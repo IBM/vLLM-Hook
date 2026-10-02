@@ -1,4 +1,4 @@
-"""One-shot generator for ``steering_vectors/qwen2_adjust_rs.pt`` (adjust_rs format).
+"""One-shot generator for ``steering_vectors/mia_v0/qwen2_adjust_rs.pt`` (adjust_rs format).
 
 The qwen2_dummy.pt vector has only ``dir`` (add_vector). This writes the same vector
 in the ``adjust_rs`` container (``dir`` = unit-direction ndarray, ``avg_proj`` = scalar
@@ -12,7 +12,7 @@ The direction is a fixed random unit vector (seed 0) — meaningless behavioural
 
 Run once from the project root:
 
-    python steering_vectors/_make_qwen2_adjust_rs.py
+    python steering_vectors/mia_v0/_make_qwen2_adjust_rs.py
 """
 import os
 
@@ -21,7 +21,7 @@ import torch
 
 HIDDEN_SIZE = 1536  # Qwen2-1.5B-Instruct residual stream width
 AVG_PROJ = float(os.environ.get("VLLM_QWEN2_ADJRS_AVGPROJ", "50.0"))
-OUT_PATH = "steering_vectors/qwen2_adjust_rs.pt"
+OUT_PATH = "steering_vectors/mia_v0/qwen2_adjust_rs.pt"
 
 torch.manual_seed(0)
 direction = torch.randn(HIDDEN_SIZE, dtype=torch.float32)

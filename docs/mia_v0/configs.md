@@ -306,19 +306,45 @@ fail later.
 | `MIA_APERTURE_MAX_BATCHED_TOKENS` | off | derive (`auto`) or pin `max_num_batched_tokens` so a heavy capture's per-step transient cannot OOM at high batch. MIN-ONLY: it never raises the budget, so it is byte-identical whenever the derived cap is the larger one |
 | `MIA_APERTURE_BACKPRESSURE_TIMEOUT_S` | `10` (s) | how long a step waits for the drain to free rows before `ApertureBackpressureError`. Capture blocks; it never silently drops rows. Raise it if a slow sink makes a heavy run trip the barrier |
 
-**The interaction to get right is `gpu_memory_utilization`.** It is vLLM's flag, not MIA's
-(`--gpu-memory-utilization` on the server), and it tells vLLM how much of the card to claim for
-weights and KV cache. The aperture comes out of what is *left*. Ask for too much of both and MIA
-refuses at engine start, naming the two numbers and what to lower:
+### The one rule: `gpu_memory_utilization` must leave room for the aperture
+
+Yes — explicitly, and it is enforced. `gpu_memory_utilization` is vLLM's flag, not MIA's
+(`--gpu-memory-utilization` on the server); it tells vLLM what fraction of the card to claim for
+weights and KV cache. **The aperture lives entirely in the fraction vLLM does not claim**, and
+engine start fails unless:
 
 ```
-aperture 4.00 GiB + gpu_memory_utilization=0.95 leaves no room (free margin 0.31 GiB):
+MIA_APERTURE_GPU_BYTES  ≤  (1 − gpu_memory_utilization) × total GPU bytes
+```
+
+On an 80 GiB card, with the 4 GiB default:
+
+| `gpu_memory_utilization` | left for the aperture | 4 GiB default |
+|---|---|---|
+| 0.80 | 16.0 GiB | fits easily |
+| 0.90 | 8.0 GiB | fits |
+| 0.95 | 4.0 GiB | exactly at the limit |
+| 0.97 | 2.4 GiB | **refused** |
+
+Two things worth knowing about that check. It is computed from the *fraction*, not from a
+measurement — so it does not know about anything else sharing the card; and it runs at engine
+construction, so you get a named error instead of a CUDA OOM mid-run:
+
+```
+aperture 4.00 GiB + gpu_memory_utilization=0.97 leaves no room (free margin 2.40 GiB):
 lower gpu_memory_utilization or MIA_APERTURE_GPU_BYTES
 ```
 
-So on a crowded card, drop `--gpu-memory-utilization` (0.7 is what the demos use) or shrink the
-aperture; capturing fewer layers also lowers what a step needs. An explicit
-`MIA_APERTURE_GPU_BYTES` is always honoured — the auto path only chooses when you set nothing.
+When you set nothing, MIA also checks the default against what **one max-token step** actually
+needs (`max_num_batched_tokens × row bytes × captured layers`). If a step needs more than 4 GiB
+it grows the budget to fit — but only within that same free margin. If it cannot, it refuses and
+names all four ways out: lower `gpu_memory_utilization`, lower `max_num_batched_tokens`, capture
+fewer layers, or set `MIA_APERTURE_GPU_BYTES` yourself.
+
+An explicit `MIA_APERTURE_GPU_BYTES` always wins and skips that growth — including when it is
+*smaller* than one step needs, which is legal and will surface as `ApertureBackpressureError`
+when a max-token step cannot be admitted. The demos use `gpu_memory_utilization=0.7`, which
+leaves 24 GiB on an 80 GiB card and never runs into this.
 
 At TP > 1 the budget is per rank, which is cheaper than it sounds for hidden states: a step costs
 `max_num_batched_tokens × ceil(L / tp) × hidden × 2` on each rank, so 2.5 GiB for

@@ -1,4 +1,4 @@
-"""One-shot generator for ``steering_vectors/phi3_adjust_rs_test.pt`` (adjust_rs format).
+"""One-shot generator for ``steering_vectors/mia_v0/phi3_adjust_rs_test.pt`` (adjust_rs format).
 
 The shipped phi3_format.pt / phi3_korean.pt / phi3_chinese.pt vectors are behavioural
 demo vectors. This writes a neutral test vector in the ``adjust_rs`` container sized to
@@ -13,7 +13,7 @@ and crashes eager. Match the shipped containers.
 
 Run once from the project root:
 
-    python steering_vectors/_make_phi3_adjust_rs_test.py
+    python steering_vectors/mia_v0/_make_phi3_adjust_rs_test.py
 """
 import os
 
@@ -22,7 +22,7 @@ import torch
 
 HIDDEN_SIZE = 3072  # Phi-3-mini-4k-instruct residual stream width
 AVG_PROJ = float(os.environ.get("VLLM_PHI3_ADJRS_AVGPROJ", "20.0"))
-OUT_PATH = "steering_vectors/phi3_adjust_rs_test.pt"
+OUT_PATH = "steering_vectors/mia_v0/phi3_adjust_rs_test.pt"
 
 torch.manual_seed(0)
 direction = torch.randn(HIDDEN_SIZE, dtype=torch.float32)

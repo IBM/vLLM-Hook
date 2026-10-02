@@ -1,4 +1,4 @@
-"""One-shot generator for ``steering_vectors/qwen2_dummy.pt``.
+"""One-shot generator for ``steering_vectors/mia_v0/qwen2_dummy.pt``.
 
 Writes a fixed random fp16 tensor of shape ``(hidden_size,)`` = ``(1536,)``
 matching Qwen2-1.5B-Instruct's residual stream width. Used only by the
@@ -7,13 +7,13 @@ path; the direction is meaningless.
 
 Run once from the project root after pulling:
 
-    python steering_vectors/_make_qwen2_dummy.py
+    python steering_vectors/mia_v0/_make_qwen2_dummy.py
 """
 import os
 import torch
 
 HIDDEN_SIZE = 1536  # Qwen2-1.5B-Instruct
-OUT_PATH    = "steering_vectors/qwen2_dummy.pt"
+OUT_PATH    = "steering_vectors/mia_v0/qwen2_dummy.pt"
 
 torch.manual_seed(0)
 direction = torch.randn(HIDDEN_SIZE, dtype=torch.float16)

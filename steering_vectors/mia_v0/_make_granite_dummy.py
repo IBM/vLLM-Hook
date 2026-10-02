@@ -1,7 +1,7 @@
-"""One-shot generator for ``steering_vectors/granite_format.pt``.
+"""One-shot generator for ``steering_vectors/mia_v0/granite_format.pt``.
 
 The granite steer config (``model_configs/activation_steer/granite-3.1-8b-instruct.json``)
-uses the ``adjust_rs`` method and points at ``steering_vectors/granite_format.pt``,
+uses the ``adjust_rs`` method and points at ``steering_vectors/mia_v0/granite_format.pt``,
 which is not checked in. This writes a dummy in the SAME format as the real
 ``phi3_format.pt`` (``dir`` = unit direction ndarray, ``avg_proj`` = scalar target
 projection) sized to Granite-3.1-8B's residual width (``hidden_size = 4096``).
@@ -16,7 +16,7 @@ or stronger steer.
 
 Run once from the project root:
 
-    python steering_vectors/_make_granite_dummy.py
+    python steering_vectors/mia_v0/_make_granite_dummy.py
 """
 import os
 
@@ -25,7 +25,7 @@ import torch
 
 HIDDEN_SIZE = 4096  # ibm-granite/granite-3.1-8b-instruct residual stream width
 AVG_PROJ = float(os.environ.get("VLLM_GRANITE_DUMMY_AVGPROJ", "300.0"))
-OUT_PATH = "steering_vectors/granite_format.pt"
+OUT_PATH = "steering_vectors/mia_v0/granite_format.pt"
 
 torch.manual_seed(0)
 direction = torch.randn(HIDDEN_SIZE, dtype=torch.float32)
