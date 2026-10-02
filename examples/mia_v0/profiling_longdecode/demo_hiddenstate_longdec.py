@@ -16,7 +16,7 @@ CONFIG = os.environ.get(
     "MIA_CONFIG_FILE", config_path(f"hidden_states/{MODEL.split('/')[-1]}.json"))
 MAX_TOKENS = int(os.environ.get("MIA_DEMO_MAX_TOKENS", "128"))
 HOOKS_ON = os.environ.get("MIA_DEMO_HOOKS_ON", "both")
-GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
+GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH", "1") != "0"
 
 if __name__ == "__main__":
     print(f"[longdec-hs] model={MODEL} config={CONFIG} "

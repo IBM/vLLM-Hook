@@ -12,7 +12,7 @@ from _serve import (HS, chat, completion_text, completion_tokens, print_evidence
 MODEL = os.environ.get("MIA_DEMO_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 CONFIG = os.environ.get(
     "MIA_CONFIG_FILE", config_path(f"hidden_states/{MODEL.split('/')[-1]}.json"))
-GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
+GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH", "1") != "0"
 
 PROMPTS = [
     "The capital of France is",

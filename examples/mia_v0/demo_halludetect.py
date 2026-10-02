@@ -10,7 +10,7 @@ from _serve import HS, chat, require_server
 
 MODEL = os.environ.get("MIA_DEMO_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 INFER_CFG = config_path("hnode_hallucination/Qwen2.5-1.5B-Instruct.infer.json")
-GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
+GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH", "1") != "0"
 
 PROBE_BASE_URL = (
     "https://raw.githubusercontent.com/Samarpit-bhatia/hnode-probe-builder/"

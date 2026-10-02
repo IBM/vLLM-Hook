@@ -13,7 +13,7 @@ from _paths import config_path
 from _serve import STEER, base_url, print_evidence, require_server
 
 MODEL = os.environ.get("MIA_DEMO_MODEL", "microsoft/Phi-3-mini-4k-instruct")
-GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
+GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH", "1") != "0"
 
 LANGUAGE_CONFIGS = {
     "Chinese": "activation_steer/Phi-3-mini-4k-instruct-chinese.json",

@@ -16,8 +16,9 @@ Then, in four steps:
 
 ```bash
 # 1. start a server for the worker you want (hidden_states | qk | steer)
-VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
-    vllm serve Qwen/Qwen2-1.5B-Instruct --max-model-len 2048 --port 8770 --enforce-eager
+MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve Qwen/Qwen2-1.5B-Instruct --max-model-len 2048 --port 8770 \
+    --compilation-config '{"cudagraph_mode": "FULL"}'
 
 # 2. confirm MIA loaded into it — this line comes from the server, not the client
 #    [graph/install_hs] HS aperture drain ON -> ...        (graph mode)
@@ -72,9 +73,10 @@ states by **layer** (rank `r` takes layers where `i % N == r`), Q/K by **head** 
 writes its own `tp_rank_<r>/`, which the reader unions:
 
 ```bash
-VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
     vllm serve meta-llama/Llama-3.1-70B \
-    --max-model-len 2048 --port 8770 --tensor-parallel-size 4 --enforce-eager
+    --max-model-len 2048 --port 8770 --tensor-parallel-size 4 \
+    --compilation-config '{"cudagraph_mode": "FULL"}'
 ```
 
 ```python
@@ -99,16 +101,8 @@ demo's printed command is runnable as-is.
 ## 1. Start a server
 
 One server serves one worker kind, chosen at launch with `MIA_WORKER`
-(`hidden_states` · `qk` · `steer` — exact, no aliases):
-
-```bash
-VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
-    vllm serve Qwen/Qwen2-1.5B-Instruct \
-    --max-model-len 2048 --port 8770 --enforce-eager
-```
-
-For FULL CUDA graphs, add `MIA_ALLOW_CUDAGRAPH=1` and ask for the mode explicitly — 0.29
-defaults to `FULL_AND_PIECEWISE`, which MIA refuses:
+(`hidden_states` · `qk` · `steer` — exact, no aliases). **Run it under FULL CUDA graphs**, which
+is what MIA exists for — capture that does not cost the engine its graphs:
 
 ```bash
 MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
@@ -117,7 +111,21 @@ MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_state
     --compilation-config '{"cudagraph_mode": "FULL"}'
 ```
 
-Every demo here prints the exact command it needs if nothing is listening.
+Both parts are needed. `MIA_ALLOW_CUDAGRAPH=1` is what stops MIA forcing the engine into eager,
+and the mode has to be named: MIA accepts `FULL` or `NONE`, and vLLM would otherwise resolve to
+one MIA refuses at startup.
+
+Eager is the opt-out, and the reason to reach for it is bit-exactness — graph-mode capture can
+move per-token logprobs slightly, eager cannot:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve Qwen/Qwen2-1.5B-Instruct \
+    --max-model-len 2048 --port 8770 --enforce-eager
+```
+
+Every demo prints the exact command it needs if nothing is listening, and prints the graph-mode
+one by default. Set `MIA_ALLOW_CUDAGRAPH=0` to have it print the eager form instead.
 
 ## 2. Skeleton
 
@@ -239,21 +247,24 @@ returns what was captured, unchanged.
 
 ## 5. Optional: FULL CUDA-graph mode
 
-Capture and steering run under CUDA graphs instead of eager. Off by default.
+The server runs under CUDA graphs by default (§1). For an **in-process** demo the env var
+still gates it, because the plugin forces eager without it:
 
 ```bash
 MIA_ALLOW_CUDAGRAPH=1 python examples/mia_v0/my_demo.py
 ```
 
-Your demo must also pass `enforce_eager=False` and `compilation_config={"cudagraph_mode": "FULL"}`
-(vLLM 0.29 defaults to `FULL_AND_PIECEWISE`, which MIA refuses); without the env var the plugin
-forces eager regardless. See `demo_capture_aperture.py`.
+An in-process demo must also pass `enforce_eager=False` and
+`compilation_config={"cudagraph_mode": "FULL"}` — MIA accepts `FULL` or `NONE` and refuses what
+vLLM would otherwise resolve to. Without the env var the plugin forces eager regardless. See
+`demo_capture_aperture.py`.
 
 ## 6. Gotchas
 
 - Set the `mp.set_start_method` / env lines **before** importing `vllm`.
 - Run from the repo root — config and vector paths are relative to it.
-- `enforce_eager=True` is required unless you enabled graph mode.
+- In-process: `enforce_eager=True` unless you enabled graph mode. Server demos are graph-mode
+  by default; `MIA_ALLOW_CUDAGRAPH=0` gets you the eager command instead.
 - Call `llm.llm_engine.reset_prefix_cache()` between prompts if you capture the same prefix twice.
 - Profiler counters need `MIA_PROFILE=1`; without it they are no-ops.
 - Performance levers: `from mia.optimizations import describe; print(describe())`.
@@ -270,8 +281,9 @@ Run every demo from the repo root, e.g. `python examples/demo_hiddenstate.py`. A
 - **`demo_actsteer_serve.py`** talks to a running server. Start it in another terminal first:
 
   ```bash
-  VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
-      vllm serve microsoft/Phi-3-mini-4k-instruct --enforce-eager --max-model-len 2048 --port 8770
+  MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+      vllm serve microsoft/Phi-3-mini-4k-instruct --max-model-len 2048 --port 8770 \
+      --compilation-config '{"cudagraph_mode": "FULL"}'
   ```
 
   Each request carries its own steer config in `extra_body["vllm_xargs"]["steer"]`, JSON-encoded,

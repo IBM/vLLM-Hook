@@ -16,7 +16,7 @@ from _serve import STEER, base_url, print_evidence, require_server
 MODEL = os.environ.get("MIA_DEMO_MODEL", "microsoft/Phi-3-mini-4k-instruct")
 CONFIG = os.environ.get(
     "MIA_CONFIG_FILE", config_path(f'activation_steer/{MODEL.split("/")[-1]}.json'))
-GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH") == "1"
+GRAPH = os.environ.get("MIA_ALLOW_CUDAGRAPH", "1") != "0"
 
 PROMPTS = [
     "Write a dialogue between two people, one is dressed up in a ball gown and the other "

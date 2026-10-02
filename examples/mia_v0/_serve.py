@@ -24,7 +24,7 @@ def base_url() -> str:
     return os.environ.get("MIA_DEMO_BASE_URL", "http://localhost:8770/v1")
 
 
-def serve_command(model: str, worker: str, *, graph: bool = False,
+def serve_command(model: str, worker: str, *, graph: bool = True,
                   max_model_len: int = 2048, tp: int = 1) -> str:
     """The `vllm serve` invocation a demo needs, ready to paste.
 
@@ -37,15 +37,18 @@ def serve_command(model: str, worker: str, *, graph: bool = False,
     if int(tp) > 1:
         args.append(f"--tensor-parallel-size {int(tp)}")
     if graph:
-        # 0.29 defaults to FULL_AND_PIECEWISE, which MIA refuses; FULL must be explicit.
+        # MIA's point is capture that survives CUDA graphs, so this is the default. The mode
+        # must be named explicitly: MIA accepts NONE or FULL, and vLLM would otherwise pick a
+        # mode MIA refuses.
         env.append("MIA_ALLOW_CUDAGRAPH=1")
         args.append("""--compilation-config '{"cudagraph_mode": "FULL"}'""")
     else:
+        # Opt-out. Eager capture is bit-exact, which graph-mode capture is not.
         args.append("--enforce-eager")
     return f"{' '.join(env)} \\\n    vllm serve {model} \\\n    {' '.join(args)}"
 
 
-def require_server(model: str, worker: str, *, graph: bool = False,
+def require_server(model: str, worker: str, *, graph: bool = True,
                    max_model_len: int = 2048, tp: int = 1) -> str:
     """Return the base URL, or explain how to start the server and exit."""
     url = base_url()

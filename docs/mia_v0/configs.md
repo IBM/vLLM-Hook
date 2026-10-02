@@ -119,18 +119,20 @@ MIA_USE_SHM=1           # legacy shared-memory fast path (hidden states + last_t
 
 ### Serve (`vllm serve` + `MiaClient` / openai client)
 
-Start the server with `MIA_WORKER` set to the worker that matches your use case:
+Start the server with `MIA_WORKER` set to the worker that matches your use case. FULL CUDA
+graphs are the expected setting; swap the two graph flags for `--enforce-eager` only when you
+need bit-exact logprobs:
 
 ```bash
 # probes (attention tracker / CoRer / hidden states):
-VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=qk \
+MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=qk \
   vllm serve ibm-granite/granite-3.1-8b-instruct \
-    --enforce-eager --max-model-len 2048 --port 8770
+    --max-model-len 2048 --port 8770 --compilation-config '{"cudagraph_mode": "FULL"}'
 
 # activation steering:
-VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+MIA_ALLOW_CUDAGRAPH=1 VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
   vllm serve microsoft/Phi-3-mini-4k-instruct \
-    --enforce-eager --max-model-len 2048 --port 8770
+    --max-model-len 2048 --port 8770 --compilation-config '{"cudagraph_mode": "FULL"}'
 ```
 
 For probe use cases, `MiaClient` mirrors the in-process `MiaLLM` API:
