@@ -868,27 +868,3 @@ def test_prof_splits_the_step(tmp_path, monkeypatch):
     assert c.get("aperture.hs.write_busy_us", 0) >= 0
     for name in ("step", "d2h", "write", "write_tail", "bookkeeping"):
         assert len(t[f"aperture.hs.{name}"]) == stats["steps"] > 0
-
-
-def test_drain_bench_runs_its_own_logic_on_cpu(tmp_path):
-    """tests/mia/perf/drain_bench.py is the GPU validation tool for this path; its `--device cpu` dry
-    run drives the same drains, so its bookkeeping, verify and cleanup are checked here."""
-    import importlib.util
-
-    path = os.path.join(os.path.dirname(__file__), "perf", "drain_bench.py")
-    spec = importlib.util.spec_from_file_location("drain_bench", path)
-    bench = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bench)
-    keys = ("MIA_APERTURE_WRITE_MODE", "MIA_APERTURE_WRITE_THREADS")
-    before = {k: os.environ.get(k) for k in keys}
-    for cfg in (dict(kind="hs", layers=3, hidden=256, rows=24, requests=3, tp_rank=0, tp_size=1),
-                dict(kind="qk", layers=2, q_dim=256, k_dim=64, rows=24, requests=2, tp_rank=0,
-                     tp_size=1)):
-        for mode in ("legacy", "auto"):
-            res = bench.run_bench(cfg, mode=mode, threads=2, base_dir=str(tmp_path), steps=3,
-                                  warmup=1, device="cpu", verify=True)
-            assert res["verify"]["ok"], res["verify"]
-            assert len(res["per_step"]) == 3 and res["summary"]["GBps_median"] > 0
-            assert sum(res["bytes_by_mode"].values()) == 4 * res["step_bytes"]
-            assert not os.path.exists(res["config"]["run_dir"])        # cleaned up
-    assert {k: os.environ.get(k) for k in keys} == before              # env restored

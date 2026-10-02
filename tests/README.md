@@ -10,13 +10,12 @@ tests/
 ├── conftest.py     shared fixtures, the `gpu` marker and `requires_gpu`
 ├── use_cases/      the per-use-case model compatibility tests
 └── mia/            tests for the CUDA-graph capture/steering internals
-    ├── parity/     the T0-T3 correctness oracle (vanilla-vLLM reference, invariants, cross-branch)
-    └── perf/       drain and host-build benches (tools, not gated tests)
+    └── parity/     the correctness oracle: capture must not change generation
 ```
 
 `use_cases/` holds one test per use case and is where a new worker or analyzer belongs.
-`mia/` holds the tests for the capture aperture, routing, delivery, TP sharding and the
-naming/gate policies — the machinery behind the use cases rather than a use case itself.
+`mia/` holds the tests for the capture aperture, routing, delivery and TP sharding — the
+machinery behind the use cases rather than a use case itself.
 
 These tests are **resource-aware** and do assume enough access to GPU resources. To reduce contention on shared systems:
 - tests use low `gpu_memory_utilization` values
