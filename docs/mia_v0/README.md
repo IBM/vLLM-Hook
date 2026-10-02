@@ -67,7 +67,15 @@ Key takeaways:
 
 ## 🧩 Supported Configurations
 
-Each use case (e.g. attention tracker, activation steering, hidden states extraction, etc) runs across a Cartesian product of configuration axes — execution path (`offline` / `vllm serve`), storage (`rpc` / `disk` / `shm`), and disk format (`pt` / `safetensors`). See [`docs/mia_v0/configs.md`](docs/mia_v0/configs.md) for code snippets showing how to select each config.
+MIA targets the **server path** (`vllm serve` + `MiaClient`) under FULL CUDA graphs. Each use case
+(attention tracker, activation steering, hidden-state extraction, …) runs across a Cartesian
+product of storage (`rpc` / `disk`) and disk format (`pt` / `safetensors`). See
+[`docs/mia_v0/configs.md`](docs/mia_v0/configs.md) for code snippets showing how to select each
+config.
+
+`MiaLLM` builds an engine in your own process and is how the demos under `examples/mia_v0/` run —
+the quickest way to exercise graph-mode capture on one machine. For the in-process workflow
+without CUDA graphs, upstream's `HookLLM` is unchanged and still available.
 
 Tensor parallelism (TP > 1) is supported for `capture_hs`, `capture_qk` and `steer`: each capturing
 rank writes its own `tp_rank_<r>/` directory and vLLM-Hook's loaders merge them. Pipeline parallelism is

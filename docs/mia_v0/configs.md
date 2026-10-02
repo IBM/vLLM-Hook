@@ -8,7 +8,7 @@ This document enumerates the supported configs and how to invoke each from user 
 
 | Axis | Values | How it's selected |
 |---|---|---|
-| **Execution path** | `offline` (in-process `MiaLLM`) · `serve` (`vllm serve` + `MiaClient`) | -|
+| **Execution path** | `serve` (`vllm serve` + `MiaClient`) | — |
 | **Storage** | `rpc` (in-memory via `collective_rpc`) · `disk` (artifact under `/dev/shm/mia/<run_id>/`) · `shm` (legacy shared memory, hidden states-only) | per-request `extra_args["save_to_disk"]` (SHM via `MIA_USE_SHM=1`) |
 | **Disk format** | `pt` (`torch.save`) · `st` (safetensors ) | `MIA_USE_SAFETENSORS={0,1}` |
 
@@ -22,22 +22,13 @@ This document enumerates the supported configs and how to invoke each from user 
 
 | Cell ID | Path | Storage | Format |
 |---|---|---|---|
-| `attn-offline-rpc-na`   | offline | rpc  | —  |
-| `attn-offline-disk-pt`  | offline | disk | pt |
-| `attn-offline-disk-st`  | offline | disk | st |
 | `attn-serve-rpc-na`     | serve   | rpc  | —  |
 | `attn-serve-disk-pt`    | serve   | disk | pt |
 | `attn-serve-disk-st`    | serve   | disk | st |
 
 ### Hidden states 
 
-Same 6 axis combinations as above, plus the legacy SHM fast-path:
-
-| Cell ID | Path | Storage | Format |
-|---|---|---|---|
-| `hs-offline-shm-na` | offline | shm  | —  |
-
-SHM is gated by `MIA_USE_SHM=1` and only supports `capture_hs` in `last_token` mode (auto-disabled otherwise; see `shm_utils.py`).
+The same 3 combinations as above.
 
 ### CoRer
 
@@ -45,8 +36,6 @@ CoRer is intrinsically two-pass and only uses the disk path (the analyzer needs 
 
 | Cell ID | Path | Storage | Format |
 |---|---|---|---|
-| `corer-offline-disk-pt` | offline | disk | pt |
-| `corer-offline-disk-st` | offline | disk | st |
 | `corer-serve-disk-pt`   | serve   | disk | pt |
 | `corer-serve-disk-st`   | serve   | disk | st |
 
@@ -56,16 +45,18 @@ Steering modifies the residual stream in-place and produces no artifacts, so sto
 
 | Cell ID | Path |
 |---|---|
-| `actsteer-offline-na-na` | offline |
 | `actsteer-serve-na-na`   | serve   |
 
 ---
 
 ## Selecting a configuration from user code
 
-All hook activation is **per-request** via `SamplingParams.extra_args` (offline) or `extra_body["vllm_xargs"]` (serve). Different requests in the same batch can use different configs.
+All hook activation is **per-request** via `extra_body["vllm_xargs"]` under `vllm serve`, or
+`SamplingParams.extra_args` when driving an engine in-process. Different requests in the same
+batch can use different configs.
 
-The two execution paths are documented below. For each path, the same code shape covers all four use cases — only `worker_name` / `analyzer_name` (offline) or `MIA_WORKER` (serve) varies:
+The same code shape covers all four use cases — only `worker_name` / `analyzer_name`, or
+`MIA_WORKER` on the server, varies:
 
 | Use case | `worker_name` / `MIA_WORKER` | `analyzer_name` |
 |---|---|---|
@@ -74,7 +65,11 @@ The two execution paths are documented below. For each path, the same code shape
 | hidden states | `capture_hs` / `hidden_states` | `hidden_states` |
 | activation steering | `steer` / `steer` | (none — no artifacts) |
 
-### Offline (`MiaLLM`)
+### Driving an engine in-process (`MiaLLM`)
+
+`MiaLLM` builds a vLLM engine in your own process. It is how every demo under
+`examples/mia_v0/` runs, and the quickest way to exercise capture under FULL CUDA graphs on
+one machine — not a deployment path. For serving, use `vllm serve` with `MiaClient` below.
 
 ```python
 import torch
@@ -115,7 +110,7 @@ out_steered = llm.generate(text, SamplingParams(temperature=0.0, max_tokens=200,
 out_plain   = llm.generate(text, SamplingParams(temperature=0.0, max_tokens=200), use_hook=False)
 ```
 
-Format/save-mode are env-vars on the offline driver process, set **before** `MiaLLM(...)` is constructed (the worker subprocess inherits them at spawn):
+Format/save-mode are env-vars on the driver process, set **before** `MiaLLM(...)` is constructed (the worker subprocess inherits them at spawn):
 
 ```bash
 MIA_USE_SAFETENSORS=1   # write .safetensors instead of .pt
@@ -138,7 +133,7 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
     --enforce-eager --max-model-len 2048 --port 8770
 ```
 
-For probe use cases, `MiaClient` mirrors the offline `MiaLLM` API:
+For probe use cases, `MiaClient` mirrors the in-process `MiaLLM` API:
 
 ```python
 from mia import MiaClient
@@ -282,25 +277,3 @@ its own `tp_rank_<r>/`, and each rank's aperture, drain thread and writer cover 
 `max_num_batched_tokens × ceil(L / tp) × hidden × 2` on a rank (2.5 GiB for Llama-3.1-70B at TP4,
 not 10 GiB). Read a run back with `mia.graph.aperture_reader.load_hs_aperture_tp(MIA_APERTURE_DIR)`,
 which unions the rank dirs and refuses a gap or a duplicate. TP = 1 is unchanged, byte for byte.
-
----
-
-## Preliminary study regarding the storage variant choice
-
-We have done a preliminary test regarding different storage variants using hidden-states extraction as an example. Numbers below are for `last_token` mode at 512-token prompts on Qwen2-1.5B-Instruct, averaged over 4 captured-layer counts {1, 4, 16, 28} (5 timed repetitions per cell after 5 warm-up runs that are discarded).
-
-> **Historical note:** these numbers were measured under the old per-request `MIA_ASYNC_SAVE` background-save-thread path described above, which has since been removed and superseded by the writer process. The `-async` cell labels below are archival measurement IDs only — they are not a configuration you can select today; see the coverage matrices above for what's currently selectable.
-
-| Variant | gen (ms) | total (ms) | analyze overhead (ms) |
-|---|---:|---:|---:|
-| **disk-st-async** | 40.0 | 41.8 | 1.8 |
-| disk-pt-async | 41.0 | 49.8 | 8.7 |
-| disk-pt | 47.3 | 53.8 | 6.5 |
-| shm | 53.1 | 53.1 | 0.0 |
-| rpc | 65.3 | 65.3 | 0.0 |
-
-### Takeaways
-
-- **disk-st (via the now-removed async-save path) was the fastest measured variant.** It minimized generate-side latency (async I/O off the critical path) and produced the smallest safetensors artifact. Today's recommended equivalent is `disk` + `st` with the writer process (on by default) — it wasn't re-benchmarked against this table, but it's the closest currently-selectable configuration to what these numbers measured.
-- **rpc is the slowest path across the board** — `collective_rpc` serializes the tensor through Python/IPC, and the cost grows with the captured-layer count. Avoid rpc when artifacts are large; use disk.
-- **`shm` is no longer competitive** post-refactor even at `last_token`. The legacy fast-path is kept for back-compat but the disk-st variant (measured under the old async-save path) beat it on every measured cell.
