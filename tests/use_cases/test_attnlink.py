@@ -9,7 +9,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
+
+# `mia` reaches `from vllm import LLM` via mia/llm.py, so guard the optional dependency here
+# rather than letting a missing vLLM ERROR collection for the whole suite.
+pytest.importorskip("vllm")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
 from demo_attnlink import INPUT_SEQ, evaluate_ranking, prepare_prompt
