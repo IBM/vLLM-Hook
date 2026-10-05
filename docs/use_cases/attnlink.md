@@ -19,13 +19,15 @@ primarily for supplying a local copy of this checkpoint.
 
 ## Quick start
 
-Install vLLM-Hook as described in the repository README. From the repository root:
+Install MIA as described in the repository README. From the repository root:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python examples/demo_attnlink.py
 ```
 
-The model is downloaded on first use. To use local weights and a named output directory:
+The demo runs offline (`MiaLLM`); its `vllm serve` version is kept as a commented block at the
+end of the file. The model is downloaded on first use. To use local weights and a named output
+directory:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python examples/demo_attnlink.py \
@@ -48,7 +50,7 @@ python examples/demo_attnlink.py --temperature 1.0 --top-p 0.9
 
 ## How it integrates
 
-The demo reuses the unmodified `probe_hook_qk` worker and registers
+The demo reuses the unmodified `capture_qk` worker and registers
 `AttnLinkAnalyzer` as `attnlink`. The model config requests the last-token Q and
 full prompt K for layer 22. The worker captures the layer's QK; the analyzer
 selects head 12 and its corresponding grouped-query attention K head.
@@ -105,12 +107,11 @@ and the existing upstream QK loading utilities. To explore other settings after
 one inference, reuse the scores without running the model again:
 
 ```python
-from vllm_hook_plugins.analyzers.attnlink_analyzer import select_columns
+from mia.analyzers.attnlink_analyzer import select_columns
 selection = select_columns(result["scores"], temperature=1.0, top_p=0.9)
 ```
 
-This small example handles **one prompt, one layer/head, one GPU**, with eager
-execution, prefix caching disabled and chunked prefill disabled. Generation uses
+This small example handles **one prompt, one layer/head, one GPU**. Generation uses
 `max_tokens=1` to complete the vLLM request; only prefill QK is analyzed. It does
 not modify workers, serving infrastructure or model weights. Missing captures,
 incomplete prompt keys and invalid spans raise errors rather than returning a
@@ -155,10 +156,9 @@ With temperature fixed at 1.0, the same scores illustrate the trade-off:
 | **0.80** | **8** | **100%** | **62.50%** |
 | 0.90 | 14 | 100% | 35.71% |
 
-Tested on an NVIDIA H100 80GB using bfloat16, `gpu_memory_utilization=0.5`,
-vLLM `0.21.1.dev0+gad7125a43.d20260627.cu128`, PyTorch `2.11.0+cu128`,
-Transformers `5.12.0`, and the stock QK worker from vLLM-Hook baseline
-`e3d6885899264c81ac61c403c8b56efaf5a02dab` (package version `0.2.0`).
+Validated on this tree (vLLM `0.29.0`, PyTorch `2.13.0`, Transformers `5.17.0`,
+H100 80GB, bfloat16) under the default CUDA graphs: the same 8 columns at `top_p=0.80`,
+recall 100%, precision 62.50%, AP 1.0. For bit-exact attention, pass `enforce_eager=True`.
 
 CPU checks can be run without a model download:
 

@@ -1,15 +1,21 @@
-# 🪝 vLLM.hook
+# 🪝 vLLM-Hook MIA
 *A modular plugin library for vLLM.*
 
 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
-vLLM.hook is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
+MIA is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
 
 This includes dynamic analysis of:  
 - attention patterns  
 - attention heads  
 - activations  
 - custom intervention behaviors  
+
+MIA is vLLM-Hook for vLLM 0.29 and its V2 model runner, under CUDA graphs by default. Two ways to run it:
+- **`MiaLLM`** (offline): builds the vLLM engine in your own Python process; for scripts, notebooks and batch jobs.
+- **`vllm serve` + `MiaClient`** (served): MIA runs inside the vLLM server; for serving, or several clients sharing one engine.
+
+New here? Start with the [Quickstart](#-quickstart).
 
 ---
 
@@ -23,11 +29,14 @@ This includes dynamic analysis of:
 
 ## 🚀 Features
 
-- **Model-agnostic plugin system** for vLLM engines  
+- **Plugin for vLLM engines** — decoder models laid out like Llama, Qwen, Mistral, Granite, Phi-3,
+  GPT-2 or OPT ([supported models](docs/configs.md#supported-models))  
 - **Extensible worker/analyzer abstraction**  
-  - Easy to define new hooks, analyzers, and behaviors  
+  - Easy to add analyzers ([adding a worker or analyzer](#adding-a-worker-or-analyzer))  
 - **Introspection** of model internals  
-- **Interventions** (activation steering, attention control, etc.)  
+- **Interventions** (activation steering)  
+- **CUDA graphs by default** — capture and steering keep the engine's CUDA graphs
+  ([limits](docs/configs.md#limits))  
 - **Example applications**:  
   - Safety guardrails  
   - Reranking  
@@ -35,91 +44,224 @@ This includes dynamic analysis of:
 
 ---
 
-## 📊 Performance Analysis
+## 📊 Performance
 
-For a detailed benchmark comparing **vLLM-Hook** against **Native vLLM Eagle** (`ExampleHiddenStatesConnector`) for hidden state extraction, see [`docs/numerical_analysis/`](docs/numerical_analysis/README.md).
+Capture and steering cost a few percent of decode throughput and keep the engine's CUDA graphs.
+Measured on vLLM 0.29.0 + the V2 runner, server path, K=3 median, against the native vLLM tier of
+the same launch (TPOT overhead):
 
-Key takeaways:
-- vLLM-Hook (`last_token`) offers significantly lower and prompt-length-invariant latency when only the final-position representation is needed
-- vLLM-Hook (`all_tokens`) is numerically equivalent to Native Eagle while avoiding its GPU memory overhead
-- Native Eagle requires loading a speculative decoding drafter model, reducing available KV cache
+| req/s | 1 | 4 | 8 | 16 |
+|---|---|---|---|---|
+| Hidden states | +4.9 % | +6.1 % | +6.4 % | +5.8 % |
+| Q/K | +6.7 % | +8.3 % | +8.4 % | +7.9 % |
+| Steering | +3.9 % | +4.1 % | +3.7 % | +5.6 % |
+
+Capture saturates at rate 32; steering holds to 64 (+5.2 %).
 
 ---
 
 ## 🧩 Supported Configurations
 
-Each use case (e.g. attention tracker, activation steering, hidden states extraction, etc) runs across a Cartesian product of configuration axes — execution path (`offline` / `vllm serve`), storage (`rpc` / `disk` / `shm`), disk format (`pt` / `safetensors`), and save mode (`sync` / `async`). See [`docs/configs.md`](docs/configs.md) for code snippets showing how to select each config.
+MIA runs in your own process (`MiaLLM`) and on the server path (`vllm serve` + `MiaClient`),
+under CUDA graphs. Each capture use case (attention tracker, hidden-state extraction, …) runs with
+either storage (`rpc` / `disk`) and disk format (`pt` / `safetensors`); CoRe is disk-only, and
+steering writes no artifact. See [`docs/configs.md`](docs/configs.md) for code snippets showing
+how to select each config.
+
+MIA requires vLLM's **V2 model runner** and runs every worker under CUDA graphs by default:
+
+- default `cudagraph_mode` is `FULL_AND_PIECEWISE`: FULL graphs for decode, piecewise graphs for
+  mixed steps;
+- `FULL_DECODE_ONLY` is accepted, and is used when the compilation mode is not the default or
+  `TORCH_COMPILE_DISABLE=1` is set;
+- `FULL` is accepted with a warning: it can compute wrong attention on FlashAttention 3 (vLLM 0.29);
+- `enforce_eager=True` (`vllm serve --enforce-eager`) opts out; `PIECEWISE` alone is refused.
+
+Tensor parallelism (TP > 1) is supported for `capture_hs`, `capture_qk` and `steer`: each capturing
+rank writes its own `tp_rank_<r>/` directory and MIA's loaders merge them. Pipeline parallelism is
+not supported, and Q/K `score` capture requires TP = 1.
 
 ---
 
 ## 📦 Installation
+
+**Requirements**
+- Linux and an NVIDIA GPU with a CUDA 13 driver; validated on an H100 80 GB.
+- Python 3.11–3.14; validated on 3.12.
+- About 12 GB for the environment, plus the models, downloaded on first use (the hidden-state,
+  steering, attention-tracker and capture-aperture demos need about 33 GB).
+- GPU memory: capture keeps a 4 GiB buffer outside vLLM's `gpu_memory_utilization` share. The demos
+  use 0.7 and models up to 8B (a 40 GB card or larger); on a smaller card lower
+  `gpu_memory_utilization` (`--gpu-memory-utilization` on a server) or set `MIA_APERTURE_GPU_BYTES`
+  ([sizing](docs/configs.md#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)).
+- Gated models (Llama, Mistral) need `hf auth login`.
+
 ### 1. Clone the repository
 
 ```bash
 git clone https://github.com/IBM/vLLM-Hook.git
-cd vLLM-Hook
+cd ./vLLM-Hook
 ```
 
-### 2. (Optional) Create an environment 
+### 2. Create an environment and install
+
+MIA is validated on **vLLM 0.29.0 with torch 2.13.0**:
 
 ```bash
-conda create -n vllm_hook_env python=3.12 pip
-conda activate vllm_hook_env
+conda create -n vllm-hook-mia python=3.12 pip
+conda activate vllm-hook-mia
+pip install -r requirement.txt    # vLLM 0.29.0, torch 2.13.0 and the other validated versions
+pip uninstall -y torchcodec       # vLLM's audio/video decoder; MIA does not use it
+pip install -e . --no-deps        # the plugin itself, from the repo root
+pip install pytest                # for the check below
 ```
 
-### 3. Install the plugin and dependencies
+Versions match [`requirement.txt`](requirement.txt). `pip check` flags the removed `torchcodec`; that is expected.
+
+MIA registers itself as a vLLM plugin, so every vLLM engine in this environment loads it: without
+`MIA_WORKER` it installs the hidden-state capture worker (and its 4 GiB GPU buffer) in every
+engine. Keep a dedicated environment; set `VLLM_PLUGINS=''` to run stock vLLM in it.
+
+### 3. Check the install
+
+Needs a GPU — the use-case tests boot a real engine for each test model
+([`tests/README.md`](tests/README.md)):
 
 ```bash
-pip install -r requirement.txt
-pip install -e vllm_hook_plugins
+pytest tests/use_cases -m gpu
 ```
 
 ---
 
-## 📕 Notebook Setup 
+## ⚡ Quickstart
 
-If you plan to use the notebooks under `notebooks/`, you may need to register your environment as a Jupyter kernel:
+Run these from the repo root (the configs name repo-relative steering vectors).
+
+**Capture hidden states, offline:**
+
+```python
+import multiprocessing as mp
+import os
+
+from vllm import SamplingParams
+
+from mia import MiaLLM
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    llm = MiaLLM(model="Qwen/Qwen2-1.5B-Instruct", worker_name="capture_hs",
+                 analyzer_name="hidden_states",
+                 config_file="model_configs/hidden_states/Qwen2-1.5B-Instruct.json",
+                 gpu_memory_utilization=0.7, max_model_len=2048)
+    out = llm.generate("The capital of France is", SamplingParams(temperature=0.0, max_tokens=10))
+    stats = llm.analyze(analyzer_spec={"reduce": "none"}, probes=out[0].probes)
+    for layer, tensors in sorted(stats["hidden_states"].items()):
+        print(layer, tuple(tensors[0].shape))
+    llm.llm_engine.engine_core.shutdown()
+```
+
+**Steer, offline:**
+
+```python
+import multiprocessing as mp
+import os
+
+from vllm import SamplingParams
+
+from mia import MiaLLM
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    llm = MiaLLM(model="microsoft/Phi-3-mini-4k-instruct", worker_name="steer",
+                 config_file="model_configs/activation_steer/Phi-3-mini-4k-instruct.json",
+                 gpu_memory_utilization=0.7, max_model_len=4096)
+    steer = {"method": "add_vector", "coefficient": 10}   # overrides the config's steering keys
+    sp = SamplingParams(temperature=0.0, max_tokens=100, extra_args={"steer": steer})
+    print(llm.generate("Write three bullet points about tea.", sp)[0].outputs[0].text)
+    llm.llm_engine.engine_core.shutdown()
+```
+
+**Served:** start the server in one shell and wait for `Application startup complete.` (about a
+minute); run the client in a second shell; stop the server with Ctrl-C.
 
 ```bash
-pip install ipykernel
-python -m ipykernel install --user --name vllm_hook_env --display-name "vllm_hook_env"
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+    vllm serve Qwen/Qwen2-1.5B-Instruct \
+    --max-model-len 2048 --port 8770 --gpu-memory-utilization 0.8
 ```
 
-Then inside Jupyter Lab:
+```python
+from mia import MiaClient
 
+client = MiaClient(base_url="http://localhost:8770/v1", analyzer_name="hidden_states",
+                   config_file="model_configs/hidden_states/Qwen2-1.5B-Instruct.json")
+client.generate(messages=[{"role": "user", "content": "The capital of France is"}],
+                model="Qwen/Qwen2-1.5B-Instruct", max_tokens=10, temperature=0.0)
+stats = client.analyze(analyzer_spec={"reduce": "none"})
+for layer, tensors in sorted(stats["hidden_states"].items()):
+    print(layer, tuple(tensors[0].shape))
 ```
-Kernel → Change Kernel → vllm_hook_env
+
+Steering over `vllm serve` needs only the `openai` client; the steer config travels JSON-encoded:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+    vllm serve microsoft/Phi-3-mini-4k-instruct --max-model-len 4096 --port 8770
 ```
+
+```python
+import json
+
+import openai
+
+with open("model_configs/activation_steer/Phi-3-mini-4k-instruct.json") as f:
+    steer = {**json.load(f)["steering"], "method": "add_vector", "coefficient": 10}
+client = openai.OpenAI(base_url="http://localhost:8770/v1", api_key="EMPTY")
+response = client.chat.completions.create(
+    model="microsoft/Phi-3-mini-4k-instruct", max_tokens=100, temperature=0.0,
+    messages=[{"role": "user", "content": "Write three bullet points about tea."}],
+    extra_body={"vllm_xargs": {"steer": json.dumps(steer)}})
+print(response.choices[0].message.content)
+```
+
+Next: [`examples/README.md`](examples/README.md) (where data lands, configs, server mode) and
+[`docs/configs.md`](docs/configs.md) (every config key, per-request argument and env var).
 
 ---
 
-## 👉 Usage Examples (Notebook / CLI)
+## 👉 Usage
 
-You can also use the included **`examples/`** and/or **`notebooks/`** directories to explore different functionalities. For the full list of use cases, see [`docs/use_cases/`](docs/use_cases/README.md).
+Every demo runs offline: it builds a `MiaLLM` engine in your process, captures or steers, and
+reads the data back. From the repo root:
 
-### 1. Attention Tracker (In-Model Safety Guardrail)
-
-Notebook 📓: `notebooks/demo_attntracker.ipynb` <br />
-CLI 🧰 : 
 ```bash
-python examples/demo_attntracker.py
+python examples/demo_hiddenstate.py
 ```
 
-### 2. Core Reranker (In-Model Relevance Ranking)
+Each other demo (bar `demo_capture_aperture.py`) also keeps its `vllm serve` version as a
+commented block, with the server command to start; `examples/demo_actsteer_serve.py` is the server example
+([server mode](examples/README.md#8-server-mode)). [`examples/README.md`](examples/README.md) is
+the walkthrough — getting started,
+[where captured data lands](examples/README.md#where-the-captured-data-goes), how to confirm a
+capture actually happened, and tensor parallelism.
+For the full list of use cases see [`docs/use_cases/`](docs/use_cases/README.md).
 
-Notebook 📓: `notebooks/demo_corer.ipynb` <br />
-CLI 🧰 : 
-```bash
-python examples/demo_corer.py
-```
+### Use cases
 
-### 3. Activation Steering (Enhanced instruction following via activation steering)
+| Use case | Demo |
+|---|---|
+| Attention Tracker (in-model safety guardrail) | `python examples/demo_attntracker.py` |
+| Core Reranker (in-model relevance ranking) | `python examples/demo_corer.py` |
+| Activation Steering (enhanced instruction following) | `python examples/demo_actsteer.py` |
+| Hidden-State Probe | `python examples/demo_hiddenstate.py` |
+| Science Hallucination Detector | `python examples/demo_scihal.py` |
+| H-Node Hallucination Detector | `python examples/demo_halludetect.py` |
+| AttnLink-U (schema linking) | `python examples/demo_attnlink.py` |
 
-Notebook 📓: `notebooks/demo_actsteer.ipynb` <br />
-CLI 🧰 : 
-```bash
-python examples/demo_actsteer.py
-```
+More demos (language steering, the server-only steering example, the capture-aperture checks,
+long decodes): [examples/README.md](examples/README.md#7-running-the-included-demos).
 
 You can customize model configurations in the `model_configs/` folder, e.g.:
 
@@ -135,14 +277,19 @@ For example `model_configs/attention_tracker/granite-3.1-8b-instruct.json`.
 The main package is structured as follows:
 
 ```
-vllm_hook_plugins/
+mia/
 ├── analyzers/
 │   ├── attention_tracker_analyzer.py
 │   ├── core_reranker_analyzer.py
 ├── workers/
-│   ├── probe_hookqk_worker.py
-│   ├── steer_activation_worker.py
-├── hook_llm.py
+│   ├── qk_capture_worker.py
+│   ├── steer_worker.py
+├── graph/
+│   ├── install.py
+│   ├── capture_aperture.py
+├── llm.py
+├── runner.py
+├── optimizations.py
 ├── registry.py
 ```
 
@@ -151,6 +298,9 @@ Each component handles a key stage of the plugin lifecycle:
 - **Registry** — manages available hooks and extensions  
 - **Workers** — define execution behavior and orchestration  
 - **Analyzers** — optionally conduct analysis based on the saved statistics  
+- **Graph** — installs the capture/steering ops and the GPU capture aperture under CUDA graphs  
+- **Runner** — the one place that touches vLLM's V2 model-runner internals  
+- **Optimizations** — the public performance levers (`optimizations.py::PUBLIC_LEVERS`)  
 
 
 ---
@@ -167,9 +317,19 @@ We welcome contributions from the community!
 5. **Open a Pull Request**  
 
 ### Guidelines:
-- Users are encouraged to define new worker/analyzer, but should not touch hook_llm
+- New analyzers and workers are welcome; discuss before modifying `mia/llm.py`, `mia/_plugin.py`, `mia/client.py` or `mia/graph/`
 - Include examples and documentation for new features  
 - New use cases must be added to [`docs/use_cases/README.md`](docs/use_cases/README.md) with the contributor's GitHub handle
+
+### Adding a worker or analyzer
+
+- **Analyzer:** a class with `__init__(hook_dir, layer_to_heads)` and
+  `analyze(analyzer_spec, run_id=None, probes=None)`; register it with
+  `PluginRegistry.register_analyzer("name", Cls)` and pass `analyzer_name="name"`.
+  `mia/analyzers/hidden_states_analyzer.py` is the smallest example.
+- **Worker:** MIA's three workers each bake their own op into the CUDA graph. A new worker class
+  installs forward hooks, which only run in eager mode: build its engine with
+  `enforce_eager=True` (`--enforce-eager`).
 
 ---
 
@@ -187,6 +347,6 @@ We welcome contributions from the community!
 
 ## IBM ❤️ Open Source AI
 
-vLLM.hook has been started by IBM Research.
+MIA is built on vLLM.hook, which was started by IBM Research.
 - Built for the **vLLM** ecosystem  
-- Inspired by community efforts to make LLMs more interpretable and controllable  
+- Inspired by community efforts to make LLMs more interpretable and controllable

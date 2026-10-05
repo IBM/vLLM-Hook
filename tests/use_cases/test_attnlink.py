@@ -1,4 +1,4 @@
-"""CPU checks; run directly with Python or through the repository's pytest suite."""
+"""AttnLink analyzer and demo helpers on CPU; runs under pytest or directly with Python."""
 import copy
 import hashlib
 import math
@@ -9,11 +9,15 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))
-from demo_attnlink import INPUT_SEQ, evaluate_ranking, prepare_prompt
-from vllm_hook_plugins.analyzers.attnlink_analyzer import AttnLinkAnalyzer, select_columns
+pytest.importorskip("vllm")  # `import mia` pulls in vLLM; skip, never error the whole collection
+
+from mia.analyzers.attnlink_analyzer import AttnLinkAnalyzer, select_columns
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples"))  # for a direct run
+from demo_attnlink import INPUT_SEQ, evaluate_ranking, prepare_prompt  # noqa: E402
 
 
 class CharacterTokenizer:
@@ -44,8 +48,7 @@ class TestAttnLink(unittest.TestCase):
 
     def test_gqa_full_softmax_and_mean_pooling(self):
         result = self.analyzer.analyze(self.spec, probes=self.capture)
-        # Full probabilities: [0.1, 0.2, 0.4, 0.1, 0.2]. Candidate-only
-        # normalization and span-sum pooling both give different results.
+        # Full softmax is [0.1, 0.2, 0.4, 0.1, 0.2]; candidate-only softmax or span sums differ.
         torch.testing.assert_close(torch.tensor(result["scores"]), torch.tensor([0.3, 0.2]))
         self.assertEqual(result["ranking"], [0, 1])
 
@@ -55,7 +58,7 @@ class TestAttnLink(unittest.TestCase):
         entry["q"] = list(entry["q"].unbind(0))
         entry["k_all"] = list(entry["k_all"].unbind(0))
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
-                "VLLM_HOOK_USE_SAFETENSORS": "0", "VLLM_HOOK_ASYNC_SAVE": "0"}):
+                "MIA_USE_SAFETENSORS": "0"}):
             run = Path(folder) / "test_run"
             run.mkdir()
             torch.save(disk, run / "qk.pt")

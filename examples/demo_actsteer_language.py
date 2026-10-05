@@ -1,89 +1,114 @@
-import os
-import sys
+"""Language steering: the same prompt answered in another language.
+
+Runs offline with `MiaLLM`. Each request carries its own steer config in
+``SamplingParams.extra_args["steer"]``, so one engine serves the unsteered answer and both steered
+ones. The same demo over `vllm serve` is kept, commented out, at the end.
+"""
 import json
 import multiprocessing as mp
-import torch
+import os
+import time
 
-mp.set_start_method("spawn", force=True)
-os.environ["VLLM_USE_V1"] = "1"
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-from vllm_hook_plugins import HookLLM
 from vllm import SamplingParams
 
-if __name__ == "__main__":
+from mia import MiaLLM
+from _paths import config_path
 
-    cache_dir = "./cache/"
-    model = 'microsoft/Phi-3-mini-4k-instruct'
-    
-    dtype_map = {
-        'microsoft/Phi-3-mini-4k-instruct': 'auto',
-        'mistralai/Mistral-7B-Instruct-v0.3': torch.float16,
-        'ibm-granite/granite-3.1-8b-instruct': torch.float16,
-        'Qwen/Qwen2-1.5B-Instruct': torch.float
-    }
+MODEL = "microsoft/Phi-3-mini-4k-instruct"   # the language vectors are Phi-3's
 
-    llm = HookLLM(
-        model=model,
-        worker_name="steer_hook_act",
-        config_file=f'model_configs/activation_steer/{model.split("/")[-1]}.json',
-        download_dir=cache_dir,
-        gpu_memory_utilization=0.7,
-        max_model_len=2048,
-        trust_remote_code=True,
-        dtype=dtype_map[model],
-        enforce_eager=True,
-        enable_prefix_caching=True,
-        enable_hook=True, 
-        tensor_parallel_size=1  # the number of gpus
-    )
-    
-    test_cases = [
-        "If a tree is on the top of a mountain and the mountain is far from the see then is the tree close to the sea?",
-        "Create a short, concise summary of the paper based on its abstract.\n\nFew-shot learning (FSL) is one of the key future steps in machine learning and raises a lot of attention. In this paper, we focus on the FSL problem of dialogue understanding, which contains two closely related tasks: intent detection and slot filling. Dialogue understanding has been proven to benefit a lot from jointly learning the two sub-tasks. However, such joint learning becomes challenging in the few-shot scenarios: on the one hand, the sparsity of samples greatly magnifies the difficulty of modeling the connection between the two tasks; on the other hand, how to jointly learn multiple tasks in the few-shot setting is still less investigated. In response to this, we introduce FewJoint, the first FSL benchmark for joint dialogue understanding. FewJoint provides a new corpus with 59 different dialogue domains from real industrial API and a code platform to ease FSL experiment set-up, which are expected to advance the research of this field. Further, we find that insufficient performance of the few-shot setting often leads to noisy sharing between two sub-task and disturbs joint learning. To tackle this, we guide slot with explicit intent information and propose a novel trust gating mechanism that blocks low-confidence intent information to ensure high quality sharing. Besides, we introduce a Reptile-based meta-learning strategy to achieve better generalization in unseen few-shot domains. In the experiments, the proposed method brings significant improvements on two datasets and achieve new state-of-the-art performance.",
-        "What is the difference between HTML and JavaScript?",
-        "Why might someone prefer to shop at a small, locally-owned business instead of a large chain store, even if the prices are higher?",
-        "What's the permission that allows creating provisioning profiles in Apple Developer account is called?",
-    ]
+LANGUAGE_CONFIGS = {
+    "Chinese": "activation_steer/Phi-3-mini-4k-instruct-chinese.json",
+    "Korean": "activation_steer/Phi-3-mini-4k-instruct-korean.json",
+}
 
-    # Per-request steering: compare Chinese and Korean steering on each prompt
-    config_paths = {
-        "Chinese": "model_configs/activation_steer/Phi-3-mini-4k-instruct-chinese.json",
-        "Korean": "model_configs/activation_steer/Phi-3-mini-4k-instruct-korean.json",
-    }
+PROMPTS = [
+    "If a tree is on the top of a mountain and the mountain is far from the see then is "
+    "the tree close to the sea?",
+    "What is the difference between HTML and JavaScript?",
+    "Why might someone prefer to shop at a small, locally-owned business instead of a "
+    "large chain store, even if the prices are higher?",
+    "What's the permission that allows creating provisioning profiles in Apple Developer "
+    "account is called?",
+]
 
-    sampling_params_by_language = {}
-    for language, config_path in config_paths.items():
-        with open(config_path) as f:
-            config = json.load(f)
-        sampling_params_by_language[language] = SamplingParams(
-            temperature=0.0,
-            max_tokens=2048,
-            stop_token_ids=[llm.tokenizer.eos_token_id, 32007],
-            extra_args={"steer": config["steering"]},
-        )
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=2048,
-        stop_token_ids=[llm.tokenizer.eos_token_id, 32007],
-    )
 
-    for case in test_cases:
+def steer_by_language():
+    """Each language's steering section, from its config file."""
+    out = {}
+    for language, rel in LANGUAGE_CONFIGS.items():
+        with open(config_path(rel)) as f:
+            out[language] = json.load(f)["steering"]
+    return out
+
+
+def main():
+    # Phi-3-mini-4k has a 4096-token context; 2048 output tokens do not fit under 2048.
+    llm = MiaLLM(model=MODEL, worker_name="steer", gpu_memory_utilization=0.7,
+                 max_model_len=4096)
+    steers = steer_by_language()
+
+    for prompt in PROMPTS:
         print("=" * 50)
-        prompt = case
         print(f"Original prompt: {prompt}")
-        messages = [{"role": "user", "content": prompt}]
-        example = llm.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        text = llm.tokenizer.apply_chat_template([{"role": "user", "content": prompt}],
+                                                 tokenize=False, add_generation_prompt=True)
 
-        for language, language_sampling_params in sampling_params_by_language.items():
-            output = llm.generate(example, language_sampling_params)
-            print(f"With {language} activation steering:")
-            print(output[0].outputs[0].text)
-            llm.llm_engine.reset_prefix_cache()
-        
-        llm.llm_engine.reset_prefix_cache()
-        output = llm.generate(example, sampling_params, use_hook=False)
-        print("Without activation steering:")
-        print(output[0].outputs[0].text)
-        llm.llm_engine.reset_prefix_cache()
+        for label, steer in [("unsteered", None)] + list(steers.items()):
+            sp = SamplingParams(max_tokens=2048, temperature=0.0,
+                                extra_args=None if steer is None else {"steer": steer})
+            t0 = time.time()
+            out = llm.generate(text, sp, use_hook=steer is not None)
+            elapsed = time.time() - t0
+            print(f"\n[{label}]")
+            print(out[0].outputs[0].text)
+            print(f"[evidence:{label}] {elapsed * 1000:.1f} ms for "
+                  f"{len(out[0].outputs[0].token_ids)} tokens")
 
+
+# --- Server mode ---------------------------------------------------------------------------
+# The same demo against `vllm serve`. Start the server in another terminal:
+#
+#   VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
+#       vllm serve microsoft/Phi-3-mini-4k-instruct \
+#       --max-model-len 4096 --port 8770
+#
+# then uncomment serve_main() and call it instead of main() at the bottom. Each request carries
+# its steer config in ``vllm_xargs["steer"]``, JSON-encoded because `vllm_xargs` only accepts
+# scalars.
+#
+# def serve_main():
+#     import openai
+#
+#     from _serve import STEER, base_url, print_evidence, require_server
+#
+#     require_server(MODEL, STEER, max_model_len=4096)
+#     client = openai.OpenAI(base_url=base_url(), api_key="EMPTY")
+#     steers = steer_by_language()
+#
+#     for prompt in PROMPTS:
+#         print("=" * 50)
+#         print(f"Original prompt: {prompt}")
+#
+#         for label, steer in [("unsteered", None)] + list(steers.items()):
+#             extra_body = (None if steer is None
+#                           else {"vllm_xargs": {"steer": json.dumps(steer)}})
+#             t0 = time.time()
+#             response = client.chat.completions.create(
+#                 model=MODEL,
+#                 messages=[{"role": "user", "content": prompt}],
+#                 max_tokens=2048,
+#                 temperature=0.0,
+#                 extra_body=extra_body,
+#             )
+#             elapsed = time.time() - t0
+#             print(f"\n[{label}]")
+#             print(response.choices[0].message.content)
+#             print_evidence(elapsed, response.usage.completion_tokens, label)
+# --- end of server mode ---
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    main()
+    # serve_main()  # server mode: see the block above

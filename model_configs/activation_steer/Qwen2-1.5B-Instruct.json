@@ -1,0 +1,14 @@
+{
+    "model_info": {
+        "name": "qwen2-1.5b-attn",
+        "model_id": "Qwen/Qwen2-1.5B-Instruct",
+        "note": "The config the activation-steering use-case test uses. Its vector is a random direction: it changes outputs but steers toward no behaviour."
+    },
+    "steering": {
+        "method": "add_vector",
+        "coefficient": 1.0,
+        "optimal_layer": 14,
+        "vector_path": "steering_vectors/qwen2_dummy.pt",
+        "apply_at_all_positions": true
+    }
+}
