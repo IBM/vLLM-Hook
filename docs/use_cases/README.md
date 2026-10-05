@@ -15,5 +15,6 @@ Each row maps a use case to its plugin code and the corresponding contributor.
 | [Token Highlighter](TokenHighlighter.md) | `highlighter_worker.py` | `highlighter_analyzer.py` | `demo_token_highlighter.py`, [`live_TH.ipynb`](../../notebooks/demo_token_highlighter/live_highlighter/live_TH.ipynb) | [@asanth7](https://github.com/asanth7) |
 | [H-Node Detector](hnode_detector.md) | `probe_hidden_states_worker.py` † | `hnode_hallucination_analyzer.py` | `demo_halludetect.py` | [@Samarpit-bhatia](https://github.com/Samarpit-bhatia) |
 | [AttnLink-U](attnlink.md) | `probe_hookqk_worker.py` † | `attnlink_analyzer.py` | `demo_attnlink.py` | [@Songjw133](https://github.com/Songjw133) |
+| [Tool-Call Risk Probe](tool_call_risk.md) | `probe_hidden_states_worker.py` † | `tool_call_risk_analyzer.py` | `demo_toolcallrisk.py` | [@rishabhsinha17](https://github.com/rishabhsinha17) |
 
 > † Reuses an existing worker.
