@@ -12,12 +12,13 @@ Two entry points:
 ```
 mia/
   __init__.py  llm.py  client.py  artifacts.py  optimizations.py
-  errors.py  registry.py  _plugin.py  _profiler.py
+  errors.py  registry.py  _profiler.py
   analyzers/    turn captured data into results
   workers/      vLLM worker extensions: capture and steer
   utils/        use-case helpers; wraps hnode/ (H-Node probe scorer)
   core/         capture and steering engine
     runner.py   the only module touching vLLM runner internals
+    _plugin.py  vLLM plugin entry point (`mia.core._plugin:register`)
     hooks/      arm the hooks, bake the in-graph ops
     aperture/   fixed GPU capture aperture, drains, sinks
     delivery/   get a finished artifact to the caller
@@ -35,7 +36,6 @@ mia/
 | `optimizations.py` | the public optimization levers, set from env or a config file |
 | `errors.py` | deliberate refusal errors, never swallowed |
 | `registry.py` | registry of worker and analyzer plugins by name |
-| `_plugin.py` | vLLM plugin entry point: patches engine, runner and serve path |
 | `_profiler.py` | process-local profiler |
 
 ## analyzers/
@@ -67,6 +67,7 @@ mia/
 | Module | Role |
 |---|---|
 | `runner.py` | adapter isolating every vLLM V2 model-runner access |
+| `_plugin.py` | vLLM plugin entry point: patches engine, runner and serve path; registered in `setup.py` as `mia.core._plugin:register` |
 
 ## core/hooks/
 
@@ -125,3 +126,5 @@ mia/
 ## Import-time rule
 
 - Every `__init__.py` under `core/` is docstring-only, because modules under `core/hooks/` read `MIA_*` env at import, and a bare `import mia` must not reach `core/hooks/`.
+- `core/_plugin.py` is loaded lazily (`llm.py`) or by vLLM through the `vllm.general_plugins` entry point, never by `import mia`.
+- The entry point is `mia.core._plugin:register`. After pulling this layout, re-run `pip install -e . --no-deps`: an environment still holding the old entry point cannot load the plugin.

@@ -165,7 +165,7 @@ _DEFAULT_HOOK_DIR = "/dev/shm/mia"
 
 
 def _graph_mode() -> bool:
-    # lazy: graph install code (reads env at import) stays out of import mia._plugin
+    # lazy: graph install code (reads env at import) stays out of import mia.core._plugin
     from mia.core.hooks.install import graph_mode_enabled
     return graph_mode_enabled()
 
@@ -253,7 +253,7 @@ def _sample_cached(output, sample, n: int):
 
 def _hybrid_marker(output, extra: dict, explicit_save, gen_counts: dict, nonce=None,
                    key=None, cached_counts=None) -> dict:
-    # lazy: graph install code (reads env at import) stays out of import mia._plugin
+    # lazy: graph install code (reads env at import) stays out of import mia.core._plugin
     from mia.core.hooks.install_hs import DEFAULT_HOOKS_ON, DEFAULT_HS_MODE
     outs = list(getattr(output, "outputs", None) or [])
     n = max(len(outs), 1)
@@ -897,7 +897,7 @@ def _mia_source_id() -> str:
     except Exception:  # noqa: BLE001
         pass
     try:
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         sha = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, timeout=5)
         if sha.returncode == 0:
@@ -1172,7 +1172,7 @@ def _disable_dynamo_for_eager_hooks() -> None:
     _MIA_DYNAMO_WRITE = (prev, True)
 
 
-_MIA_PKG_DIR = str(Path(__file__).resolve().parent)
+_MIA_PKG_DIR = str(Path(__file__).resolve().parents[1])
 
 
 def _capture_mode_line(mode: CaptureMode, engine_args, cg_explicit: bool = False,
@@ -1225,7 +1225,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
         _drop_inherited_delivery()
     mode = resolve_capture_mode(self, os.environ, _ENGINE_HINTS.get(), kind=_wkind)
     graph_mode = mode.graph
-    # lazy: graph install code (reads env at import) stays out of import mia._plugin
+    # lazy: graph install code (reads env at import) stays out of import mia.core._plugin
     from mia.core.hooks.install import set_graph_mode
     set_graph_mode(graph_mode)
     if mode.engine_eager:
@@ -2147,7 +2147,7 @@ def _deliver_offline(llm, outputs, engine_ids: dict) -> set:
     info = _offline_delivery_info(llm)
     if not info.get("roots"):
         return set()
-    # lazy: graph install code stays out of import mia._plugin; readers patchable at call time
+    # lazy: graph install code stays out of import mia.core._plugin; readers patchable at call time
     from mia.core.aperture.aperture_gather import GatherError, load_delivered, wait_delivered
     from mia.core.delivery.delivered_probes import hs_probes
     from mia.core.hooks.install_hs import DEFAULT_HOOKS_ON, DEFAULT_HS_MODE

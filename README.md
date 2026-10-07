@@ -332,7 +332,7 @@ We welcome contributions from the community!
 5. **Open a Pull Request**  
 
 ### Guidelines:
-- New analyzers and workers are welcome; discuss before modifying `mia/llm.py`, `mia/_plugin.py`, `mia/client.py` or `mia/core/`
+- New analyzers and workers are welcome; discuss before modifying `mia/llm.py`, `mia/core/_plugin.py`, `mia/client.py` or `mia/core/`
 - Include examples and documentation for new features  
 - New use cases must be added to [`docs/use_cases/README.md`](docs/use_cases/README.md) with the contributor's GitHub handle
 

@@ -9,7 +9,7 @@ setup(
     entry_points={
         "vllm.general_plugins": [
             "mia_registry = mia:register_plugins",
-            "mia = mia._plugin:register",
+            "mia = mia.core._plugin:register",
         ],
     },
     python_requires=">=3.11,<3.15",

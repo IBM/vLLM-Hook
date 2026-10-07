@@ -136,8 +136,8 @@ class MiaLLM:
         llm_kwargs = dict(vllm_kwargs)
         if download_dir is not None:
             llm_kwargs['download_dir'] = download_dir
-        # lazy: keep mia._plugin and mia.core.hooks out of import mia
-        from mia._plugin import engine_hints
+        # lazy: keep mia.core._plugin and mia.core.hooks out of import mia
+        from mia.core._plugin import engine_hints
         with engine_hints(qk_score=self._qk_capture == "score"):
             self.llm = LLM(
                 model=model,
@@ -261,8 +261,8 @@ class MiaLLM:
             return
         if self._model_dims is None:
             return
-        # lazy: keep mia._plugin and mia.core.hooks out of import mia
-        from mia._plugin import _engine_graph, _engine_tp_size
+        # lazy: keep mia.core._plugin and mia.core.hooks out of import mia
+        from mia.core._plugin import _engine_graph, _engine_tp_size
         if _engine_tp_size(self.llm) > 1 or _engine_graph(self.llm):
             return
         prompt_len = self._prompt_token_len(prompt)

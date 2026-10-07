@@ -24,7 +24,7 @@ TRIM_ENV = "MIA_APERTURE_GATHER_TRIM"
 MMAP_ENV = "MIA_APERTURE_MMAP"
 WRITE_MODE_ENV = "MIA_APERTURE_WRITE_MODE"
 
-# A literal, not an import: mia._plugin is mid-import when apply() runs.
+# A literal, not an import: mia.core._plugin is mid-import when apply() runs.
 HS_WORKER = "hidden_states"
 
 DEFAULT_FLUSH_MS = 200

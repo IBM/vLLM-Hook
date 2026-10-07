@@ -359,8 +359,8 @@ def qk_probes(payload: dict, *, n_prompt: int, n_gen: int, hookq_mode: Optional[
                            "layer_num": layer, "hookq_mode": mode}
     if layout == "disk":
         return {"config": conf, "qk_cache": cache}
-    # lazy: import cycle (mia._plugin imports this module)
-    from mia._plugin import _reconstruct_compact_qk
+    # lazy: import cycle (mia.core._plugin imports this module)
+    from mia.core._plugin import _reconstruct_compact_qk
 
     probes = {"qk_cache": cache, "config": conf}
     _reconstruct_compact_qk(probes)
