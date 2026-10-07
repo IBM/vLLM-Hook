@@ -15,7 +15,7 @@ mia/
   errors.py  registry.py  _plugin.py  _profiler.py
   analyzers/    turn captured data into results
   workers/      vLLM worker extensions: capture and steer
-  probes/hnode/ trained-probe scoring
+  utils/        use-case helpers; wraps hnode/ (H-Node probe scorer)
   core/         capture and steering engine
     runner.py   the only module touching vLLM runner internals
     hooks/      arm the hooks, bake the in-graph ops
@@ -54,11 +54,13 @@ mia/
 | `steer_worker.py` | activation steering: eager hooks and the CUDA-graph buffer path |
 | `_common.py` | stateless helpers shared by the capture workers |
 
-## probes/hnode/
+## utils/
+
+`utils/` holds helpers tied to one use case, not shared engine code. It currently wraps `hnode/`; new use-case helpers get their own subfolder here.
 
 | Module | Role |
 |---|---|
-| `__init__.py`, `score.py` | H-Node hallucination probe: numpy-only scorer for a trained probe |
+| `hnode/__init__.py`, `hnode/score.py` | H-Node hallucination probe: numpy-only scorer for a trained probe |
 
 ## core/
 
@@ -123,4 +125,3 @@ mia/
 ## Import-time rule
 
 - Every `__init__.py` under `core/` is docstring-only, because modules under `core/hooks/` read `MIA_*` env at import, and a bare `import mia` must not reach `core/hooks/`.
-- `probes/` holds probe scoring code and is unrelated to the `probes` field on `MiaLLM`/`MiaClient` outputs.

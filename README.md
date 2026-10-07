@@ -292,7 +292,7 @@ mia/
 │   ├── aperture/     (capture_aperture.py, aperture_gather.py)
 │   ├── delivery/     (delivery_router.py, artifact_writer.py)
 │   ├── runtime/      (tp_shard.py)
-├── probes/
+├── utils/
 │   ├── hnode/
 ├── artifacts.py
 ├── client.py
@@ -311,7 +311,7 @@ Each component handles a key stage of the plugin lifecycle:
   - `aperture/` — the GPU capture aperture under CUDA graphs  
   - `delivery/` — routes, writes and delivers captured artifacts  
   - `runtime/` — CPU budget, child-process, device and TP-shard helpers  
-- **Probes** — use-case probes that score captured activations  
+- **Utils** — use-case helpers; wraps `hnode/`, the H-Node probe scorer  
 - **Runner** — `mia/core/runner.py`, the one place that touches vLLM's V2 model-runner internals  
 - **Optimizations** — the public performance levers (`optimizations.py::PUBLIC_LEVERS`)  
 

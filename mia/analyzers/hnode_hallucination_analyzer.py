@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import torch
 
 from mia.artifacts import load_and_merge_hs_cache, unpack_hidden_states
-from mia.probes.hnode.score import HNodeProbe
+from mia.utils.hnode.score import HNodeProbe
 
 
 class HNodeHallucinationAnalyzer:
