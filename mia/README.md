@@ -96,7 +96,7 @@ mia/
 
 | Module | Role |
 |---|---|
-| `delivery_selector.py`, `delivery_router.py`, `sizing.py` | pick the delivery path (hybrid default), the transport (RPC or disk), and the size prediction behind it |
+| `delivery_selector.py`, `delivery_router.py`, `sizing.py` | pick the transport (RPC or disk), and the size prediction behind it |
 | `per_request_delivery.py` | per-request demux, finish-tracking, assembly |
 | `offload_process.py`, `writer_process.py`, `server_analyze_process.py` | background processes: ship files to the client, write off the engine GIL, run server-side reduce |
 | `artifact_writer.py`, `run_artifact.py` | serialize and write artifacts; eager-format run artifacts |
