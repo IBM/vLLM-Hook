@@ -15,7 +15,7 @@ mia/
   errors.py  registry.py  _profiler.py
   analyzers/    turn captured data into results
   workers/      vLLM worker extensions: capture and steer
-  utils/        use-case helpers; wraps hnode/ (H-Node probe scorer)
+  utils/        use-case helpers
   core/         capture and steering engine
     runner.py   the only module touching vLLM runner internals
     _plugin.py  vLLM plugin entry point (`mia.core._plugin:register`)
@@ -34,7 +34,7 @@ mia/
 | `client.py` | `MiaClient`: probe capture and analysis against `vllm serve` |
 | `artifacts.py` | read captured artifacts back: unpack, merge TP shards, load a run, dispatch a disk analyze |
 | `optimizations.py` | the public optimization levers, set from env or a config file |
-| `errors.py` | deliberate refusal errors, never swallowed |
+| `errors.py` | deliberate refusal error |
 | `registry.py` | registry of worker and analyzer plugins by name |
 | `_profiler.py` | process-local profiler |
 
