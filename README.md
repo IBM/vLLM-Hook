@@ -3,7 +3,7 @@
 
 📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
-📄 [Preprint] [**MIA**: Runtime-Reconfigurable Access to Model Internals in LLM Inference Engines]([paper](docs/MIA_Arxiv_.pdf))
+📄 [Preprint] [**MIA**: Runtime-Reconfigurable Access to Model Internals in LLM Inference Engines]((docs/MIA_Arxiv_.pdf))
 
 MIA is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
 
