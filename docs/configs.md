@@ -351,19 +351,6 @@ hidden-state files. A served capture sent without `save_to_disk` may land in
 `<hook_dir>/<run_id>/` instead of on the response; `client.analyze()` reads it either way. An
 explicit `save_to_disk` is never overridden.
 
-## Limits
-
-- Graph-mode capture can move per-token logprobs slightly; `enforce_eager=True`
-  (`--enforce-eager`) is bit-exact. `MIA_ALLOW_CUDAGRAPH=0` selects eager for every engine in the
-  process, `vllm serve` included.
-- Q/K capture turns prefix caching off unless you set it.
-- Offline score capture, and Q/K with explicit prefix caching or DP > 1, run eager; a served score
-  request on a graph engine is refused (start the server with `--enforce-eager`).
-- Graph steering: at most `MIA_STEER_VMAX` (16) distinct vectors per engine; more are refused. The
-  table is sized at engine start (`MIA_STEER_VMAX × hidden_size`, 128 KiB at 16 × 4096 in bf16), not
-  from free GPU memory.
-- CoRe batch reranking (several cases in one `analyze`) fails when the cases' prompts differ in
-  length; rerank one case at a time, as `demo_corer.py` does.
 
 ## Tuning
 
