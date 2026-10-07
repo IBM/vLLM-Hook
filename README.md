@@ -37,8 +37,7 @@ New here? Start with the [Quickstart](#-quickstart).
   - Easy to add analyzers ([adding a worker or analyzer](#adding-a-worker-or-analyzer))  
 - **Introspection** of model internals  
 - **Interventions** (activation steering)  
-- **CUDA graphs by default** — capture and steering keep the engine's CUDA graphs
-  ([limits](docs/configs.md#limits))  
+- **CUDA graphs by default** — capture and steering keep the engine's CUDA graphs  
 - **Example applications**:  
   - Safety guardrails  
   - Reranking  
