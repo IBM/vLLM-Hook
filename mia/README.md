@@ -121,10 +121,3 @@ mia/
 
 - `llm` / `client` use `core`; `core` uses `vllm`.
 - `workers` and `analyzers` sit beside `core`: `core/hooks`, `core/aperture` and `core/delivery` import `mia.workers`, and `core/delivery` imports `mia.artifacts`.
-- `core/runner.py` is the only module that touches vLLM's V2 runner internals.
-
-## Import-time rule
-
-- Every `__init__.py` under `core/` is docstring-only, because modules under `core/hooks/` read `MIA_*` env at import, and a bare `import mia` must not reach `core/hooks/`.
-- `core/_plugin.py` is loaded lazily (`llm.py`) or by vLLM through the `vllm.general_plugins` entry point, never by `import mia`.
-- The entry point is `mia.core._plugin:register`. After pulling this layout, re-run `pip install -e . --no-deps`: an environment still holding the old entry point cannot load the plugin.
