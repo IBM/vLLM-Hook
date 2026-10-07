@@ -1,0 +1,14 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "granite3-8b-attn",
+        "model_id": "ibm-granite/granite-3.1-8b-instruct"
+    },
+    "steering": {
+        "method":"adjust_rs",
+        "coefficient": 1,
+        "optimal_layer": 15,
+        "vector_path": "steering_vectors/granite_format.pt",
+        "apply_at_all_positions": true
+    }
+}

@@ -138,7 +138,7 @@ Save it as `examples/my_demo.py` and run it from the repo root: `python examples
 and generate with `use_hook=False` for the unsteered run. See `demo_actsteer.py`.
 
 **Per-request knobs** that the config file does not cover go in `SamplingParams.extra_args`, e.g.
-`{"hooks_on": "both"}` (see `profiling_longdecode/`); the full list is in
+`{"hooks_on": "both"}` (see the [long-decode demos](../docs/numerical_analysis/README.md)); the full list is in
 [`docs/configs.md`](../docs/configs.md#per-request-arguments).
 
 ### Token-exact prompts
@@ -241,7 +241,7 @@ Run every demo from the repo root, e.g. `python examples/demo_hiddenstate.py`. A
 - **`MIA_DEMO_MODEL` / `MIA_CONFIG_FILE`** swap the model and config of `demo_hiddenstate.py`,
   `demo_actsteer.py`, `demo_attntracker.py` (granite, Mistral-7B or Qwen2-1.5B: it needs a
   token-range recipe per chat template), `demo_capture_aperture.py` and the two
-  `profiling_longdecode/` demos. The other demos are tied to their model. `demo_actsteer.py` on
+  long-decode demos in `docs/numerical_analysis/`. The other demos are tied to their model. `demo_actsteer.py` on
   another model needs your own steering config and vector: only Phi-3 ships a real one.
 - **`demo_actsteer_serve.py`** is server-only: start the server it prints, then run it
   ([Server mode](#8-server-mode)).
@@ -266,8 +266,8 @@ Run every demo from the repo root, e.g. `python examples/demo_hiddenstate.py`. A
   - Labels: 0 entailment, 1 contradiction, 2 unverifiable. Fit a scikit-learn
     `LogisticRegression`, save it with `joblib.dump`, and point `MIA_SCIHAL_CLF` (or
     `scihal.clf_path` in `model_configs/hidden_states/Llama-3.1-8B-Instruct.json`) at the file.
-- **`profiling_longdecode/`** holds long-decode variants of the Q/K and hidden-state demos; see
-  its [README](profiling_longdecode/README.md).
+- **Long-decode variants** of the Q/K and hidden-state demos are in
+  [`docs/numerical_analysis/`](../docs/numerical_analysis/README.md).
 
 ## 8. Server mode
 

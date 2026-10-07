@@ -29,8 +29,8 @@ New here? Start with the [Quickstart](#-quickstart).
 
 ## 🚀 Features
 
-- **Plugin for vLLM engines** — decoder models laid out like Llama, Qwen, Mistral, Granite, Phi-3,
-  GPT-2 or OPT ([supported models](docs/configs.md#supported-models))  
+- **Model-agnostic plugin system** for vLLM engines — no model files are rewritten
+  ([model compatibility](docs/configs.md#model-compatibility))  
 - **Extensible worker/analyzer abstraction**  
   - Easy to add analyzers ([adding a worker or analyzer](#adding-a-worker-or-analyzer))  
 - **Introspection** of model internals  
@@ -347,6 +347,6 @@ We welcome contributions from the community!
 
 ## IBM ❤️ Open Source AI
 
-MIA is built on vLLM.hook, which was started by IBM Research.
+vLLM-Hook MIA was started by IBM Research.
 - Built for the **vLLM** ecosystem  
 - Inspired by community efforts to make LLMs more interpretable and controllable

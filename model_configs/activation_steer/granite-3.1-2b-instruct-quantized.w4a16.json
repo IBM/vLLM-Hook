@@ -1,0 +1,15 @@
+{
+    "model_info": {
+        "provider": "attn-hf",
+        "name": "granite31-2b-quantized-attn",
+        "model_id": "RedHatAI/granite-3.1-2b-instruct-quantized.w4a16",
+        "note": "Temporary activation-steering config for the RedHatAI Granite 3.1 2B quantized checkpoint. This mirrors the existing Granite demo settings and should be treated as provisional until steering parameters are re-derived."
+    },
+    "steering": {
+        "method": "adjust_rs",
+        "coefficient": 1,
+        "optimal_layer": 15,
+        "vector_path": "steering_vectors/granite_format.pt",
+        "apply_at_all_positions": true
+    }
+}

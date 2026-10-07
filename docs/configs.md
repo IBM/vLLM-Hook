@@ -20,12 +20,12 @@ Disk writes go through a writer process (`MIA_WRITER_PROCESS`, default on).
 
 ---
 
-## Supported models
+## Model compatibility
 
-MIA finds decoder layers by module name, so it works with models whose vLLM implementation names
-them one of these ways:
+MIA does not rewrite model files: it finds decoder layers by module name, so it works with any model
+whose vLLM implementation names them one of these ways:
 
-| Module names | Models | Workers |
+| Module names | Examples | Workers |
 |---|---|---|
 | `model.layers.N` | Llama, Qwen, Mistral, Granite, Phi-3 and similar | all |
 | `transformer.h.N` | GPT-2 | all |
@@ -359,7 +359,9 @@ explicit `save_to_disk` is never overridden.
 - Q/K capture turns prefix caching off unless you set it.
 - Offline score capture, and Q/K with explicit prefix caching or DP > 1, run eager; a served score
   request on a graph engine is refused (start the server with `--enforce-eager`).
-- Graph steering: at most `MIA_STEER_VMAX` (16) distinct vectors per engine; more are refused.
+- Graph steering: at most `MIA_STEER_VMAX` (16) distinct vectors per engine; more are refused. The
+  table is sized at engine start (`MIA_STEER_VMAX × hidden_size`, 128 KiB at 16 × 4096 in bf16), not
+  from free GPU memory.
 - CoRe batch reranking (several cases in one `analyze`) fails when the cases' prompts differ in
   length; rerank one case at a time, as `demo_corer.py` does.
 

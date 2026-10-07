@@ -13,5 +13,9 @@ Each row maps a use case to its paper, its demo under `examples/`, the plugin na
 | Science Hallucination Detector | [Detecting Hallucinations in Scientific Claims by Combining Prompting Strategies and Internal State Classification](https://aclanthology.org/2025.sdp-1.30/) | `demo_scihal.py` | `science_hallucination` | `capture_hs` † | [@IRENEKO](https://github.com/IRENEKO) |
 | [H-Node Detector](hnode_detector.md) | [H-Node Attack and Defense in Large Language Models](https://arxiv.org/abs/2603.26045) | `demo_halludetect.py` | `hnode_hallucination` | `capture_hs` † | [@Samarpit-bhatia](https://github.com/Samarpit-bhatia) |
 | [AttnLink-U](attnlink.md) | [AttnLink: Turning Attention into Schema Links for Text-to-SQL](https://arxiv.org/abs/2608.00693) | `demo_attnlink.py` | `attnlink` | `capture_qk` † | [@Songjw133](https://github.com/Songjw133) |
+| [Spotlight](spotlight.md) | [Venkateswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/) | [`demo_spotlight.py`](https://github.com/IBM/vLLM-Hook/blob/v0.2.0/examples/demo_spotlight.py) | — | `probe_spotlight` ‡ | [@danishcontractor](https://github.com/danishcontractor) |
+| [Token Highlighter](TokenHighlighter.md) | [Token Highlighter: Inspecting and Mitigating Jailbreak Prompts for LLMs](https://arxiv.org/abs/2412.18171) | [`demo_token_highlighter.py`](https://github.com/IBM/vLLM-Hook/blob/v0.2.0/examples/demo_token_highlighter.py) | `token_highlighter` | `token_highlighter` ‡ | [@asanth7](https://github.com/asanth7) |
 
 > † Reuses an existing worker.
+>
+> ‡ Supported only on vLLM's V1 model runner (vLLM-Hook [v0.2.0](https://github.com/IBM/vLLM-Hook/tree/v0.2.0)); sunset in MIA.

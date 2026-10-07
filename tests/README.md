@@ -47,7 +47,7 @@ pytest "tests/use_cases/test_attntracker.py::test_attention_tracker[gpt2]" -vv
 
 - **Nothing captured** (`probes` is `None`, analyzer output empty): the engine log prints
   `no decoder layers matched` / `no attention modules matched` when the model's module names are
-  not ones MIA knows ([supported models](../docs/configs.md#supported-models)); in eager mode it
+  not ones MIA knows ([model compatibility](../docs/configs.md#model-compatibility)); in eager mode it
   prints `Installed 0 ... hooks`.
 - **`CUDA-capable device(s) is/are busy or unavailable`**: another process holds the GPU; see
   above.
