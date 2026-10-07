@@ -39,14 +39,14 @@ from vllm.v1.engine.core_client import InprocClient
 from mia import register_plugins
 from mia._profiler import PROF
 from mia.errors import MiaConfigurationError, MiaDeliveryError
-from mia.graph import (
-    aperture_gather as ag,
+from mia.core.aperture import aperture_gather as ag
+from mia.core.delivery import (
     delivery_selector as ds,
     disk_flush_probe as _dfp,
     run_artifact,
 )
-from mia.graph.aperture_reader import load_qk_aperture_tp
-from mia.graph.aperture_sizing import (
+from mia.core.aperture.aperture_reader import load_qk_aperture_tp
+from mia.core.aperture.aperture_sizing import (
     CAPTURE_SUBSYSTEMS,
     DEFAULT_AUTOCAP_HEADROOM_BYTES,
     DEFAULT_AUTOCAP_SAFETY,
@@ -59,14 +59,14 @@ from mia.graph.aperture_sizing import (
     resolve_aperture_bytes_auto,
     safe_cap_with_model_sized_aperture,
 )
-from mia.graph.delivered_probes import (
+from mia.core.delivery.delivered_probes import (
     DeliveryReadTimeout,
     qk_probes,
     response_id,
     serialize_probes as _serialize_probes,
     trim_probes as _trim_probes,
 )
-from mia.graph.delivery_route import (
+from mia.core.delivery.delivery_route import (
     _WRITE_POOL,
     await_turn,
     end_turn,
@@ -76,12 +76,12 @@ from mia.graph.delivery_route import (
     route_enabled,
     run_filter,
 )
-from mia.graph.delivery_router import RouteDecision, decide_route
-from mia.graph.delivery_selector import DP_SIZE_ENV, STAMP_ENV
-from mia.graph.run_artifact import artifact_wait_s
-from mia.graph.run_mode import DEFAULT_MIA_WORKER, capture_mode_from_env, parse_mia_worker_env
-from mia.graph.run_mode import MIA_WORKER_VALUES, UnknownMiaWorkerError  # noqa: F401  (re-exported)
-from mia.graph.tp_shard import (
+from mia.core.delivery.delivery_router import RouteDecision, decide_route
+from mia.core.delivery.delivery_selector import DP_SIZE_ENV, STAMP_ENV
+from mia.core.delivery.run_artifact import artifact_wait_s
+from mia.core.hooks.run_mode import DEFAULT_MIA_WORKER, capture_mode_from_env, parse_mia_worker_env
+from mia.core.hooks.run_mode import MIA_WORKER_VALUES, UnknownMiaWorkerError  # noqa: F401  (re-exported)
+from mia.core.runtime.tp_shard import (
     HS_ALL_RANKS_ENV,
     HS_LAYER_SHARD_RULE,
     HS_MODE_ALL_RANKS,
@@ -104,16 +104,16 @@ from mia.graph.tp_shard import (
 )
 from mia.optimizations import env_is_on
 from mia.registry import PluginRegistry
-from mia.run_utils import (
+from mia.core.delivery.sizing import (
     estimate_gen_len,
     predict_artifact_kb,
     predicted_rpc_ms,
     qk_score_size_select,
-    read_refused_qk,
     route_to_disk,
     rpc_disk_crossover_kb,
 )
-from mia.runner import UnsupportedRunnerError
+from mia.artifacts import read_refused_qk
+from mia.core.runner import UnsupportedRunnerError
 from mia.workers._common import match_internal_ids
 from mia.workers.steer_worker import (
     _effective_key,
@@ -166,7 +166,7 @@ _DEFAULT_HOOK_DIR = "/dev/shm/mia"
 
 def _graph_mode() -> bool:
     # lazy: graph install code (reads env at import) stays out of import mia._plugin
-    from mia.graph.install import graph_mode_enabled
+    from mia.core.hooks.install import graph_mode_enabled
     return graph_mode_enabled()
 
 
@@ -254,7 +254,7 @@ def _sample_cached(output, sample, n: int):
 def _hybrid_marker(output, extra: dict, explicit_save, gen_counts: dict, nonce=None,
                    key=None, cached_counts=None) -> dict:
     # lazy: graph install code (reads env at import) stays out of import mia._plugin
-    from mia.graph.install_hs import DEFAULT_HOOKS_ON, DEFAULT_HS_MODE
+    from mia.core.hooks.install_hs import DEFAULT_HOOKS_ON, DEFAULT_HS_MODE
     outs = list(getattr(output, "outputs", None) or [])
     n = max(len(outs), 1)
     n_gen = [int(gen_counts.get(getattr(o, "index", j), len(o.token_ids or [])))
@@ -285,7 +285,7 @@ def _sample_metas(mark: dict) -> list:
 def _spawn_hybrid_writer(engine, request_id, mark: dict, extra: dict, internal=None,
                          start=None) -> None:
     # lazy: spawn_writer looked up at call time so it can be patched
-    from mia.graph.delivery_route import spawn_writer
+    from mia.core.delivery.delivery_route import spawn_writer
     spawn_writer(engine, ext=str(request_id), n=mark["n"], layers=mark["layers"],
                  metas=_sample_metas(mark),
                  hook_dir=extra.get("hook_dir") or _DEFAULT_HOOK_DIR,
@@ -1226,7 +1226,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
     mode = resolve_capture_mode(self, os.environ, _ENGINE_HINTS.get(), kind=_wkind)
     graph_mode = mode.graph
     # lazy: graph install code (reads env at import) stays out of import mia._plugin
-    from mia.graph.install import set_graph_mode
+    from mia.core.hooks.install import set_graph_mode
     set_graph_mode(graph_mode)
     if mode.engine_eager:
         self.enforce_eager = True
@@ -2148,9 +2148,9 @@ def _deliver_offline(llm, outputs, engine_ids: dict) -> set:
     if not info.get("roots"):
         return set()
     # lazy: graph install code stays out of import mia._plugin; readers patchable at call time
-    from mia.graph.aperture_gather import GatherError, load_delivered, wait_delivered
-    from mia.graph.delivered_probes import hs_probes
-    from mia.graph.install_hs import DEFAULT_HOOKS_ON, DEFAULT_HS_MODE
+    from mia.core.aperture.aperture_gather import GatherError, load_delivered, wait_delivered
+    from mia.core.delivery.delivered_probes import hs_probes
+    from mia.core.hooks.install_hs import DEFAULT_HOOKS_ON, DEFAULT_HS_MODE
     _step_inproc_core(llm)
     plan, exp, done = [], {}, set()
     for out, internal, extra in reqs:
@@ -2207,7 +2207,7 @@ def _deliver_offline(llm, outputs, engine_ids: dict) -> set:
 def _attach_delivered(obj, info: dict, key: str, meta: dict, layers, run_ids,
                       state=None) -> None:
     # lazy: padded_offline_probes looked up at call time so it can be patched
-    from mia.graph.delivered_probes import (attach_lazy, first_pass_probes, offline_probes,
+    from mia.core.delivery.delivered_probes import (attach_lazy, first_pass_probes, offline_probes,
                                             padded_offline_probes, padded_reader)
 
     roots, names = info["roots"], info["names"]
@@ -2288,7 +2288,7 @@ def _engine_dead(engine) -> bool:
 
 def _backlog(state: dict):
     # lazy: delivery_backlog looked up at call time so it can be patched
-    from mia.graph.aperture_gather import delivery_backlog
+    from mia.core.aperture.aperture_gather import delivery_backlog
     keys = state["keys"]
     items = list(keys.items())                   # lazy reads pop keys from other threads
     if not items:
@@ -2670,7 +2670,7 @@ def register() -> None:
     EngineArgs.create_engine_config = _patched_create_engine_config
 
     try:
-        from mia.graph.install import patch_worker_load_model
+        from mia.core.hooks.install import patch_worker_load_model
         patch_worker_load_model()
     except Exception as e:  # noqa: BLE001
         print(f"[mia] graph load_model patch unavailable ({e}); "

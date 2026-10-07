@@ -12,17 +12,17 @@ import numpy as np
 import torch
 
 from mia._profiler import PROF
-from mia.graph import register_graph_ops
-from mia.graph.capture_aperture import CaptureAperture, ApertureBackpressureError
-from mia.graph.hosts import HSCaptureHost
-from mia.graph.registry import HostRegistry, get_registry, set_registry
-from mia.graph.aperture_metadata import ReqCaptureRecord
-from mia.graph.aperture_sizing import aperture_bytes_is_explicit, resolve_aperture_bytes_auto
-from mia.graph.tp_shard import (
+from mia.core.hooks.ops import register_graph_ops
+from mia.core.aperture.capture_aperture import CaptureAperture, ApertureBackpressureError
+from mia.core.hooks.hosts import HSCaptureHost
+from mia.core.hooks.registry import HostRegistry, get_registry, set_registry
+from mia.core.aperture.aperture_metadata import ReqCaptureRecord
+from mia.core.aperture.aperture_sizing import aperture_bytes_is_explicit, resolve_aperture_bytes_auto
+from mia.core.runtime.tp_shard import (
     HS_ALL_RANKS_ENV, HS_MODE_RANK0, HS_MODE_ROUND_ROBIN, HS_MODE_SINGLE, HSShard, dp_layout,
     dp_run_base, hs_rows_for_mode, rank_dir_name, refuse_pipeline_parallel, resolve_hs_shard_mode,
     resolve_tp_coords)
-from mia.graph.install import (
+from mia.core.hooks.install import (
     _capture_idle_key,
     _resolve_max_num_batched_tokens,
     _run_dummy_pass,
@@ -30,16 +30,16 @@ from mia.graph.install import (
     predict_capture_write_shape,
 )
 from mia.errors import MiaConfigurationError, MiaSizingError
-from mia.runner import StepView
+from mia.core.runner import StepView
 from mia.workers._common import iter_matched_modules
 from mia.workers.hs_capture_worker import match_layer
-from mia.graph.aperture_drain_hs import (
+from mia.core.aperture.aperture_drain_hs import (
     MultiLayerApertureDrain,
     OffLoopApertureDrain,
     record_captured_cells,
     _torch_dtype_name,
 )
-from mia.graph.writer_process import init_writer_process, mark_no_writer
+from mia.core.delivery.writer_process import init_writer_process, mark_no_writer
 
 logger = logging.getLogger(__name__)
 

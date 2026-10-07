@@ -23,8 +23,8 @@ mode MIA chose: `[mia] capture mode: FULL_AND_PIECEWISE CUDA graph (chosen by de
 |---|---|---|
 | `MiaLLM.generate(...)` | `out[i].probes` per prompt; with several prompts `out[0].probes` holds the whole batch, one entry per prompt, for `llm.analyze(probes=out[0].probes, ...)` | on first access to `probes`, which waits for that output (a timeout names the request) |
 | `MiaClient.generate(...)` | `response.probes`; `client.analyze(...)` | shortly after the response; `response.probes` waits for it |
-| either, with `save_to_disk=True, run_id=R` | `<hook_dir>/R/`; `analyze(run_id=R)`, or `mia.run_utils.load_and_merge_hs_cache` / `load_and_merge_qk_cache(hook_dir, R)` | offline: when `generate` returns; served: shortly after the response (`client.analyze()` waits for it) |
-| hidden-state files (CUDA graphs) | `mia.graph.aperture_gather.load_delivered(<capture dir>)` → `{request_id: {layer: Tensor}}` | lists only requests already delivered |
+| either, with `save_to_disk=True, run_id=R` | `<hook_dir>/R/`; `analyze(run_id=R)`, or `mia.artifacts.load_and_merge_hs_cache` / `load_and_merge_qk_cache(hook_dir, R)` | offline: when `generate` returns; served: shortly after the response (`client.analyze()` waits for it) |
+| hidden-state files (CUDA graphs) | `mia.core.aperture.aperture_gather.load_delivered(<capture dir>)` → `{request_id: {layer: Tensor}}` | lists only requests already delivered |
 
 - **`hook_dir`** defaults to `/dev/shm/mia` for `MiaClient`, `~/.cache/mia` for `MiaLLM`.
   `/dev/shm/mia` and `/tmp/mia_profile` are shared by every user of a node: pass your own
@@ -78,7 +78,7 @@ by **head** — and each rank writes its own `tp_rank_<r>/`, which the readers m
 ```python
 import os
 
-from mia.graph.aperture_gather import load_delivered
+from mia.core.aperture.aperture_gather import load_delivered
 
 # Merges every tp_rank_<r>/; refuses a missing or duplicate rank.
 per_request = load_delivered(os.environ.get("MIA_APERTURE_DIR", "./hs_aperture_dump"))

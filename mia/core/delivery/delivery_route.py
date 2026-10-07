@@ -10,13 +10,13 @@ from urllib.parse import unquote
 import vllm.envs as envs
 
 from . import run_artifact
-from .aperture_gather import (DELIVERY_HARD_CAP_S, DeliveryTimeoutError, GatherError,
+from mia.core.aperture.aperture_gather import (DELIVERY_HARD_CAP_S, DeliveryTimeoutError, GatherError,
                               NoDeliveryError, delivery_base, delivery_root, delivery_timeout_s,
                               discover_delivery_ranks, poll_delivered)
 from .delivered_probes import (AmbiguousDelivery, check_id, encode_delivery, external_id,
                                hs_probes, key_pattern, match_keys, response_id)
 from .delivery_selector import STAMP_ENV
-from .tp_shard import parse_rank_dir
+from mia.core.runtime.tp_shard import parse_rank_dir
 from mia.errors import MiaConfigurationError
 
 logger = logging.getLogger(__name__)

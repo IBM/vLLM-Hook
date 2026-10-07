@@ -11,7 +11,7 @@ from .aperture_metadata import read_qk_sidecar, read_sidecar
 from .aperture_run_index import INDEX_NAME, read_run_index, read_run_segments, run_slices
 from .aperture_trim import is_reclaimed, refuse_trimmed_rows, trimmed_floor_rows
 from .aperture_trim import TrimmedRegionError, trim_status  # noqa: F401  (re-exported)
-from .tp_shard import (
+from mia.core.runtime.tp_shard import (
     TPShardError,
     check_complete_shard_set,
     check_hs_shard_set,

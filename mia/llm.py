@@ -10,10 +10,11 @@ from vllm import LLM, SamplingParams
 
 from mia.optimizations import apply_optimizations
 from mia.registry import PluginRegistry
-from mia.run_utils import dispatch_disk_analyze, qk_score_size_select
+from mia.core.delivery.sizing import qk_score_size_select
+from mia.artifacts import dispatch_disk_analyze
 from mia._profiler import PROF
 from mia.workers.steer_worker import resolve_steer_modes
-from mia.artifact_quant import dequantize_cache_inplace
+from mia.core.delivery.artifact_quant import dequantize_cache_inplace
 
 
 def _merge_probes(all_probes: list) -> dict:
@@ -135,7 +136,7 @@ class MiaLLM:
         llm_kwargs = dict(vllm_kwargs)
         if download_dir is not None:
             llm_kwargs['download_dir'] = download_dir
-        # lazy: keep mia._plugin and mia.graph out of import mia
+        # lazy: keep mia._plugin and mia.core.hooks out of import mia
         from mia._plugin import engine_hints
         with engine_hints(qk_score=self._qk_capture == "score"):
             self.llm = LLM(
@@ -260,7 +261,7 @@ class MiaLLM:
             return
         if self._model_dims is None:
             return
-        # lazy: keep mia._plugin and mia.graph out of import mia
+        # lazy: keep mia._plugin and mia.core.hooks out of import mia
         from mia._plugin import _engine_graph, _engine_tp_size
         if _engine_tp_size(self.llm) > 1 or _engine_graph(self.llm):
             return
@@ -356,8 +357,8 @@ class MiaLLM:
                 outputs = self.llm.generate(prompts, sp_list, **passthrough)
 
         if hook and self.worker_name and not save_to_disk:
-            # lazy: keep mia.graph (reads env at import) out of import mia
-            from mia.graph.delivered_probes import attach_lazy, merge_source, pending
+            # lazy: keep mia.core.delivery out of import mia
+            from mia.core.delivery.delivered_probes import attach_lazy, merge_source, pending
             srcs = [merge_source(o) for o in outputs]
             if len(outputs) > 1 and any(s is not None for s in srcs):
                 def merged():

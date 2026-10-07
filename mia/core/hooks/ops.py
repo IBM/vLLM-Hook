@@ -44,7 +44,7 @@ def _steer_buffer_impl(
     if _STEER_FUSED and residual.is_cuda:
         try:
             # lazy: Triton kernels load on first use; a failed import falls back below
-            from mia.graph.steer_triton import steer_buffer_fused
+            from mia.core.hooks.steer_triton import steer_buffer_fused
             steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n)
             return None
         except Exception:  # noqa: BLE001
@@ -148,7 +148,7 @@ def _capture_hs_impl(
             and hs_buf.dtype in _FUSED_OK_DTYPES):
         try:
             # lazy: Triton kernels load on first use; a failed import falls back below
-            from mia.graph.capture_triton import capture_hs_fused
+            from mia.core.hooks.capture_triton import capture_hs_fused
             capture_hs_fused(hidden, residual, hs_buf, index, has_residual)
             _FUSED_FIRE_COUNT[0] += 1
             return None

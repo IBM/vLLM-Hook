@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 import torch
 
 from mia._profiler import PROF
-from mia.run_utils import load_and_merge_qk_cache
+from mia.artifacts import load_and_merge_qk_cache
 
 class CorerAnalyzer:
     """Rerank documents by query-to-document attention, calibrated by a no-document pass (CoRe)."""

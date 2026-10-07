@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 import torch
 
 from mia._profiler import PROF
-from mia.run_utils import load_and_merge_hs_cache
+from mia.artifacts import load_and_merge_hs_cache
 
 
 class HiddenStatesAnalyzer:

@@ -22,8 +22,8 @@ from .aperture_trim import (TRIM_ENV as GATHER_TRIM_ENV, TrimError, TrimLog, ali
                             floor_row_for_bytes, is_reclaimed, published_cursors, punch_hole,
                             punch_supported, trim_align, trim_chunk_bytes, trim_enabled,
                             trim_explicit, trim_lag_bytes, trimmed_floor_rows)
-from .cpu_budget import allocated_cpus
-from .tp_shard import (
+from mia.core.runtime.cpu_budget import allocated_cpus
+from mia.core.runtime.tp_shard import (
     RANK_DIR_PREFIX,
     HSShard,
     TPShardError,
@@ -1417,7 +1417,7 @@ class ApertureGatherProcess:
 
     def start(self) -> None:
         # lazy: child_process reads env at import; keep it out of plugin load
-        from .child_process import register_shutdown, start_child
+        from mia.core.runtime.child_process import register_shutdown, start_child
 
         if self._procs:
             return

@@ -286,11 +286,17 @@ mia/
 ├── workers/
 │   ├── qk_capture_worker.py
 │   ├── steer_worker.py
-├── graph/
-│   ├── install.py
-│   ├── capture_aperture.py
+├── core/
+│   ├── runner.py
+│   ├── hooks/        (install.py, ops.py)
+│   ├── aperture/     (capture_aperture.py, aperture_gather.py)
+│   ├── delivery/     (delivery_router.py, artifact_writer.py)
+│   ├── runtime/      (tp_shard.py)
+├── probes/
+│   ├── hnode/
+├── artifacts.py
+├── client.py
 ├── llm.py
-├── runner.py
 ├── optimizations.py
 ├── registry.py
 ```
@@ -300,9 +306,16 @@ Each component handles a key stage of the plugin lifecycle:
 - **Registry** — manages available hooks and extensions  
 - **Workers** — define execution behavior and orchestration  
 - **Analyzers** — optionally conduct analysis based on the saved statistics  
-- **Graph** — installs the capture/steering ops and the GPU capture aperture under CUDA graphs  
-- **Runner** — the one place that touches vLLM's V2 model-runner internals  
+- **Core** — the capture and steering engine, in four subpackages  
+  - `hooks/` — installs the capture and steering ops  
+  - `aperture/` — the GPU capture aperture under CUDA graphs  
+  - `delivery/` — routes, writes and delivers captured artifacts  
+  - `runtime/` — CPU budget, child-process, device and TP-shard helpers  
+- **Probes** — use-case probes that score captured activations  
+- **Runner** — `mia/core/runner.py`, the one place that touches vLLM's V2 model-runner internals  
 - **Optimizations** — the public performance levers (`optimizations.py::PUBLIC_LEVERS`)  
+
+Full detail: [`mia/README.md`](mia/README.md).
 
 
 ---
@@ -319,7 +332,7 @@ We welcome contributions from the community!
 5. **Open a Pull Request**  
 
 ### Guidelines:
-- New analyzers and workers are welcome; discuss before modifying `mia/llm.py`, `mia/_plugin.py`, `mia/client.py` or `mia/graph/`
+- New analyzers and workers are welcome; discuss before modifying `mia/llm.py`, `mia/_plugin.py`, `mia/client.py` or `mia/core/`
 - Include examples and documentation for new features  
 - New use cases must be added to [`docs/use_cases/README.md`](docs/use_cases/README.md) with the contributor's GitHub handle
 

@@ -8,11 +8,11 @@ import threading
 import torch.multiprocessing as tmp
 
 from mia._profiler import PROF
-from mia.graph.artifact_writer import write_artifact
-from mia.graph.child_process import get_until_parent_exits, register_shutdown, start_child
-from mia.graph.tensor_pack import pack_tensor_tree, unpack_tensor_tree
-from mia.graph.thread_device import bind_thread_to_device, creator_cuda_device
-from mia.graph.tp_shard import resolve_tp_coords
+from mia.core.delivery.artifact_writer import write_artifact
+from mia.core.runtime.child_process import get_until_parent_exits, register_shutdown, start_child
+from mia.core.delivery.tensor_pack import pack_tensor_tree, unpack_tensor_tree
+from mia.core.runtime.thread_device import bind_thread_to_device, creator_cuda_device
+from mia.core.runtime.tp_shard import resolve_tp_coords
 
 _CHILD_THREAD_ENV = {
     "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",

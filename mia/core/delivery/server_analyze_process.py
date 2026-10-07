@@ -8,10 +8,10 @@ import threading
 import torch.multiprocessing as tmp
 
 from mia import register_plugins
-from mia.graph.child_process import get_until_parent_exits, register_shutdown, start_child
-from mia.graph.thread_device import bind_thread_to_device, creator_cuda_device
+from mia.core.runtime.child_process import get_until_parent_exits, register_shutdown, start_child
+from mia.core.runtime.thread_device import bind_thread_to_device, creator_cuda_device
 from mia.registry import PluginRegistry
-from mia.run_utils import dispatch_disk_analyze
+from mia.artifacts import dispatch_disk_analyze
 
 
 _CHILD_THREAD_ENV = {

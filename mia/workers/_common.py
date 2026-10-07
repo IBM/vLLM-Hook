@@ -11,7 +11,7 @@ import vllm.envs as envs
 from safetensors.torch import save_file as _st_save
 
 from mia._profiler import PROF, is_enabled
-from mia.artifact_quant import (
+from mia.core.delivery.artifact_quant import (
     quant_nbytes,
     quantize,
     resolve_dtype,

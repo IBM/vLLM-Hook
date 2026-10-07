@@ -8,17 +8,17 @@ import numpy as np
 import torch
 
 from mia._profiler import PROF
-from mia.graph import register_graph_ops
-from mia.graph.hosts import SteerHost
-from mia.graph.install import (
+from mia.core.hooks.ops import register_graph_ops
+from mia.core.hooks.hosts import SteerHost
+from mia.core.hooks.install import (
     _IDLE_ROUTE_KEY,
     _resolve_max_num_batched_tokens,
     install_prepare_inputs_routing,
 )
-from mia.graph.registry import PinnedMirror, set_registry
-from mia.graph.steer_routing_gpu import scatter_routing
-from mia.graph.tp_shard import refuse_pipeline_parallel
-from mia.runner import StepView
+from mia.core.hooks.registry import PinnedMirror, set_registry
+from mia.core.hooks.steer_routing_gpu import scatter_routing
+from mia.core.runtime.tp_shard import refuse_pipeline_parallel
+from mia.core.runner import StepView
 from mia.workers._common import iter_matched_modules
 from mia.workers.hs_capture_worker import match_layer
 from mia.workers.steer_worker import (

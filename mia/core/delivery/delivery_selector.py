@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import Mapping, MutableMapping, Optional, Tuple
 
-from mia.graph.run_mode import GRAPH_ENV, WORKER_ENV, capture_mode_from_env, parse_mia_worker_env
+from mia.core.hooks.run_mode import GRAPH_ENV, WORKER_ENV, capture_mode_from_env, parse_mia_worker_env
 
 logger = logging.getLogger(__name__)
 

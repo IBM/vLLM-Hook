@@ -12,13 +12,13 @@ import torch
 from vllm.forward_context import get_forward_context
 
 from mia._profiler import PROF
-from mia.graph import register_graph_ops
-from mia.graph.capture_aperture import CaptureAperture, ApertureBackpressureError
-from mia.graph.hosts import QKCaptureHost
-from mia.graph.registry import HostRegistry, get_registry, set_registry
-from mia.graph.aperture_metadata import QKReqCaptureRecord
-from mia.graph.aperture_sizing import aperture_bytes_is_explicit, resolve_aperture_bytes_auto
-from mia.graph.tp_shard import (
+from mia.core.hooks.ops import register_graph_ops
+from mia.core.aperture.capture_aperture import CaptureAperture, ApertureBackpressureError
+from mia.core.hooks.hosts import QKCaptureHost
+from mia.core.hooks.registry import HostRegistry, get_registry, set_registry
+from mia.core.aperture.aperture_metadata import QKReqCaptureRecord
+from mia.core.aperture.aperture_sizing import aperture_bytes_is_explicit, resolve_aperture_bytes_auto
+from mia.core.runtime.tp_shard import (
     check_attn_modules_match_shard,
     dp_layout,
     dp_run_base,
@@ -29,12 +29,12 @@ from mia.graph.tp_shard import (
     resolve_tp_coords,
 )
 from mia.errors import MiaConfigurationError, MiaRefusal, MiaSizingError
-from mia.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
+from mia.core.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
 from mia.workers._common import iter_matched_modules
 from mia.workers.qk_capture_worker import match_attn
-from mia.graph.aperture_drain_hs import _torch_dtype_name
-from mia.graph.aperture_drain_qk import MultiLayerQKApertureDrain, OffLoopQKApertureDrain
-from mia.graph.aperture_sink import predict_rows_per_write
+from mia.core.aperture.aperture_drain_hs import _torch_dtype_name
+from mia.core.aperture.aperture_drain_qk import MultiLayerQKApertureDrain, OffLoopQKApertureDrain
+from mia.core.aperture.aperture_sink import predict_rows_per_write
 
 
 _GRAPH_MODE_ENV = "MIA_GRAPH_MODE"
@@ -266,7 +266,7 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
         worker._disk_states = {}
 
     # lazy: child_process reads env at import; keep it out of plugin load
-    from mia.graph.writer_process import init_writer_process
+    from mia.core.delivery.writer_process import init_writer_process
     init_writer_process(worker)
 
     cap = _resolve_max_num_batched_tokens(worker)

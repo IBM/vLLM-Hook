@@ -1,6 +1,6 @@
 """H-Node hallucination detection: inference side for MIA."""
 
-from mia.utils.hnode.score import (
+from mia.probes.hnode.score import (
     HNodeProbe,
     ProbeArtifact,
     score_activations,

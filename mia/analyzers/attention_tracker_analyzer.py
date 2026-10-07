@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from mia._profiler import PROF
-from mia.run_utils import load_and_merge_qk_cache, unpack_qk
+from mia.artifacts import load_and_merge_qk_cache, unpack_qk
 
 
 class AttntrackerAnalyzer:

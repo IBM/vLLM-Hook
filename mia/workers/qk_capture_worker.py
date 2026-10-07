@@ -12,8 +12,8 @@ from vllm.forward_context import get_forward_context
 
 from mia._profiler import PROF
 from mia.errors import MiaConfigurationError
-from mia.run_utils import write_refused_qk
-from mia.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
+from mia.artifacts import write_refused_qk
+from mia.core.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
 from mia.workers._common import (
     capture_bytes,
     clear_rank_artifact,
@@ -54,8 +54,8 @@ _BATCHED_FLUSH = os.environ.get("MIA_BATCHED_FLUSH") == "1"
 
 def _cpu_list(tensors, acc: dict | None):
     if acc is not None:
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.census import cpu_list_measured
+        # lazy: keep mia.core.runtime (reads env at import) out of import mia
+        from mia.core.runtime.census import cpu_list_measured
         return cpu_list_measured(tensors, acc)
     if _BATCHED_FLUSH:
         return cpu_list_batched(tensors)
@@ -260,16 +260,16 @@ def _worker_tp_rank(worker) -> int:
     r = getattr(worker, "_tp_rank", None)
     if r is not None:
         return int(r)
-    # lazy: keep mia.graph (reads env at import) out of import mia
-    from mia.graph.tp_shard import resolve_tp_coords
+    # lazy: keep mia.core.runtime out of import mia
+    from mia.core.runtime.tp_shard import resolve_tp_coords
     return resolve_tp_coords(worker)[0]
 
 
 def _attach_tp_shard(payload: dict, worker) -> dict:
     shard = getattr(worker, "_qk_shard", None)
     if shard is not None and shard.tp_size > 1:
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.tp_shard import TP_SHARD_KEY
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import TP_SHARD_KEY
         payload[TP_SHARD_KEY] = shard.as_header()
     return payload
 
@@ -295,8 +295,8 @@ def _marshal_perreq_qk(per_layer: dict, conf: dict, hookq_mode: str, shard=None,
     if module_names:
         payload["module_names"] = {int(L): str(n) for L, n in module_names.items()}
     if shard is not None and shard.tp_size > 1:
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.tp_shard import TP_SHARD_KEY
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import TP_SHARD_KEY
         payload[TP_SHARD_KEY] = shard.as_header()
     return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
 
@@ -349,8 +349,8 @@ class QKCaptureWorker:
 
         self._artifact_tag, self._artifact_gran, self._artifact_gsize = resolve_capture_quant("qk")
 
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.writer_process import init_writer_process
+        # lazy: keep mia.core.delivery out of import mia
+        from mia.core.delivery.writer_process import init_writer_process
         init_writer_process(self)
 
         cfg = model.config
@@ -358,7 +358,7 @@ class QKCaptureWorker:
         num_h = int(getattr(text_cfg, "num_attention_heads"))
         num_kv = int(getattr(text_cfg, "num_key_value_heads", num_h))
         hidden = int(getattr(text_cfg, "hidden_size"))
-        from mia.graph.tp_shard import check_attn_modules_match_shard, qk_conf_head_dim
+        from mia.core.runtime.tp_shard import check_attn_modules_match_shard, qk_conf_head_dim
         head_dim = qk_conf_head_dim(text_cfg)
         attn_mult = float(getattr(text_cfg, "attention_multiplier", 1 / math.sqrt(head_dim)))
         self._conf = dict(
@@ -369,7 +369,7 @@ class QKCaptureWorker:
             attention_multiplier=attn_mult,
         )
 
-        from mia.graph.tp_shard import qk_shard, refuse_pipeline_parallel, resolve_tp_coords
+        from mia.core.runtime.tp_shard import qk_shard, refuse_pipeline_parallel, resolve_tp_coords
         refuse_pipeline_parallel(getattr(self.parallel_config, "pipeline_parallel_size", 1),
                                  "QK install_hooks")
         tp_rank, tp_size = resolve_tp_coords(self)
@@ -545,8 +545,8 @@ class QKCaptureWorker:
         if not getattr(self, "_disk_states", None):
             self._disk_states = {}
 
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.install import (
+        # lazy: keep mia.core.hooks (reads env at import) out of import mia
+        from mia.core.hooks.install import (
             install_execute_model_wrapper,
             install_qk_hosts,
         )
@@ -564,8 +564,8 @@ class QKCaptureWorker:
         else:
             drain.drain_once()
         drain.close()
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.tp_shard import drain_holds_data
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import drain_holds_data
         if not drain_holds_data(drain):
             return None
         return getattr(self, "_qk_run_dir", None)
@@ -680,8 +680,8 @@ class QKCaptureWorker:
             return False
         shard = getattr(self, "_qk_shard", None)
         if shard is not None and shard.tp_size > 1:
-            # lazy: keep mia.graph (reads env at import) out of import mia
-            from mia.graph.tp_shard import rank_dir_name
+            # lazy: keep mia.core.runtime out of import mia
+            from mia.core.runtime.tp_shard import rank_dir_name
             dest = os.path.join(str(dest), rank_dir_name(shard.tp_rank))
         _aperture_disk_dbg(f"worker.route_aperture_to_disk(qk): req_id={req_id!r} (EXTERNAL) dest={dest!r}")
         route(str(req_id), str(dest))
@@ -733,8 +733,8 @@ class QKCaptureWorker:
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve and remove captured QK states for a completed request."""
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.drain import drain_barrier
+        # lazy: keep mia.core.hooks out of import mia
+        from mia.core.hooks.drain import drain_barrier
         drain_barrier(self)
         consumer = getattr(self, "_capture_consumer", None)
         if consumer is not None:
@@ -755,7 +755,7 @@ class QKCaptureWorker:
             _census_bucket = None
             _census_acc = None
             if _CENSUS_ON:
-                from mia.graph.census import census_bucket, new_accumulator
+                from mia.core.runtime.census import census_bucket, new_accumulator
                 _census_bucket = census_bucket(layer_dict)
                 _census_acc = new_accumulator()
             cpu_dict = {}
@@ -814,7 +814,7 @@ class QKCaptureWorker:
                             "k_all_qmeta": entry.get("_k_all_qmeta"),
                             "layer_num": entry["layer_num"], "hookq_mode": mode}
             if _census_bucket is not None:
-                from mia.graph.census import census_emit, census_record
+                from mia.core.runtime.census import census_emit, census_record
                 census_emit(census_record(worker="qk", sink="rpc", req_id=req_id,
                                            bucket=_census_bucket, acc=_census_acc))
             payload = {"qk_cache": cpu_dict, "config": self._conf}
@@ -896,8 +896,8 @@ class QKCaptureWorker:
 
     def flush_disk(self, external_req_ids: list, run_id: str, hook_dir: str) -> bool:
         """Write captured Q/K for all requests in the batch to one artifact."""
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.drain import drain_barrier
+        # lazy: keep mia.core.hooks out of import mia
+        from mia.core.hooks.drain import drain_barrier
         drain_barrier(self)
         consumer = getattr(self, "_capture_consumer", None)
         cpu_cache: dict = {"config": self._conf, "qk_cache": {}}
@@ -924,7 +924,7 @@ class QKCaptureWorker:
                     _census_bucket = None
                     _census_acc = None
                     if _CENSUS_ON:
-                        from mia.graph.census import census_bucket, new_accumulator
+                        from mia.core.runtime.census import census_bucket, new_accumulator
                         _census_bucket = census_bucket(layer_dict)
                         _census_acc = new_accumulator()
                     for mod_name, entry in layer_dict.items():
@@ -986,11 +986,11 @@ class QKCaptureWorker:
                         else:
                             cpu_cache["qk_cache"][mod_name] = cpu_entry
                     if _census_bucket is not None:
-                        from mia.graph.census import census_emit, census_record
+                        from mia.core.runtime.census import census_emit, census_record
                         census_emit(census_record(worker="qk", sink="disk", req_id=req_id,
                                                    bucket=_census_bucket, acc=_census_acc))
 
-        from mia.graph.tp_shard import rank_dir_name
+        from mia.core.runtime.tp_shard import rank_dir_name
         tp_rank = _worker_tp_rank(self)
         run_dir = os.path.join(hook_dir, run_id, rank_dir_name(tp_rank))
         if refused_here or found_any:
@@ -1019,7 +1019,7 @@ class QKCaptureWorker:
                                       use_st, has_scores or quant_on, "qk.pt",
                                       req_ids=flushed_ids, block=True)
             if not submitted:
-                from mia.graph.writer_process import note_submit_refused
+                from mia.core.delivery.writer_process import note_submit_refused
                 note_submit_refused(self, wp)
                 compact_page_backed_cache(cpu_cache)
                 if use_st and not has_scores and not quant_on:
@@ -1042,7 +1042,7 @@ class QKCaptureWorker:
         return run_dir
 
     def _save_safetensors(self, cpu_cache: dict, run_dir: str):
-        # lazy: keep mia.graph (reads env at import) out of import mia
-        from mia.graph.artifact_writer import save_qk_cache_safetensors
+        # lazy: keep mia.core.delivery out of import mia
+        from mia.core.delivery.artifact_writer import save_qk_cache_safetensors
         save_qk_cache_safetensors(cpu_cache, run_dir, self.hookq_mode, _worker_tp_rank(self))
 

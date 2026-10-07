@@ -18,7 +18,7 @@ import torch
 
 from mia._profiler import PROF
 from .capture_aperture import CaptureAperture
-from .per_request_delivery import PerRequestIndex
+from mia.core.delivery.per_request_delivery import PerRequestIndex
 from .aperture_metadata import (
     HsSidecarLog, LayerEntry, StepMeta, expand_records, write_sidecar)
 from .aperture_gather import (DELIVER_ENV as GATHER_DELIVER_ENV, ApertureGatherProcess,
@@ -33,9 +33,9 @@ from .aperture_sink import (
     WRITE_MODE_ENV, WriteShape, WriteStats, alloc_host_rows, join_writes, join_writes_quietly,
     lock_run_dir, record_step_stats, release_run_lock, releases_run_lock_on_failure,
     resolve_per_request_write_mode, resolve_write_mode, resolve_write_threads, timed_write)
-from .thread_device import bind_thread_to_device
-from .delivery_selector import STAMP_ENV
-from mia.graph.offload_process import OffloadProcess
+from mia.core.runtime.thread_device import bind_thread_to_device
+from mia.core.delivery.delivery_selector import STAMP_ENV
+from mia.core.delivery.offload_process import OffloadProcess
 
 logger = logging.getLogger(__name__)
 
@@ -907,7 +907,7 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
                 self._offload = new_offload
                 new_offload = None
                 # lazy: child_process reads env at import; keep it out of plugin load
-                from mia.graph.child_process import register_shutdown
+                from mia.core.runtime.child_process import register_shutdown
                 register_shutdown(self._offload.close)
             self._disk_routed[req_id] = str(dest)
         if new_offload is not None:

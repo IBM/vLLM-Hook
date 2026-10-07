@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from safetensors import safe_open
 
-from mia.run_utils import load_and_merge_hs_cache, unpack_hidden_states
+from mia.artifacts import load_and_merge_hs_cache, unpack_hidden_states
 
 
 class ScienceHallucinationAnalyzer:

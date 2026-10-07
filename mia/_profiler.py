@@ -286,8 +286,8 @@ class MemorySampler:
             used = [d for d in range(t.cuda.device_count()) if t.cuda.memory_reserved(d) > 0]
             if len(used) != 1:
                 return None
-            # lazy: keep mia.graph out of import mia; optional dependency (pynvml)
-            from mia.graph.thread_device import bind_thread_to_device
+            # lazy: keep mia.core.runtime out of import mia; optional dependency (pynvml)
+            from mia.core.runtime.thread_device import bind_thread_to_device
             bind_thread_to_device(t.device("cuda", used[0]))
         except Exception:
             return None

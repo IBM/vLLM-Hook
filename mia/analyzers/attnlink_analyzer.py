@@ -5,7 +5,7 @@ from typing import Dict, Optional
 import torch
 
 from mia._profiler import PROF
-from mia.run_utils import load_and_merge_qk_cache, unpack_qk
+from mia.artifacts import load_and_merge_qk_cache, unpack_qk
 
 
 def select_columns(scores, temperature=1.0, top_p=0.8):

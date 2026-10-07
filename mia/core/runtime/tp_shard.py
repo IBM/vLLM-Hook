@@ -10,7 +10,7 @@ import torch
 from vllm.distributed import parallel_state as ps
 
 from mia.errors import MiaConfigurationError
-from mia.graph.delivery_selector import DP_SIZE_ENV, _dp_size
+from mia.core.delivery.delivery_selector import DP_SIZE_ENV, _dp_size
 
 RANK_DIR_PREFIX = "tp_rank_"
 _RANK_DIR_RE = re.compile(r"^tp_rank_(\d+)$")

@@ -21,7 +21,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from mia._profiler import PROF
 from mia.errors import MiaDeliveryError
-from .aperture_gather import DeliveryTimeoutError
+from mia.core.aperture.aperture_gather import DeliveryTimeoutError
 from mia.workers.qk_capture_worker import _use_compact_kall
 
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")

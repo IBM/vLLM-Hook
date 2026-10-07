@@ -54,7 +54,7 @@ def _run_transfer_with_retries(transfer_fn, req_id: str, src_path: str, dest: st
 def _offload_child(q_in, q_out, max_retries: int, retry_delay: float) -> None:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     # lazy: child_process reads env at import; keep it out of plugin load
-    from mia.graph.child_process import get_until_parent_exits
+    from mia.core.runtime.child_process import get_until_parent_exits
     while True:
         item = get_until_parent_exits(q_in)
         if item is None:
@@ -96,7 +96,7 @@ class OffloadProcess:
                     args=(self._q, self._q_out, self._max_retries, self._retry_delay),
                     daemon=True, name="mia-offload")
                 # lazy: child_process reads env at import; keep it out of plugin load
-                from mia.graph.child_process import start_child
+                from mia.core.runtime.child_process import start_child
                 start_child(self._proc)
             finally:
                 if _saved_cvd is None:

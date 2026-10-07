@@ -20,7 +20,7 @@ import torch
 
 from mia._profiler import PROF, is_enabled as is_prof_enabled
 from mia.errors import MiaRefusal
-from .thread_device import bind_thread_to_device
+from mia.core.runtime.thread_device import bind_thread_to_device
 
 logger = logging.getLogger(__name__)
 
