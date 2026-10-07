@@ -1,5 +1,8 @@
 # Spotlight: Attention Steering for Instruction Following
 
+> **Supported only on vLLM's V1 model runner; sunset in MIA.** Its code, demo and configs are in
+> vLLM-Hook [v0.2.0](https://github.com/IBM/vLLM-Hook/tree/v0.2.0).
+
 **Paper**: [Venkateswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/)  
 **Reference implementation**: [agent-lifecycle-toolkit SpotLightComponent](https://github.com/AgentToolkit/agent-lifecycle-toolkit/blob/main/altk/pre_llm/spotlight/spotlight.py)
 

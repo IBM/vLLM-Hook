@@ -1,10 +1,13 @@
-# tests/controls/test_corer.py
-import pytest
-import torch
+"""CoRe reranking through a real MiaLLM engine: two save_to_disk passes, read by run id (GPU)."""
 from typing import List
 
-from vllm_hook_plugins import HookLLM, register_plugins
-from tests.conftest import ensure_config_for_model
+import pytest
+import torch
+
+pytest.importorskip("vllm")  # `import mia` pulls in vLLM; skip, never error the whole collection
+
+from mia import MiaLLM, register_plugins
+from tests.conftest import ensure_config_for_model, requires_gpu
 
 
 TEST_MODELS = [
@@ -13,7 +16,7 @@ TEST_MODELS = [
 ]
 
 def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, documents: List[str]):
-    # setup prompts
+    """The prompt in the model's chat tags, and its document spans and query offsets."""
     off_set = 0
     if 'granite' in model_name.lower():
         prompt_prefix = '<|start_of_role|>user<|end_of_role|>'
@@ -30,7 +33,7 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
         prompt_suffix = '<|im_end|><|im_start|>assistant<|im_sep|>'
     retrieval_instruction = ' Here are some paragraphs:\n\n'
     retrieval_instruction_late = 'Please find information that are relevant to the following query in the paragraphs above.\n\nQuery: '
-    
+
     doc_span = []
     query_start_idx = None
     query_end_idx = None
@@ -63,22 +66,26 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
     return llm_prompt, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
 
 
+@pytest.mark.gpu
+@requires_gpu
 @pytest.mark.parametrize("model_id", TEST_MODELS)
-def test_core_reranker(cache_dir, project_root, model_id):
+def test_core_reranker(tmp_path, engines, model_id):
+    """A query pass and an 'N/A' pass, saved to disk, rank every document."""
     register_plugins()
 
-    cfg = ensure_config_for_model(project_root, "core_reranker", model_id)
+    cfg = ensure_config_for_model("core_reranker", model_id, tmp_path)
 
-    llm = HookLLM(
+    llm = MiaLLM(
         model=model_id,
-        worker_name="probe_hook_qk",
+        worker_name="capture_qk",
         analyzer_name="core_reranker",
         config_file=str(cfg),
-        download_dir=str(cache_dir),
+        hook_dir=str(tmp_path / "hooks"),
         gpu_memory_utilization=0.5,
         dtype=torch.float16,
         enable_hook=True,
     )
+    engines.append(llm)
 
     query = "Which city is older: Rome or New York?"
     documents = [
@@ -89,11 +96,12 @@ def test_core_reranker(cache_dir, project_root, model_id):
     textQ, query_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model_id, query, documents)
     textNA, na_spec = apply_chat_template_and_get_ranges(llm.tokenizer, model_id, "N/A", documents)
 
-    llm.generate(textQ, temperature=0.1, max_tokens=1)
-    llm.generate(textNA, cleanup=False, temperature=0.1, max_tokens=1)
+    llm.generate(textQ, save_to_disk=True, run_id="corer-doc", temperature=0.1, max_tokens=1)
+    llm.generate(textNA, save_to_disk=True, run_id="corer-na", temperature=0.1, max_tokens=1)
 
     stats = llm.analyze(
-        analyzer_spec={"query_spec": query_spec, "na_spec": na_spec}
+        analyzer_spec={"query_spec": query_spec, "na_spec": na_spec},
+        run_ids=["corer-doc", "corer-na"],
     )
 
     assert "scores" in stats
