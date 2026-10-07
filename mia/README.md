@@ -2,122 +2,143 @@
 
 Capture and steer vLLM model internals, then analyze what was captured.
 
-Two entry points:
+## Contents
 
-- `MiaLLM` (`llm.py`): offline, wraps `vllm.LLM`.
-- `MiaClient` (`client.py`): served, OpenAI-compatible client for `vllm serve`.
+- [Overview](#overview)
+- [Directory Structure](#directory-structure)
+- [Package Reference](#package-reference)
+- [Dependency Direction](#dependency-direction)
 
-## Tree
+## Overview
 
-```
+`mia` exposes two entry points:
+
+| Entry point | Defined in | Mode | Description |
+|---|---|---|---|
+| `MiaLLM` | `llm.py` | Offline | Wraps `vllm.LLM`; arms capture or steering and runs analyzers. |
+| `MiaClient` | `client.py` | Served | OpenAI-compatible client for `vllm serve`; probe capture and analysis. |
+
+## Directory Structure
+
+```text
 mia/
-  __init__.py  llm.py  client.py  artifacts.py  optimizations.py
-  errors.py  registry.py  _profiler.py
-  analyzers/    turn captured data into results
-  workers/      vLLM worker extensions: capture and steer
-  utils/        use-case helpers
-  core/         capture and steering engine
-    runner.py   the only module touching vLLM runner internals
-    _plugin.py  vLLM plugin entry point (`mia.core._plugin:register`)
-    hooks/      arm the hooks, bake the in-graph ops
-    aperture/   fixed GPU capture aperture, drains, sinks
-    delivery/   get a finished artifact to the caller
-    runtime/    helper processes, device binding, CPU budget, TP geometry
+├── __init__.py            # Public API and plugin registration
+├── llm.py                 # MiaLLM (offline)
+├── client.py              # MiaClient (served)
+├── artifacts.py           # Read captured artifacts back
+├── optimizations.py       # Public optimization levers
+├── errors.py              # Deliberate refusal error
+├── registry.py            # Worker / analyzer plugin registry
+├── _profiler.py           # Process-local profiler
+│
+├── analyzers/             # Turn captured data into results
+├── workers/               # vLLM worker extensions: capture and steer
+├── utils/                 # Use-case-specific helpers
+│   └── hnode/
+└── core/                  # Capture and steering engine
+    ├── runner.py          # Only module touching vLLM runner internals
+    ├── _plugin.py         # vLLM plugin entry point
+    ├── hooks/             # Arm the hooks, bake the in-graph ops
+    ├── aperture/          # Fixed GPU capture aperture, drains, sinks
+    ├── delivery/          # Get a finished artifact to the caller
+    └── runtime/           # Helper processes, device binding, CPU budget, TP geometry
 ```
 
-## Top level
+## Package Reference
+
+### Top-level modules
 
 | Module | Role |
 |---|---|
-| `__init__.py` | public API and plugin registration |
-| `llm.py` | `MiaLLM`: arms capture or steering, runs analyzers |
-| `client.py` | `MiaClient`: probe capture and analysis against `vllm serve` |
-| `artifacts.py` | read captured artifacts back: unpack, merge TP shards, load a run, dispatch a disk analyze |
-| `optimizations.py` | the public optimization levers, set from env or a config file |
-| `errors.py` | deliberate refusal error |
-| `registry.py` | registry of worker and analyzer plugins by name |
-| `_profiler.py` | process-local profiler |
+| `__init__.py` | Public API and plugin registration. |
+| `llm.py` | `MiaLLM`: arms capture or steering, runs analyzers. |
+| `client.py` | `MiaClient`: probe capture and analysis against `vllm serve`. |
+| `artifacts.py` | Reads captured artifacts back: unpack, merge TP shards, load a run, dispatch a disk analyze. |
+| `optimizations.py` | Public optimization levers, set from env or a config file. |
+| `errors.py` | Deliberate refusal error. |
+| `registry.py` | Registry of worker and analyzer plugins by name. |
+| `_profiler.py` | Process-local profiler. |
 
-## analyzers/
-
-| Module | Role |
-|---|---|
-| `attention_tracker_analyzer.py`, `attnlink_analyzer.py`, `core_reranker_analyzer.py` | attention-based: prompt-injection detection, schema-column ranking, document relevance |
-| `hidden_states_analyzer.py` | load captured hidden states, apply a reduction |
-| `hnode_hallucination_analyzer.py`, `science_hallucination_analyzer.py` | hallucination detection with trained probes |
-
-## workers/
+### `analyzers/`
 
 | Module | Role |
 |---|---|
-| `hs_capture_worker.py`, `qk_capture_worker.py` | hidden-state and Q/K capture: eager hooks and the CUDA-graph aperture path |
-| `steer_worker.py` | activation steering: eager hooks and the CUDA-graph buffer path |
-| `_common.py` | stateless helpers shared by the capture workers |
+| `attention_tracker_analyzer.py`, `attnlink_analyzer.py`, `core_reranker_analyzer.py` | Attention-based: prompt-injection detection, schema-column ranking, document relevance. |
+| `hidden_states_analyzer.py` | Loads captured hidden states and applies a reduction. |
+| `hnode_hallucination_analyzer.py`, `science_hallucination_analyzer.py` | Hallucination detection with trained probes. |
 
-## utils/
-
-`utils/` holds helpers tied to one use case, not shared engine code. It currently wraps `hnode/`; new use-case helpers get their own subfolder here.
+### `workers/`
 
 | Module | Role |
 |---|---|
-| `hnode/__init__.py`, `hnode/score.py` | H-Node hallucination probe: numpy-only scorer for a trained probe |
+| `hs_capture_worker.py`, `qk_capture_worker.py` | Hidden-state and Q/K capture: eager hooks and the CUDA-graph aperture path. |
+| `steer_worker.py` | Activation steering: eager hooks and the CUDA-graph buffer path. |
+| `_common.py` | Stateless helpers shared by the capture workers. |
 
-## core/
+### `utils/`
 
-| Module | Role |
-|---|---|
-| `runner.py` | adapter isolating every vLLM V2 model-runner access |
-| `_plugin.py` | vLLM plugin entry point: patches engine, runner and serve path; registered in `setup.py` as `mia.core._plugin:register` |
-
-## core/hooks/
+Helpers tied to a single use case, not shared engine code. New use-case helpers get their own subfolder.
 
 | Module | Role |
 |---|---|
-| `ops.py` | custom ops for CUDA-graph QK/HS capture and steering |
-| `capture_triton.py`, `steer_triton.py` | Triton-fused kernels: `capture_hs` scatter, `steer_buffer` |
-| `install.py`, `install_hs.py`, `install_steer.py` | CUDA-graph installs: QK capture, HS capture, buffer-mode steering |
-| `hosts.py` | per-layer static-buffer hosts |
-| `registry.py` | per-worker device routing slabs and host registry |
-| `steer_routing_gpu.py` | GPU scatter of the steer and capture routing slabs |
-| `drain.py` | worker-flush barrier for CUDA-graph capture |
-| `run_mode.py` | env half of a run's mode: which worker, graph or eager |
+| `hnode/__init__.py`, `hnode/score.py` | H-Node hallucination probe: numpy-only scorer for a trained probe. |
 
-## core/aperture/
+### `core/`
+
+The engine. Its own modules are listed first, followed by its four subpackages.
 
 | Module | Role |
 |---|---|
-| `capture_aperture.py` | fixed GPU aperture written in-graph at an advancing cursor, drained off-loop |
-| `aperture_drain_hs.py`, `aperture_drain_qk.py`, `aperture_sink.py`, `aperture_reader.py` | host drains (HS, QK), raw-file write path, read-back from dump and sidecar |
-| `aperture_metadata.py` | per-step sidecar mapping aperture rows to (req_id, layer, tokens) |
-| `aperture_gather.py`, `aperture_run_index.py`, `aperture_trim.py` | hybrid gather into per-request artifacts, its row index, reclaiming gathered files |
-| `aperture_sizing.py` | byte budgets and the safe `max_num_batched_tokens` cap |
+| `runner.py` | Adapter isolating every vLLM V2 model-runner access. |
+| `_plugin.py` | vLLM plugin entry point: patches engine, runner and serve path. Registered in `setup.py` as `mia.core._plugin:register`. |
 
-## core/delivery/
+#### `core/hooks/`
 
 | Module | Role |
 |---|---|
-| `delivery_selector.py`, `delivery_router.py`, `sizing.py` | pick the transport (RPC or disk), and the size prediction behind it |
-| `per_request_delivery.py` | per-request demux, finish-tracking, assembly |
-| `offload_process.py`, `writer_process.py`, `server_analyze_process.py` | background processes: ship files to the client, write off the engine GIL, run server-side reduce |
-| `artifact_writer.py`, `run_artifact.py` | serialize and write artifacts; eager-format run artifacts |
-| `artifact_quant.py` | on-GPU quantization of captured artifacts |
-| `tensor_pack.py` | pack a tensor tree into one uint8 buffer plus manifest |
-| `delivered_probes.py` | delivered HS and graph-mode Q/K data in eager shapes |
-| `delivery_route.py` | API-server read route and `save_to_disk` writer |
-| `disk_flush_probe.py` | coalesces the per-request `flush_disk` RPC under the aperture |
+| `ops.py` | Custom ops for CUDA-graph QK/HS capture and steering. |
+| `capture_triton.py`, `steer_triton.py` | Triton-fused kernels: `capture_hs` scatter, `steer_buffer`. |
+| `install.py`, `install_hs.py`, `install_steer.py` | CUDA-graph installs: QK capture, HS capture, buffer-mode steering. |
+| `hosts.py` | Per-layer static-buffer hosts. |
+| `registry.py` | Per-worker device routing slabs and host registry. |
+| `steer_routing_gpu.py` | GPU scatter of the steer and capture routing slabs. |
+| `drain.py` | Worker-flush barrier for CUDA-graph capture. |
+| `run_mode.py` | Env half of a run's mode: which worker, graph or eager. |
 
-`load_delivered` lives in `core/aperture/aperture_gather.py`.
-
-## core/runtime/
+#### `core/aperture/`
 
 | Module | Role |
 |---|---|
-| `child_process.py` | start helper child processes, daemonic TP workers included |
-| `thread_device.py`, `cpu_budget.py` | bind threads to their device; CPUs the process may use |
-| `tp_shard.py` | TP capture geometry, rank dirs, shard merging |
-| `census.py` | opt-in GPU-to-host offload cost attribution |
+| `capture_aperture.py` | Fixed GPU aperture written in-graph at an advancing cursor, drained off-loop. |
+| `aperture_drain_hs.py`, `aperture_drain_qk.py`, `aperture_sink.py`, `aperture_reader.py` | Host drains (HS, QK), raw-file write path, read-back from dump and sidecar. |
+| `aperture_metadata.py` | Per-step sidecar mapping aperture rows to (req_id, layer, tokens). |
+| `aperture_gather.py`, `aperture_run_index.py`, `aperture_trim.py` | Hybrid gather into per-request artifacts, its row index, reclaiming gathered files. `load_delivered` lives in `aperture_gather.py`. |
+| `aperture_sizing.py` | Byte budgets and the safe `max_num_batched_tokens` cap. |
 
-## Dependency direction
+#### `core/delivery/`
 
-- `llm` / `client` use `core`; `core` uses `vllm`.
+| Module | Role |
+|---|---|
+| `delivery_selector.py`, `delivery_router.py`, `sizing.py` | Pick the transport (RPC or disk) and the size prediction behind it. |
+| `per_request_delivery.py` | Per-request demux, finish-tracking, assembly. |
+| `offload_process.py`, `writer_process.py`, `server_analyze_process.py` | Background processes: ship files to the client, write off the engine GIL, run server-side reduce. |
+| `artifact_writer.py`, `run_artifact.py` | Serialize and write artifacts; eager-format run artifacts. |
+| `artifact_quant.py` | On-GPU quantization of captured artifacts. |
+| `tensor_pack.py` | Pack a tensor tree into one uint8 buffer plus manifest. |
+| `delivered_probes.py` | Delivered HS and graph-mode Q/K data in eager shapes. |
+| `delivery_route.py` | API-server read route and `save_to_disk` writer. |
+| `disk_flush_probe.py` | Coalesces the per-request `flush_disk` RPC under the aperture. |
+
+#### `core/runtime/`
+
+| Module | Role |
+|---|---|
+| `child_process.py` | Start helper child processes, daemonic TP workers included. |
+| `thread_device.py`, `cpu_budget.py` | Bind threads to their device; CPUs the process may use. |
+| `tp_shard.py` | TP capture geometry, rank dirs, shard merging. |
+| `census.py` | Opt-in GPU-to-host offload cost attribution. |
+
+## Dependency Direction
+
+- `llm` and `client` use `core`; `core` uses `vllm`.
 - `workers` and `analyzers` sit beside `core`: `core/hooks`, `core/aperture` and `core/delivery` import `mia.workers`, and `core/delivery` imports `mia.artifacts`.
