@@ -1,5 +1,9 @@
 # Running the Notebooks
 
+> **Outdated; these notebooks will be updated for MIA.** They still use the vLLM-Hook v0 API
+> (`vllm_hook_plugins`): run them from [v0.2.0](https://github.com/IBM/vLLM-Hook/tree/v0.2.0), and in Colab have the setup cell check out
+> `v0.2.0` instead of `main`.
+
 The `notebooks/` directory includes local notebooks and Google Colab variants
 for the same demos.
 

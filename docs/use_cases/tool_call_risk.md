@@ -15,7 +15,7 @@ Because the score comes from prefill, it is available before the model samples a
 
 ## How it integrates with vLLM-Hook
 
-`ProbeHiddenStatesWorker` captures the last-token hidden state at the probe layer during prefill (`hooks_on="prefill"`, `mode="last_token"`). `ToolCallRiskAnalyzer` loads the probe and returns:
+MIA's hidden-state worker (`capture_hs`) captures the residual stream at the probe layer and keeps the last-token vector of each prompt. `ToolCallRiskAnalyzer` loads the probe and returns:
 
 ```python
 {
@@ -66,6 +66,8 @@ The demo scores a clean step and two injected steps (the model ignores the injec
 Hidden states captured through vLLM-Hook match HuggingFace. With identical token ids on the same GPU, the two agree to 0.13% relative L2 in fp32, and in bf16 they differ by as much as two HuggingFace runs do (about 2.5%).
 
 On 280 agent steps of about 4,500 prompt tokens each (Qwen2.5-7B-Instruct, bf16, one RTX 4090, vLLM 0.21.0), capturing one layer to memory took 159.1 s against 158.6 s with capture off and 158.5 s for plain vLLM with CUDA graphs.
+
+These measurements, and the probe itself, come from the pre-MIA capture path on vLLM 0.21.0 in eager mode. The probe has not yet been re-checked against MIA's CUDA-graph capture on vLLM 0.29.
 
 Full numbers and scripts are in the training repo.
 

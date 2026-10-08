@@ -1,31 +1,22 @@
-"""Serve-path
-
-Launch a `vllm serve` instance in a separate terminal:
-
-    VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_HOOK_WORKER=steer \\
-        vllm serve microsoft/Phi-3-mini-4k-instruct \\
-        --enforce-eager --max-model-len 2048 --port 8770
-
-Different requests can carry different steer configs via
-``extra_body["vllm_xargs"]["steer"]`` — vllm_xargs requires scalar values,
-so the per-request dict is JSON-encoded as a string. The plugin
-(_hook_plugin._patched_generate) decodes it back to a dict before the
-worker reads it.
-"""
+"""Activation steering over ``vllm serve``: per-request steer configs via vllm_xargs."""
 import json
+
 import openai
+
+from _paths import config_path, vector_path
+from _serve import STEER, base_url, require_server
 
 
 if __name__ == "__main__":
-    base_url = "http://localhost:8770/v1"
     model = "microsoft/Phi-3-mini-4k-instruct"
-    config_path = f'model_configs/activation_steer/{model.split("/")[-1]}-chinese.json'
+    require_server(model, STEER, max_model_len=4096)
+    cfg_file = config_path(f'activation_steer/{model.split("/")[-1]}-chinese.json')
 
-    with open(config_path) as f:
+    with open(cfg_file) as f:
         config = json.load(f)
     default_config = config["steering"]
 
-    client = openai.OpenAI(base_url=base_url, api_key="EMPTY")
+    client = openai.OpenAI(base_url=base_url(), api_key="EMPTY")
 
     test_case = [
         "Hello hello! Thank you for coming to our Expo talk today. I hope you enjoyed our talk so far. Do you have any questions?"
@@ -44,7 +35,7 @@ if __name__ == "__main__":
     print(response.choices[0].message.content)
 
     print("=" * 50)
-    override = {**default_config, "method": "add_vector", "coefficient": 4, "optimal_layer": 0, "vector_path": "steering_vectors/phi3_korean.pt"}
+    override = {**default_config, "method": "add_vector", "coefficient": 4, "optimal_layer": 0, "vector_path": vector_path("phi3_korean.pt")}
     response = client.chat.completions.create(
         messages=[{"role": "user", "content": test_case[0]}],
         extra_body={"vllm_xargs": {"steer": json.dumps(override)},

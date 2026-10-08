@@ -1,0 +1,15 @@
+# Cache and runtime artifacts
+cache/
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+.DS_Store
+
+# debug output
+output*.txt
+
+# capture-aperture dumps (MIA_APERTURE_DIR defaults to these RELATIVE paths)
+hs_aperture_dump/
+qk_aperture_dump/
+
+ignore/
