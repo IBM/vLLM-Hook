@@ -1,8 +1,10 @@
 """Tool-call risk scoring of AgentDojo agent steps (inference only).
 
-Runs offline with `MiaLLM`. Downloads a pre-built Qwen2.5-7B-Instruct probe and three
-AgentDojo steps on first run, renders each step with the model's tool-calling chat template,
-scores the last prompt token, and prints the score next to the action the model generated.
+Runs offline with `MiaLLM`. The same demo over `vllm serve` is kept, commented out, at the end.
+
+Downloads a pre-built Qwen2.5-7B-Instruct probe and three AgentDojo steps on first run, renders
+each step with the model's tool-calling chat template, scores the last prompt token, and prints
+the score next to the action the model generated.
 
 The artifact is hosted with the training code and cached under ./cache/tool_call_risk/:
 https://github.com/rishabhsinha17/latent-state-auditing/tree/main/serving/vllm_hook
@@ -51,12 +53,12 @@ def ensure_artifacts():
             )
 
 
-def report(steps, outputs, result):
+def report(steps, actions, result):
     """Print the verdict and probability per step, with the generated action."""
     print(f"Layer: {result['layer']}  |  threshold: {result['threshold']}")
     print("-" * 78)
-    for s, out, p, verdict in zip(steps, outputs, result["probabilities"], result["verdicts"]):
-        action = out.outputs[0].text.strip().replace("\n", " ")
+    for s, text, p, verdict in zip(steps, actions, result["probabilities"], result["verdicts"]):
+        action = text.strip().replace("\n", " ")
         print(f"[{verdict:>4s}]  P(unsafe)={p:.3f}  {s['label']}")
         print(f"        task:   {s['messages'][1]['content'].strip()[:100]}")
         print(f"        action: {action[:160]}\n")
@@ -91,10 +93,51 @@ def main():
     spec = {"probe_path": probe_path}
     if args.threshold is not None:
         spec["threshold"] = args.threshold
-    report(steps, outputs, llm.analyze(analyzer_spec=spec, run_id=run_id))
+    report(steps, [o.outputs[0].text for o in outputs],
+           llm.analyze(analyzer_spec=spec, run_id=run_id))
+
+
+# --- Server mode ---------------------------------------------------------------------------
+# The same demo against `vllm serve`. Start the server in another terminal:
+#
+#   VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+#       vllm serve Qwen/Qwen2.5-7B-Instruct \
+#       --max-model-len 16384 --port 8770 --gpu-memory-utilization 0.8
+#
+# then uncomment serve_main() and call it instead of main() at the bottom.
+#
+# def serve_main():
+#     from transformers import AutoTokenizer
+#
+#     from mia import MiaClient
+#     from _serve import HS, require_server
+#
+#     ensure_artifacts()
+#     probe_path = os.path.join(ART_DIR, "probe.npz")
+#     with open(os.path.join(ART_DIR, "demo_steps.jsonl")) as f:
+#         steps = [json.loads(line) for line in f]
+#
+#     url = require_server(MODEL, HS, max_model_len=16384)
+#     client = MiaClient(base_url=url, analyzer_name="tool_call_risk", config_file=INFER_CFG)
+#     tokenizer = AutoTokenizer.from_pretrained(MODEL)
+#
+#     # Render each step with the tools locally and send raw text, so the server sees the same
+#     # prompt as offline mode. One request for all steps: a run holds its last response's requests.
+#     prompts = [tokenizer.apply_chat_template(s["messages"], tools=s["tools"],
+#                                              add_generation_prompt=True, tokenize=False)
+#                for s in steps]
+#     run_id = "toolcallrisk_demo"
+#     response = client.generate_text(prompts, model=MODEL, max_tokens=256, temperature=0.0,
+#                                     save_to_disk=True, run_id=run_id)
+#     actions = [c.text for c in sorted(response.choices, key=lambda c: c.index)]
+#
+#     report(steps, actions,
+#            client.analyze(analyzer_spec={"probe_path": probe_path}, run_id=run_id))
+# --- end of server mode ---
 
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     main()
+    # serve_main()  # server mode: see the block above
