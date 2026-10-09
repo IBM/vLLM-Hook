@@ -67,7 +67,9 @@ Hidden states captured through vLLM-Hook match HuggingFace. With identical token
 
 On 280 agent steps of about 4,500 prompt tokens each (Qwen2.5-7B-Instruct, bf16, one RTX 4090, vLLM 0.21.0), capturing one layer to memory took 159.1 s against 158.6 s with capture off and 158.5 s for plain vLLM with CUDA graphs.
 
-These measurements, and the probe itself, come from the pre-MIA capture path on vLLM 0.21.0 in eager mode. The probe has not yet been re-checked against MIA's CUDA-graph capture on vLLM 0.29.
+These measurements, and the probe itself, come from the pre-MIA capture path on vLLM 0.21.0 in eager mode. Recapturing 440 of the training steps through MIA on vLLM 0.29 (RTX 4090, CUDA graphs) reproduces those features. The median cosine to the training vectors is 0.99966 (minimum 0.998), the largest probe score shift is 0.06, and AUROC on the subset is 0.902 for both. Only 4 of 440 verdicts change at the stored threshold.
+
+On a 24 GB GPU the demo sets `MIA_APERTURE_GPU_BYTES` to 512 MiB. One captured layer needs about 60 MB per 8192-token step, and the 4 GiB default aperture leaves a 7B model no room for KV cache at `gpu_memory_utilization=0.8`.
 
 Full numbers and scripts are in the training repo.
 

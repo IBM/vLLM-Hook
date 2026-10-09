@@ -78,11 +78,12 @@ def main():
 
     llm = MiaLLM(model=MODEL, worker_name="capture_hs", analyzer_name="tool_call_risk",
                  config_file=INFER_CFG, hook_dir="/dev/shm/mia",
-                 gpu_memory_utilization=0.85, max_model_len=16384)
+                 gpu_memory_utilization=0.8, max_model_len=4096)
 
     prompts = [
         {"prompt_token_ids": llm.tokenizer.apply_chat_template(
-            s["messages"], tools=s["tools"], add_generation_prompt=True, tokenize=True)}
+            s["messages"], tools=s["tools"], add_generation_prompt=True, tokenize=True,
+            return_dict=False)}
         for s in steps
     ]
 
@@ -100,9 +101,9 @@ def main():
 # --- Server mode ---------------------------------------------------------------------------
 # The same demo against `vllm serve`. Start the server in another terminal:
 #
-#   VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
+#   VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states MIA_APERTURE_GPU_BYTES=536870912 \
 #       vllm serve Qwen/Qwen2.5-7B-Instruct \
-#       --max-model-len 16384 --port 8770 --gpu-memory-utilization 0.8
+#       --max-model-len 4096 --port 8770 --gpu-memory-utilization 0.8
 #
 # then uncomment serve_main() and call it instead of main() at the bottom.
 #
@@ -117,7 +118,7 @@ def main():
 #     with open(os.path.join(ART_DIR, "demo_steps.jsonl")) as f:
 #         steps = [json.loads(line) for line in f]
 #
-#     url = require_server(MODEL, HS, max_model_len=16384)
+#     url = require_server(MODEL, HS, max_model_len=4096)
 #     client = MiaClient(base_url=url, analyzer_name="tool_call_risk", config_file=INFER_CFG)
 #     tokenizer = AutoTokenizer.from_pretrained(MODEL)
 #
@@ -137,6 +138,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # One captured layer fills ~60 MB per 8192-token step. The 4 GiB default aperture leaves a
+    # 7B model no KV cache on a 24 GB card, so default to 512 MiB (an explicit value wins).
+    os.environ.setdefault("MIA_APERTURE_GPU_BYTES", str(512 << 20))
     mp.set_start_method("spawn", force=True)
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     main()
