@@ -11,6 +11,7 @@ from mia.analyzers.hidden_states_analyzer import HiddenStatesAnalyzer
 from mia.analyzers.science_hallucination_analyzer import ScienceHallucinationAnalyzer
 from mia.analyzers.hnode_hallucination_analyzer import HNodeHallucinationAnalyzer
 from mia.analyzers.attnlink_analyzer import AttnLinkAnalyzer
+from mia.analyzers.tool_call_risk_analyzer import ToolCallRiskAnalyzer
 
 
 def register_plugins():
@@ -25,6 +26,7 @@ def register_plugins():
     PluginRegistry.register_analyzer("hidden_states",         HiddenStatesAnalyzer)
     PluginRegistry.register_analyzer("science_hallucination", ScienceHallucinationAnalyzer)
     PluginRegistry.register_analyzer("hnode_hallucination",   HNodeHallucinationAnalyzer)
+    PluginRegistry.register_analyzer("tool_call_risk",        ToolCallRiskAnalyzer)
 
 __all__ = [
     "PluginRegistry",
@@ -39,5 +41,6 @@ __all__ = [
     "HiddenStatesAnalyzer",
     "ScienceHallucinationAnalyzer",
     "HNodeHallucinationAnalyzer",
+    "ToolCallRiskAnalyzer",
     "register_plugins"
 ]
