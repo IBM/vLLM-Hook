@@ -7,12 +7,17 @@ analyzers work correctly with vLLM models.
 
 ```
 tests/
-├── conftest.py     shared fixtures, the `gpu` marker and `requires_gpu`
-└── use_cases/      one test per use case — these boot a real engine
+├── conftest.py        shared fixtures, markers, and `requires_gpu`
+├── use_cases/         one GPU-backed test per use case
+└── cpu_behavioral/    Apple Silicon vLLM CPU behavioral fixtures
 ```
 
 `use_cases/` is where a new worker or analyzer belongs — add a test there alongside your
 demo.
+
+`cpu_behavioral/` is for Apple Silicon vLLM CPU parity fixtures. These scripts also boot a
+real vLLM engine, but they use the source-built vLLM CPU path instead of CUDA. Each fixture
+must call `generate()` and map to a real example/use case, not just an internal hook probe.
 
 ---
 ## Run Tests
@@ -41,6 +46,45 @@ pytest tests/use_cases/test_attntracker.py -m gpu -vv
 pytest "tests/use_cases/test_attntracker.py::test_attention_tracker[gpt2]" -vv
 ```
 
+## CPU Behavioral Fixtures
+
+The CPU fixtures live in `tests/cpu_behavioral/`:
+
+- `run_hidden_states_cpu.py`
+- `run_attention_tracker_cpu.py`
+- `run_activation_steer_cpu.py`
+- `run_core_reranker_cpu.py`
+
+They require the Apple Silicon vLLM CPU setup documented in
+`tests/cpu_behavioral/docs/APPLE_SILICON_VLLM_CPU_INSTALL.md`.
+
+Run one fixture directly:
+
+```bash
+KMP_DUPLICATE_LIB_OK=TRUE \
+OMP_NUM_THREADS=1 \
+VLLM_CPU_OMP_THREADS_BIND=nobind \
+TRITON_DEFAULT_BACKEND=cpu \
+TRITON_CACHE_DIR=/private/tmp/triton-cache \
+TRITON_DISABLE_OPENMP=1 \
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+MIA_WRITER_PROCESS=0 \
+.venv-mac-cpu/bin/python tests/cpu_behavioral/run_hidden_states_cpu.py
+```
+
+Run the optional pytest wrapper. It skips by default, because each case boots vLLM CPU.
+Set `MIA_RUN_VLLM_CPU_FIXTURES=1` to run the fixture scripts:
+
+```bash
+MIA_RUN_VLLM_CPU_FIXTURES=1 \
+.venv-mac-cpu/bin/python -m pytest \
+  tests/cpu_behavioral/test_vllm_cpu_fixtures.py \
+  -vv -s
+```
+
+Use `MIA_CPU_MODEL` to point the fixtures at a different cached model. If unset, they use
+`facebook/opt-125m`.
+
 ---
 
 ## Common Failures
@@ -53,3 +97,5 @@ pytest "tests/use_cases/test_attntracker.py::test_attention_tracker[gpt2]" -vv
   above.
 - **`Cannot find any model weights`**: the model was not downloaded (offline, or a gated model
   without `hf auth login`).
+- **CPU fixture cannot reach Hugging Face**: set `MIA_CPU_MODEL` to a local/cached model path
+  or run once with network access so vLLM can resolve the model.
