@@ -396,7 +396,7 @@ class QKCaptureWorker:
 
             if metadata is None:
                 return
-            if torch.cuda.is_current_stream_capturing():
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
                 return None
 
             query_start_loc, seq_lens = get_query_metadata(metadata)
