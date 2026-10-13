@@ -112,6 +112,8 @@ cd "$REPO_ROOT"
 
 ## Run the Hidden-State Fixture
 
+Use this environment block for native Apple Silicon vLLM CPU fixture runs:
+
 ```bash
 export REPO_ROOT="$(pwd)"
 
@@ -141,6 +143,122 @@ model.decoder.layers.1: 1 tensors, shape=(768,)
 model.decoder.layers.2: 1 tensors, shape=(768,)
 model.decoder.layers.3: 1 tensors, shape=(768,)
 CPU hidden-state behavior fixture passed.
+```
+
+## Run Fixtures and Pytest Checks
+
+Run these commands from the repo root after the venv, `triton-cpu`, vLLM CPU,
+and MIA install steps above.
+Each fixture uses `MIA_CPU_MODEL` if set, otherwise `facebook/opt-125m`; make
+sure that model is cached locally or that Hugging Face network access is
+available.
+
+### Hidden-state generation fixture
+
+Starts vLLM CPU, runs `generate()`, captures hidden states, and checks CPU
+tensors.
+
+```bash
+rm -rf /private/tmp/triton-cache
+
+unset TRITON_LOCAL_LIBOMP_PATH
+unset DYLD_INSERT_LIBRARIES
+
+KMP_DUPLICATE_LIB_OK=TRUE \
+OMP_NUM_THREADS=1 \
+VLLM_CPU_OMP_THREADS_BIND=nobind \
+TRITON_DEFAULT_BACKEND=cpu \
+TRITON_CACHE_DIR=/private/tmp/triton-cache \
+TRITON_DISABLE_OPENMP=1 \
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+MIA_WRITER_PROCESS=0 \
+.venv-mac-cpu/bin/python tests/cpu_behavioral/run_hidden_states_cpu.py
+```
+
+### Attention Tracker fixture
+
+Starts vLLM CPU, runs `generate()` with Q/K capture, then calls the Attention
+Tracker analyzer on the captured probes.
+
+```bash
+rm -rf /private/tmp/triton-cache
+
+unset TRITON_LOCAL_LIBOMP_PATH
+unset DYLD_INSERT_LIBRARIES
+
+KMP_DUPLICATE_LIB_OK=TRUE \
+OMP_NUM_THREADS=1 \
+VLLM_CPU_OMP_THREADS_BIND=nobind \
+TRITON_DEFAULT_BACKEND=cpu \
+TRITON_CACHE_DIR=/private/tmp/triton-cache \
+TRITON_DISABLE_OPENMP=1 \
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+MIA_WRITER_PROCESS=0 \
+.venv-mac-cpu/bin/python tests/cpu_behavioral/run_attention_tracker_cpu.py
+```
+
+### Activation Steering fixture
+
+Starts vLLM CPU, runs `generate()` with the `steer` worker, and checks that
+steered generation completes. The fixture writes a local zero-effect dummy
+steering vector so it tests the worker path without asserting model quality.
+
+```bash
+rm -rf /private/tmp/triton-cache
+
+unset TRITON_LOCAL_LIBOMP_PATH
+unset DYLD_INSERT_LIBRARIES
+
+KMP_DUPLICATE_LIB_OK=TRUE \
+OMP_NUM_THREADS=1 \
+VLLM_CPU_OMP_THREADS_BIND=nobind \
+TRITON_DEFAULT_BACKEND=cpu \
+TRITON_CACHE_DIR=/private/tmp/triton-cache \
+TRITON_DISABLE_OPENMP=1 \
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+MIA_WRITER_PROCESS=0 \
+.venv-mac-cpu/bin/python tests/cpu_behavioral/run_activation_steer_cpu.py
+```
+
+### CoRe reranker fixture
+
+Starts vLLM CPU, runs two Q/K capture generations, saves both runs to disk, and
+checks that the CoRe analyzer returns one score and one rank per document.
+
+```bash
+rm -rf /private/tmp/triton-cache
+
+unset TRITON_LOCAL_LIBOMP_PATH
+unset DYLD_INSERT_LIBRARIES
+
+KMP_DUPLICATE_LIB_OK=TRUE \
+OMP_NUM_THREADS=1 \
+VLLM_CPU_OMP_THREADS_BIND=nobind \
+TRITON_DEFAULT_BACKEND=cpu \
+TRITON_CACHE_DIR=/private/tmp/triton-cache \
+TRITON_DISABLE_OPENMP=1 \
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+MIA_WRITER_PROCESS=0 \
+.venv-mac-cpu/bin/python tests/cpu_behavioral/run_core_reranker_cpu.py
+```
+
+### Optional pytest wrapper
+
+By default, pytest skips these because each case boots vLLM. Set
+`MIA_RUN_VLLM_CPU_FIXTURES=1` when you want pytest to call the same fixture
+scripts above.
+
+```bash
+MIA_RUN_VLLM_CPU_FIXTURES=1 \
+.venv-mac-cpu/bin/python -m pytest \
+  tests/cpu_behavioral/test_vllm_cpu_fixtures.py \
+  -vv -s
+```
+
+To verify collection without booting vLLM, omit the env var:
+
+```bash
+.venv-mac-cpu/bin/python -m pytest tests/cpu_behavioral/test_vllm_cpu_fixtures.py -vv -s
 ```
 
 ## Apple Silicon Triton Patch
