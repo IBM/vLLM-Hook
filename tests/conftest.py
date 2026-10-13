@@ -24,6 +24,10 @@ def pytest_configure(config):
     # Select engine tests with -m (`-m gpu` / `-m "not gpu"`), never -k: -k matches names only.
     config.addinivalue_line(
         "markers", "gpu: boots a real vLLM engine; needs a GPU (skipped otherwise)")
+    config.addinivalue_line(
+        "markers",
+        "cpu_behavior: local CPU behavior baseline tests for MIA parity work",
+    )
 
 
 def has_gpu() -> bool:
