@@ -13,7 +13,7 @@ analyzer_name="hidden_states"
 
 The atomic test must call `generate()`. Hook installation alone is not enough.
 
-## Why Docker
+## Native Apple Silicon Path
 
 Native macOS reached important milestones:
 
@@ -52,8 +52,6 @@ Preloading `libomp` with `DYLD_INSERT_LIBRARIES` caused a model-load segfault in
 TVMFFIEnvRegisterCAPI
 ```
 
-Docker keeps a second local test path while moving the toolchain to Linux ARM64.
-
 ## Native macOS Notes
 
 Native macOS is useful for investigation and now has a local passing path for the
@@ -66,7 +64,6 @@ The recovered native install path is preserved separately in
 
 When this fails, record the first failing stage:
 
-- `docker-build`: image build fails before the test starts.
 - `install`: vLLM, Triton CPU, or MIA cannot build or install.
 - `import`: `import vllm`, `import triton`, or `import mia` fails.
 - `triton-backend`: Triton imports but vLLM reports `HAS_TRITON False`.

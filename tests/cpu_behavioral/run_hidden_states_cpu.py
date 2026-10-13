@@ -20,13 +20,22 @@ MODEL_ID = os.environ.get("MIA_CPU_MODEL", "facebook/opt-125m")
 CONFIG_FILE = REPO_ROOT / "model_configs" / "hidden_states" / "Qwen2-1.5B-Instruct.json"
 
 
+def log(message: str) -> None:
+    print(f"[hidden-states-cpu] {message}", flush=True)
+
+
 def main() -> None:
+    log(f"repo={REPO_ROOT}")
+    log(f"model={MODEL_ID}")
+    log(f"config={CONFIG_FILE}")
     mp.set_start_method("spawn", force=True)
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     os.environ.setdefault("MIA_WRITER_PROCESS", "0")
 
+    log("registering MIA plugins")
     register_plugins()
 
+    log("building vLLM CPU engine with capture_hs worker")
     llm = MiaLLM(
         model=MODEL_ID,
         worker_name="capture_hs",
@@ -45,17 +54,20 @@ def main() -> None:
         "Hidden states test.",
     ]
 
+    log(f"running generate() for {len(prompts)} prompt(s)")
     outputs = llm.generate(
         prompts,
         SamplingParams(temperature=0.0, max_tokens=1),
         use_hook=True,
     )
+    log("running hidden_states analyzer")
     stats = llm.analyze(analyzer_spec={"reduce": "none"}, probes=outputs[0].probes)
 
     hidden_states = stats["hidden_states"]
     assert hidden_states, "Expected at least one captured hidden-state layer."
 
     hidden_size = llm.llm.llm_engine.model_config.hf_config.hidden_size
+    log(f"asserting captured tensors have hidden_size={hidden_size}")
     for layer_name, tensors in sorted(hidden_states.items()):
         assert len(tensors) == len(prompts), (
             f"{layer_name}: expected {len(prompts)} tensors, got {len(tensors)}"
@@ -64,10 +76,11 @@ def main() -> None:
             assert tensor.device.type == "cpu"
             assert tensor.shape == torch.Size([hidden_size])
             assert torch.isfinite(tensor).all()
-        print(f"{layer_name}: {len(tensors)} tensors, shape=({hidden_size},)")
+        log(f"{layer_name}: {len(tensors)} tensor(s), shape=({hidden_size},)")
 
+    log("shutting down vLLM engine")
     llm.llm_engine.engine_core.shutdown()
-    print("CPU hidden-state behavior fixture passed.")
+    log("passed")
 
 
 if __name__ == "__main__":
