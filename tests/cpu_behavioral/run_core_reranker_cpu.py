@@ -10,11 +10,12 @@ import torch
 from vllm import SamplingParams
 
 from mia import MiaLLM, register_plugins
+from backend_support import assert_backend, hook_directory
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID = os.environ.get("MIA_CPU_MODEL", "facebook/opt-125m")
-HOOK_DIR = REPO_ROOT / "tests" / "cpu_behavioral" / ".hooks"
+HOOK_DIR = hook_directory(REPO_ROOT)
 
 
 def log(message: str) -> None:
@@ -68,6 +69,7 @@ def main() -> None:
     register_plugins()
 
     log("building vLLM CPU engine with capture_qk worker")
+    assert_backend()
     llm = MiaLLM(
         model=MODEL_ID,
         worker_name="capture_qk",
@@ -82,40 +84,41 @@ def main() -> None:
         enforce_eager=True,
     )
 
-    doc_prompt, query_spec, doc_count = _prompt_and_spec(
-        llm.tokenizer,
-        "Which city is older: Rome or New York?",
-    )
-    na_prompt, na_spec, _ = _prompt_and_spec(llm.tokenizer, "N/A")
-    log(f"built document prompt with {doc_count} document span(s)")
+    try:
+        doc_prompt, query_spec, doc_count = _prompt_and_spec(
+            llm.tokenizer,
+            "Which city is older: Rome or New York?",
+        )
+        na_prompt, na_spec, _ = _prompt_and_spec(llm.tokenizer, "N/A")
+        log(f"built document prompt with {doc_count} document span(s)")
 
-    log("running document Q/K capture generation")
-    llm.generate(
-        doc_prompt,
-        SamplingParams(temperature=0.0, max_tokens=1),
-        save_to_disk=True,
-        run_id="core-reranker-cpu-doc",
-    )
-    log("running N/A baseline Q/K capture generation")
-    llm.generate(
-        na_prompt,
-        SamplingParams(temperature=0.0, max_tokens=1),
-        save_to_disk=True,
-        run_id="core-reranker-cpu-na",
-    )
-    log("running core_reranker analyzer")
-    stats = llm.analyze(
-        analyzer_spec={"query_spec": query_spec, "na_spec": na_spec},
-        run_ids=["core-reranker-cpu-doc", "core-reranker-cpu-na"],
-    )
+        log("running document Q/K capture generation")
+        llm.generate(
+            doc_prompt,
+            SamplingParams(temperature=0.0, max_tokens=1),
+            save_to_disk=True,
+            run_id="core-reranker-cpu-doc",
+        )
+        log("running N/A baseline Q/K capture generation")
+        llm.generate(
+            na_prompt,
+            SamplingParams(temperature=0.0, max_tokens=1),
+            save_to_disk=True,
+            run_id="core-reranker-cpu-na",
+        )
+        log("running core_reranker analyzer")
+        stats = llm.analyze(
+            analyzer_spec={"query_spec": query_spec, "na_spec": na_spec},
+            run_ids=["core-reranker-cpu-doc", "core-reranker-cpu-na"],
+        )
 
-    assert "scores" in stats
-    assert "ranking" in stats
-    assert len(stats["scores"][0]) == doc_count
-    assert len(stats["ranking"][0]) == doc_count
-
-    log("shutting down vLLM engine")
-    llm.llm_engine.engine_core.shutdown()
+        assert "scores" in stats
+        assert "ranking" in stats
+        assert len(stats["scores"][0]) == doc_count
+        assert len(stats["ranking"][0]) == doc_count
+    finally:
+        log("shutting down vLLM engine")
+        llm.llm_engine.engine_core.shutdown()
     log(f"passed: scores={stats['scores']} ranking={stats['ranking']}")
 
 

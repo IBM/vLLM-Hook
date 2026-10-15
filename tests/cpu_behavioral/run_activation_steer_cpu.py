@@ -10,11 +10,12 @@ import torch
 from vllm import SamplingParams
 
 from mia import MiaLLM, register_plugins
+from backend_support import assert_backend, hook_directory
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID = os.environ.get("MIA_CPU_MODEL", "facebook/opt-125m")
-HOOK_DIR = REPO_ROOT / "tests" / "cpu_behavioral" / ".hooks"
+HOOK_DIR = hook_directory(REPO_ROOT)
 
 
 def log(message: str) -> None:
@@ -56,6 +57,7 @@ def main() -> None:
     register_plugins()
 
     log("building vLLM CPU engine with steer worker")
+    assert_backend()
     llm = MiaLLM(
         model=MODEL_ID,
         worker_name="steer",
@@ -70,19 +72,20 @@ def main() -> None:
         enforce_eager=True,
     )
 
-    log("running generate() with steering enabled")
-    outputs = llm.generate(
-        ["Activation steering CPU fixture."],
-        SamplingParams(temperature=0.0, max_tokens=1),
-        use_hook=True,
-    )
+    try:
+        log("running generate() with steering enabled")
+        outputs = llm.generate(
+            ["Activation steering CPU fixture."],
+            SamplingParams(temperature=0.0, max_tokens=1),
+            use_hook=True,
+        )
 
-    assert len(outputs) == 1
-    assert outputs[0].outputs
-    assert outputs[0].outputs[0].text is not None
-
-    log("shutting down vLLM engine")
-    llm.llm_engine.engine_core.shutdown()
+        assert len(outputs) == 1
+        assert outputs[0].outputs
+        assert outputs[0].outputs[0].text is not None
+    finally:
+        log("shutting down vLLM engine")
+        llm.llm_engine.engine_core.shutdown()
     log("passed")
 
 

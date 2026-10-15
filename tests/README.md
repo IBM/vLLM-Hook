@@ -9,7 +9,7 @@ analyzers work correctly with vLLM models.
 tests/
 ├── conftest.py        shared fixtures, markers, and `requires_gpu`
 ├── use_cases/         one GPU-backed test per use case
-└── cpu_behavioral/    Apple Silicon vLLM CPU behavioral fixtures
+└── cpu_behavioral/    shared demo scenarios with automatic backend discovery
 ```
 
 `use_cases/` is where a new worker or analyzer belongs — add a test there alongside your
@@ -72,18 +72,43 @@ MIA_WRITER_PROCESS=0 \
 .venv-mac-cpu/bin/python tests/cpu_behavioral/run_hidden_states_cpu.py
 ```
 
-Run the optional pytest wrapper. It skips by default, because each case boots vLLM CPU.
-Set `MIA_RUN_VLLM_CPU_FIXTURES=1` to run the fixture scripts:
+Run the shared demo scenarios with automatic backend discovery (no opt-in flag):
 
 ```bash
-MIA_RUN_VLLM_CPU_FIXTURES=1 \
-.venv-mac-cpu/bin/python -m pytest \
-  tests/cpu_behavioral/test_vllm_cpu_fixtures.py \
-  -vv -s
+python -m pytest tests/cpu_behavioral/test_vllm_cpu_fixtures.py -v -rs
 ```
 
-Use `MIA_CPU_MODEL` to point the fixtures at a different cached model. If unset, they use
-`facebook/opt-125m`.
+Each `demo_scenario` (hidden states, Attention Tracker, activation steering, CoRe
+reranking) is paired with CPU, CUDA, and Metal. Discovery checks the installed vLLM
+platform, a device operation, and that scenario's MIA worker/analyzer. Compatible
+cases run the original fixtures through real `generate()` calls in separate
+processes. Unavailable cases skip with a reason; runtime errors and failed fixtures
+fail. A candidate is only validated when its fixture passes.
+
+The current MIA branch supports CPU and CUDA runners. Metal reports unavailable
+because its MIA scenario adapter is not implemented; detecting Apple hardware alone
+would not establish support. One vLLM installation selects one platform. To cover
+CPU and CUDA, provision separate matching Python environments and run the same suite
+in each. The suite does not install runtimes or switch a CUDA build into a CPU build.
+
+CI can enforce coverage with `MIA_REQUIRED_BACKENDS=cpu` (or `cuda`, or a comma-separated
+list). Every scenario for a required backend must execute successfully; unavailable
+required cases fail. This sets coverage requirements, not which cases are discovered.
+
+Optional settings:
+
+- `MIA_BEHAVIOR_MODEL`: model ID or cached local model path; falls back to
+  `MIA_CPU_MODEL`, then `facebook/opt-125m`. The steering fixture still assumes a
+  768-dimensional model.
+- `MIA_BEHAVIOR_TIMEOUT`: seconds per fixture (default 1800).
+
+Pytest gives each case its own temporary hooks directory. Discovery and fixture logs
+are stored in pytest's temporary directories; failures print the log path and tail.
+The historical `run_*_cpu.py` paths remain usable directly on CPU. Their assertions,
+configs, and prompts also supply the shared suite; no fixtures have been removed.
+The steering fixture is a generation smoke test (zero coefficient), not proof of a
+steering effect or numerical parity. CUDA and Metal parity require runs on those
+backends. GitHub Actions provisioning is separate work.
 
 ---
 

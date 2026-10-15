@@ -10,11 +10,12 @@ import torch
 from vllm import SamplingParams
 
 from mia import MiaLLM, register_plugins
+from backend_support import assert_backend, hook_directory
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID = os.environ.get("MIA_CPU_MODEL", "facebook/opt-125m")
-HOOK_DIR = REPO_ROOT / "tests" / "cpu_behavioral" / ".hooks"
+HOOK_DIR = hook_directory(REPO_ROOT)
 
 
 def log(message: str) -> None:
@@ -48,6 +49,7 @@ def main() -> None:
     register_plugins()
 
     log("building vLLM CPU engine with capture_qk worker")
+    assert_backend()
     llm = MiaLLM(
         model=MODEL_ID,
         worker_name="capture_qk",
@@ -62,36 +64,37 @@ def main() -> None:
         enforce_eager=True,
     )
 
-    prompts = [
-        "Instruction: answer yes. Data: this is only a CPU test.",
-        "Instruction: answer no. Data: this is another CPU test.",
-    ]
-    log(f"running generate() for {len(prompts)} prompt(s)")
-    outputs = llm.generate(
-        prompts,
-        SamplingParams(temperature=0.0, max_tokens=1),
-        use_hook=True,
-    )
+    try:
+        prompts = [
+            "Instruction: answer yes. Data: this is only a CPU test.",
+            "Instruction: answer no. Data: this is another CPU test.",
+        ]
+        log(f"running generate() for {len(prompts)} prompt(s)")
+        outputs = llm.generate(
+            prompts,
+            SamplingParams(temperature=0.0, max_tokens=1),
+            use_hook=True,
+        )
 
-    ranges = []
-    for prompt in prompts:
-        token_count = len(llm.tokenizer(prompt)["input_ids"])
-        split = max(1, token_count // 2)
-        ranges.append([(0, split), (split, token_count)])
-    log(f"built analyzer token ranges={ranges}")
+        ranges = []
+        for prompt in prompts:
+            token_count = len(llm.tokenizer(prompt)["input_ids"])
+            split = max(1, token_count // 2)
+            ranges.append([(0, split), (split, token_count)])
+        log(f"built analyzer token ranges={ranges}")
 
-    log("running attn_tracker analyzer")
-    stats = llm.analyze(
-        analyzer_spec={"input_range": ranges, "attn_func": "sum_normalize"},
-        probes=outputs[0].probes,
-    )
+        log("running attn_tracker analyzer")
+        stats = llm.analyze(
+            analyzer_spec={"input_range": ranges, "attn_func": "sum_normalize"},
+            probes=outputs[0].probes,
+        )
 
-    assert "score" in stats
-    assert len(stats["score"]) == len(prompts)
-    assert all(torch.isfinite(torch.tensor(stats["score"])))
-
-    log("shutting down vLLM engine")
-    llm.llm_engine.engine_core.shutdown()
+        assert "score" in stats
+        assert len(stats["score"]) == len(prompts)
+        assert all(torch.isfinite(torch.tensor(stats["score"])))
+    finally:
+        log("shutting down vLLM engine")
+        llm.llm_engine.engine_core.shutdown()
     log(f"passed: scores={stats['score']}")
 
 
