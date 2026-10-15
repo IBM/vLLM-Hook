@@ -1,4 +1,4 @@
-# CPU Behavioral Testing
+# Demo Behavioral Testing
 
 This folder contains CPU behavior tests and install notes for vLLM-Hook/MIA.
 
@@ -57,16 +57,21 @@ MIA_WRITER_PROCESS=0 \
   steering worker.
 - `run_core_reranker_cpu.py`: vLLM CPU Q/K capture runs for the CoRe reranker
   analyzer.
-- `test_vllm_cpu_fixtures.py`: optional pytest wrapper that calls the fixture
-  scripts when `MIA_RUN_VLLM_CPU_FIXTURES=1`.
+- `test_vllm_cpu_fixtures.py`: automatic per-scenario backend discovery and execution
+  using the original fixture scripts.
 - `APPLE_SILICON_VLLM_CPU_INSTALL.md`: native Apple Silicon vLLM CPU install and patch notes.
 - `RESEARCH_NOTES.md`: native macOS findings and troubleshooting notes.
 
-Run the optional pytest wrapper with:
+Run all four demo scenarios on the detected runtime:
 
 ```bash
-MIA_RUN_VLLM_CPU_FIXTURES=1 \
-.venv-mac-cpu/bin/python -m pytest \
-  tests/cpu_behavioral/test_vllm_cpu_fixtures.py \
-  -vv -s
+python -m pytest tests/cpu_behavioral/test_vllm_cpu_fixtures.py -v -rs
 ```
+
+No `MIA_RUN_VLLM_CPU_FIXTURES` flag is needed. CPU and CUDA are discovered from the
+installed vLLM platform, not hardware alone. Metal is unavailable until a MIA
+scenario adapter exists. Failed runtime checks or generation fail the test; absent
+optional backends skip. CI can require a backend with `MIA_REQUIRED_BACKENDS=cpu`.
+See [the test guide](../../README.md) for coverage requirements, model selection,
+logs, isolation, and current limitations. The native Apple Silicon setup above still
+applies when running these tests in a CPU environment.
