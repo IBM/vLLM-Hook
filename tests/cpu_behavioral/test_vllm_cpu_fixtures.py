@@ -76,7 +76,9 @@ DEMO_SCENARIOS = {
 }
 
 
-@pytest.mark.parametrize("backend,available", [
+# Install requirements/<backend>.txt in that backend's environment before pytest.
+# Optional dependencies must never be installed as a side effect of collection.
+BACKEND_CASES = [
     pytest.param("cpu", CPU_AVAILABLE, id="cpu", marks=pytest.mark.skipif(
         not CPU_AVAILABLE and "cpu" not in REQUIRED,
         reason="requires a CPU-capable vLLM installation (on any supported OS)")),
@@ -86,7 +88,10 @@ DEMO_SCENARIOS = {
     pytest.param("metal", METAL_AVAILABLE, id="metal", marks=pytest.mark.skipif(
         not METAL_AVAILABLE and "metal" not in REQUIRED,
         reason="MIA Metal scenario adapter is not implemented yet")),
-])
+]
+
+
+@pytest.mark.parametrize("backend,available", BACKEND_CASES)
 @pytest.mark.parametrize("demo_scenario", DEMO_SCENARIOS)
 def test_vllm_demo_scenario(demo_scenario, backend, available, tmp_path, capsys):
     if not available:
@@ -102,3 +107,27 @@ def test_vllm_demo_scenario(demo_scenario, backend, available, tmp_path, capsys)
         print(f"\n--- {demo_scenario} ({backend}) ---", flush=True)
         run_child([sys.executable, "-u", str(script)], env, tmp_path / "fixture.log",
                   int(os.environ.get("MIA_BEHAVIOR_TIMEOUT", "1800")))
+
+
+# TODO: export machine-readable results from the real demos using identical model
+# weights, tokenizer, prompts, and scenario configs. CPU results can be produced in
+# a separate baseline environment/job; parity must not require both vLLM builds in
+# one Python environment. Compare only after both scenario runs have passed.
+PARITY_TODOS = {
+    "hidden_states": "compare layer coverage/shapes and choose tensor tolerances",
+    "attention_tracker": "compare scores for identical token ranges and heads",
+    "activation_steer": "add a nonzero-steering behavior check before comparing effects",
+    "core_reranker": "compare document scores/rankings with explicit tolerances",
+}
+
+
+@pytest.mark.parametrize("backend,available", BACKEND_CASES[1:])
+@pytest.mark.parametrize("demo_scenario", DEMO_SCENARIOS)
+def test_vllm_demo_parity(demo_scenario, backend, available):
+    """Reserved CPU-versus-backend comparisons; skips are not parity evidence."""
+    if not available:
+        pytest.skip(f"{backend} runtime is unavailable for parity")
+    pytest.skip(
+        f"TODO CPU/{backend} parity for {demo_scenario}: implement result export; "
+        f"{PARITY_TODOS[demo_scenario]}"
+    )
