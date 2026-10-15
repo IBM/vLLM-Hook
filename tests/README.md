@@ -79,11 +79,12 @@ python -m pytest tests/cpu_behavioral/test_vllm_cpu_fixtures.py -v -rs
 ```
 
 Each `demo_scenario` (hidden states, Attention Tracker, activation steering, CoRe
-reranking) is paired with CPU, CUDA, and Metal. Discovery checks the installed vLLM
-platform, a device operation, and that scenario's MIA worker/analyzer. Compatible
-cases run the original fixtures through real `generate()` calls in separate
-processes. Unavailable cases skip with a reason; runtime errors and failed fixtures
-fail. A candidate is only validated when its fixture passes.
+reranking) is paired with CPU, CUDA, and Metal. `pytest.mark.skipif` skips
+cases that do not match the installed vLLM runtime. CPU cases are eligible on any
+supported OS with a CPU-capable vLLM installation. CUDA cases also require a visible
+CUDA device. Matching cases run the original fixtures through real `generate()`
+calls in separate processes. Fixture failures fail the test; they are never
+converted into skips.
 
 The current MIA branch supports CPU and CUDA runners. Metal reports unavailable
 because its MIA scenario adapter is not implemented; detecting Apple hardware alone
@@ -102,8 +103,9 @@ Optional settings:
   768-dimensional model.
 - `MIA_BEHAVIOR_TIMEOUT`: seconds per fixture (default 1800).
 
-Pytest gives each case its own temporary hooks directory. Discovery and fixture logs
-are stored in pytest's temporary directories; failures print the log path and tail.
+Pytest gives each case its own temporary hooks directory. Demo output streams to the terminal for passing and failing cases, with a scenario
+label before each run. Fixture logs are also stored in pytest's temporary
+directories; failures print the log path.
 The historical `run_*_cpu.py` paths remain usable directly on CPU. Their assertions,
 configs, and prompts also supply the shared suite; no fixtures have been removed.
 The steering fixture is a generation smoke test (zero coefficient), not proof of a
