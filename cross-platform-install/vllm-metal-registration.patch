@@ -1,0 +1,32 @@
+diff --git a/vllm_metal/compat.py b/vllm_metal/compat.py
+index f073ea0..4bda0e3 100644
+--- a/vllm_metal/compat.py
++++ b/vllm_metal/compat.py
+@@ -236,12 +236,12 @@ def _gemma4_assistant_config_class() -> type[Any]:
+     return Gemma4AssistantCompatConfig
+ 
+ 
+-def _transformers_knows_gemma4_assistant(auto_config: Any) -> bool:
+-    try:
+-        auto_config.for_model("gemma4_assistant")
+-    except ValueError:
+-        return False
+-    return True
++def _transformers_knows_gemma4_assistant() -> bool:
++    # Check registration without constructing a default config. A registered
++    # config may require checkpoint-specific values to pass validation.
++    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
++
++    return "gemma4_assistant" in CONFIG_MAPPING
+ 
+ 
+ def _patch_vllm_gemma4_mtp_config_loading() -> None:
+@@ -262,7 +262,7 @@ def _patch_vllm_gemma4_mtp_config_loading() -> None:
+         )
+         return
+ 
+-    if _transformers_knows_gemma4_assistant(AutoConfig):
++    if _transformers_knows_gemma4_assistant():
+         return
+ 
+     try:
