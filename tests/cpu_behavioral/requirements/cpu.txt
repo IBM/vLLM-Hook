@@ -1,0 +1,7 @@
+# CPU baseline environment: install this file before running pytest.
+# The CPU baseline job should set MIA_REQUIRED_BACKENDS=cpu.
+pytest
+# TODO: automate installation of a compatible CPU-built vLLM and Triton CPU.
+# vllm-hook-mia currently pins vLLM 0.29.0 in setup.py; a CPU source build may
+# need platform-specific build flags. Do not install a CUDA wheel as a CPU fallback.
+# Keep Apple-specific OpenMP settings conditional (see backend_support.py).

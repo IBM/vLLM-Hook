@@ -13,3 +13,6 @@ hs_aperture_dump/
 qk_aperture_dump/
 
 ignore/
+
+# Local environment used by cross-platform installation checks
+.venv-install-test-cpu/

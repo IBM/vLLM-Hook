@@ -1,0 +1,7 @@
+# Optional Metal environment: this is a dependency placeholder, not Metal support.
+pytest
+# TODO: add a compatible vllm-metal requirement after implementing the MIA adapter.
+# Gate Metal-only requirements to supported macOS/Apple Silicon environments.
+# Resolve compatibility with setup.py's existing vLLM dependency before enabling
+# this environment; installing vllm-metal alone cannot provide the missing hooks.
+# TODO: run the translated scenarios and export results for CPU/Metal parity.

@@ -9,7 +9,10 @@ import torch
 
 from mia.errors import MiaConfigurationError
 
-_V2_MODULE_PREFIX = "vllm.v1.worker.gpu."
+_V2_MODULE_PREFIXES = (
+    "vllm.v1.worker.gpu.",
+    "vllm.v1.worker.cpu.",
+)
 _STASH_ATTR = "_mia_arg_stash"
 
 
@@ -18,14 +21,14 @@ class UnsupportedRunnerError(MiaConfigurationError):
 
 
 def is_v2_runner(runner) -> bool:
-    """True iff `runner` is vLLM's V2 GPUModelRunner."""
-    return type(runner).__module__.startswith(_V2_MODULE_PREFIX)
+    """True iff `runner` is one of vLLM's V2 model runners."""
+    return type(runner).__module__.startswith(_V2_MODULE_PREFIXES)
 
 
 def require_v2_runner(runner) -> None:
     if not is_v2_runner(runner):
         raise UnsupportedRunnerError(
-            "MIA requires vLLM's V2 model runner (vllm.v1.worker.gpu.model_runner), but "
+            "MIA requires vLLM's V2 model runner, but "
             f"the live runner is {type(runner).__module__}.{type(runner).__name__}. "
             "Unset VLLM_USE_V2_MODEL_RUNNER (or set it to 1) and use vLLM 0.29.0."
         )
