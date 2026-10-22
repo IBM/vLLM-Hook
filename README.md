@@ -27,6 +27,8 @@ New here? Start with the [Quickstart](#-quickstart).
 
 - **July 6, 2026** — Presented at ICML 2026: [*vLLM-Hook: Live Programming of Model Internals on vLLM*](https://icml.cc/virtual/2026/75729). (ICML registration and login are required to view the presentation.)
 
+- **October 21, 2026** - Featured in IBM Research Blog: [*Toward fast AI interpretability and control*](https://research.ibm.com/blog/fast-interpretability-plugin-vllm).
+
 ---
 
 ## 🚀 Features
