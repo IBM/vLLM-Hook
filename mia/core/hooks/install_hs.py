@@ -189,6 +189,14 @@ def install_hs_hosts(worker) -> Optional[HostRegistry]:
     return registry
 
 
+def _weights_bytes(worker):
+    """Bytes vLLM measured for the model weights, or None before/without a load."""
+    try:
+        return int(worker.model_runner.model_memory_usage) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _resolve_aperture_rows(worker, num_layers, hidden_size, buf_dtype, device,
                            rows_needed=None) -> tuple:
     elem_size = torch.empty(0, dtype=buf_dtype).element_size()
@@ -204,7 +212,8 @@ def _resolve_aperture_rows(worker, num_layers, hidden_size, buf_dtype, device,
     per_layer_row_bytes = hidden_size * elem_size
     aperture_bytes = resolve_aperture_bytes_auto(
         total_gpu, gpu_util, rows_needed=rows_needed,
-        row_bytes=int(num_layers) * per_layer_row_bytes, what="HS capture")
+        row_bytes=int(num_layers) * per_layer_row_bytes, what="HS capture",
+        weights_bytes=_weights_bytes(worker))
     R = int(aperture_bytes // (num_layers * per_layer_row_bytes))
     if R < 1:
         raise MiaSizingError(

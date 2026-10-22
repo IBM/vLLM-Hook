@@ -97,6 +97,14 @@ def _aperture_reserve_or_block(aperture: CaptureAperture, n: int, consumer=None)
         f"the off-loop drain is not keeping up.")
 
 
+def _weights_bytes(worker):
+    """Bytes vLLM measured for the model weights, or None before/without a load."""
+    try:
+        return int(worker.model_runner.model_memory_usage) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype, device,
                               rows_needed=None) -> tuple:
     elem = torch.empty(0, dtype=buf_dtype).element_size()
@@ -112,7 +120,8 @@ def _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype, devic
     per_slot_bytes = (int(q_dim) + int(k_dim)) * elem
     aperture_bytes = resolve_aperture_bytes_auto(
         total_gpu, gpu_util, rows_needed=rows_needed,
-        row_bytes=int(num_layers) * per_slot_bytes, what="QK capture")
+        row_bytes=int(num_layers) * per_slot_bytes, what="QK capture",
+        weights_bytes=_weights_bytes(worker))
     R = int(aperture_bytes // (num_layers * per_slot_bytes))
     if R < 1:
         raise MiaSizingError(

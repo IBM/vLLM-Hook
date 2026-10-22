@@ -13,15 +13,32 @@ _TRUE = ("1", "true", "on", "yes", "auto")
 _FALSE = ("", "0", "false", "off", "no")
 
 
-def resolve_aperture_bytes_fixed(total_gpu_bytes: int, fixed_bytes: int, gpu_mem_util: float) -> int:
+def aperture_room_bytes(total_gpu_bytes: int, gpu_mem_util: float,
+                        weights_bytes: Optional[int] = None) -> float:
+    """Room for the aperture inside vLLM's ``gpu_memory_utilization`` share.
+
+    The aperture is allocated when the model loads, before vLLM profiles memory, so vLLM counts
+    it with the weights and sizes the KV cache from what is left of
+    ``gpu_memory_utilization x total``. It is not taken from the fraction vLLM leaves unclaimed.
+    """
+    room = float(gpu_mem_util) * int(total_gpu_bytes)
+    if weights_bytes:
+        room -= int(weights_bytes)
+    return room
+
+
+def resolve_aperture_bytes_fixed(total_gpu_bytes: int, fixed_bytes: int, gpu_mem_util: float,
+                                 weights_bytes: Optional[int] = None) -> int:
     """Fixed-size aperture path: return ``fixed_bytes`` verbatim after a fit check."""
     fixed_bytes = int(fixed_bytes)
-    total_gpu_bytes = int(total_gpu_bytes)
-    free_margin = (1.0 - gpu_mem_util) * total_gpu_bytes
-    if fixed_bytes > free_margin:
+    room = aperture_room_bytes(total_gpu_bytes, gpu_mem_util, weights_bytes)
+    if fixed_bytes >= room:
+        after = (f" after {int(weights_bytes) / (1 << 30):.2f} GiB of weights"
+                 if weights_bytes else "")
         raise MiaSizingError(
-            f"aperture {fixed_bytes/(1<<30):.2f} GiB + gpu_memory_utilization={gpu_mem_util} leaves no "
-            f"room (free margin {free_margin/(1<<30):.2f} GiB): lower gpu_memory_utilization or "
+            f"aperture {fixed_bytes/(1<<30):.2f} GiB does not fit: it comes out of vLLM's "
+            f"gpu_memory_utilization={gpu_mem_util} share (the KV-cache budget), which has "
+            f"{max(room, 0)/(1<<30):.2f} GiB{after}. Raise gpu_memory_utilization or lower "
             f"MIA_APERTURE_GPU_BYTES")
     return fixed_bytes
 
@@ -29,27 +46,29 @@ def resolve_aperture_bytes_fixed(total_gpu_bytes: int, fixed_bytes: int, gpu_mem
 def resolve_aperture_bytes_auto(total_gpu_bytes: int, gpu_mem_util: float,
                                 rows_needed: Optional[int] = None,
                                 row_bytes: Optional[int] = None,
-                                what: str = "capture") -> int:
+                                what: str = "capture",
+                                weights_bytes: Optional[int] = None) -> int:
     """Resolve the aperture byte budget: ``MIA_APERTURE_GPU_BYTES`` if set, else the default."""
     raw_fixed = os.environ.get("MIA_APERTURE_GPU_BYTES")
     if raw_fixed is not None and raw_fixed.strip() != "":
-        return resolve_aperture_bytes_fixed(total_gpu_bytes, int(raw_fixed), gpu_mem_util)
+        return resolve_aperture_bytes_fixed(total_gpu_bytes, int(raw_fixed), gpu_mem_util,
+                                            weights_bytes)
     budget = DEFAULT_APERTURE_GPU_BYTES
     need = model_sized_aperture_bytes(rows_needed, row_bytes)
     if need is not None and need > budget:
-        free_margin = (1.0 - gpu_mem_util) * int(total_gpu_bytes)
-        if need > free_margin:
+        room = aperture_room_bytes(total_gpu_bytes, gpu_mem_util, weights_bytes)
+        if need >= room:
             raise MiaSizingError(
                 f"{what} aperture cannot hold one max-token step by default: "
                 f"{int(rows_needed)} rows (max_num_batched_tokens) x {int(row_bytes)} B/row "
-                f"(every captured layer) = {need / (1 << 30):.2f} GiB, but "
-                f"gpu_memory_utilization={gpu_mem_util} leaves {free_margin / (1 << 30):.2f} GiB. "
-                f"Lower gpu_memory_utilization, lower max_num_batched_tokens, capture fewer "
-                f"layers, or set MIA_APERTURE_GPU_BYTES explicitly (an explicit value always "
-                f"wins; one smaller than {need} B risks ApertureBackpressureError on a "
-                f"max-token step).")
+                f"(every captured layer) = {need / (1 << 30):.2f} GiB, but the aperture comes out "
+                f"of vLLM's gpu_memory_utilization={gpu_mem_util} share, which has "
+                f"{max(room, 0) / (1 << 30):.2f} GiB. Raise gpu_memory_utilization, lower "
+                f"max_num_batched_tokens, capture fewer layers, or set MIA_APERTURE_GPU_BYTES "
+                f"explicitly (an explicit value always wins; one smaller than {need} B risks "
+                f"ApertureBackpressureError on a max-token step).")
         budget = need
-    return resolve_aperture_bytes_fixed(total_gpu_bytes, budget, gpu_mem_util)
+    return resolve_aperture_bytes_fixed(total_gpu_bytes, budget, gpu_mem_util, weights_bytes)
 
 
 def model_sized_aperture_bytes(rows_needed: Optional[int], row_bytes: Optional[int]) -> Optional[int]:
