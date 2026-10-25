@@ -1,6 +1,0 @@
-# Optional CUDA environment: install this file only for a CUDA test job.
-pytest
-# TODO: pin a validated PyTorch/CUDA wheel combination for vLLM 0.29.0.
-# vllm-hook-mia already declares vLLM in setup.py. Provision the matching CUDA
-# runtime before pytest; collection only checks availability, never installs it.
-# TODO: export successful scenario results for comparison with CPU baseline results.

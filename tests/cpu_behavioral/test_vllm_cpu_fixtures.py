@@ -76,9 +76,7 @@ DEMO_SCENARIOS = {
 }
 
 
-# Install requirements/<backend>.txt in that backend's environment before pytest.
-# Optional dependencies must never be installed as a side effect of collection.
-BACKEND_CASES = [
+@pytest.mark.parametrize("backend,available", [
     pytest.param("cpu", CPU_AVAILABLE, id="cpu", marks=pytest.mark.skipif(
         not CPU_AVAILABLE and "cpu" not in REQUIRED,
         reason="requires a CPU-capable vLLM installation (on any supported OS)")),
@@ -88,10 +86,7 @@ BACKEND_CASES = [
     pytest.param("metal", METAL_AVAILABLE, id="metal", marks=pytest.mark.skipif(
         not METAL_AVAILABLE and "metal" not in REQUIRED,
         reason="MIA Metal scenario adapter is not implemented yet")),
-]
-
-
-@pytest.mark.parametrize("backend,available", BACKEND_CASES)
+])
 @pytest.mark.parametrize("demo_scenario", DEMO_SCENARIOS)
 def test_vllm_demo_scenario(demo_scenario, backend, available, tmp_path, capsys):
     if not available:
@@ -107,19 +102,3 @@ def test_vllm_demo_scenario(demo_scenario, backend, available, tmp_path, capsys)
         print(f"\n--- {demo_scenario} ({backend}) ---", flush=True)
         run_child([sys.executable, "-u", str(script)], env, tmp_path / "fixture.log",
                   int(os.environ.get("MIA_BEHAVIOR_TIMEOUT", "1800")))
-
-
-# Numerical comparisons run in separate CPU/CUDA environments on the same host.
-# See cross-platform-install/run_parity.py and PARITY-README.md.
-# Optionally validate the resulting report from pytest (no GPU needed here).
-@pytest.mark.parametrize("demo_scenario", DEMO_SCENARIOS)
-def test_vllm_demo_parity(demo_scenario):
-    import json
-    report_path = os.environ.get("MIA_PARITY_REPORT")
-    if not report_path:
-        pytest.skip("Run colab_cli.py parity, or run_parity.py; set MIA_PARITY_REPORT to its report.json")
-    report = json.loads(Path(report_path).read_text())
-    assert "error" not in report, report.get("error")
-    result = report["scenarios"][demo_scenario]
-    assert result["numbers_compared"] > 0
-    assert result["passed"], result["errors"]

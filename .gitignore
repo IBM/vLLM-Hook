@@ -13,12 +13,3 @@ hs_aperture_dump/
 qk_aperture_dump/
 
 ignore/
-
-# Local environment used by cross-platform installation checks
-.venv-install-test-cpu/
-
-# CPU wheels backed up locally by the Colab parity script
-.colab-cache/
-
-# Runner-independent GPU environments, wheels and results
-.gpu-ci/
