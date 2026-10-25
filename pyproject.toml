@@ -22,8 +22,32 @@ cpu = [
     "torchvision",
 ]
 
+# CUDA: reuse requirement.txt exactly; these pins describe the existing stack,
+# not a newly validated CUDA runtime. A matching driver/device is still required.
+cuda = [
+    "numpy==2.3.5",
+    "safetensors==0.8.0",
+    "torch==2.13.0",
+    "transformers==5.17.0",
+    "triton==3.7.1",
+    "vllm==0.29.0",
+    "zstandard==0.25.0",
+]
+
+# Experimental runtime dependencies only: the apple-silicon branch implements
+# HookLLMMetal in the older vllm_hook_plugins package, not this checkout's mia.
+# Upstream vllm-metal v0.29.0 explicitly targets vLLM v0.29.0 and Python 3.12/3.13.
+# Unsupported platforms/Python versions omit this requirement; they do NOT gain
+# Metal support. Provision the matching macOS vLLM core via that release's
+# installer before installing MIA --no-deps. No Triton CPU is needed for Metal.
+metal = [
+    "vllm-metal==0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.12' and python_version < '3.14'",
+]
+
 [dependency-groups]
 test = ["pytest"]
+# Same-machine numerical comparison runner shares the existing test tools.
+parity = [{ include-group = "test" }]
 cpu-build = [
     "setuptools==77.0.3",
     "wheel",
@@ -38,9 +62,25 @@ cpu-build = [
     "lit",
 ]
 
+# Verified by prepare_parity_cpu.py before uv receives the local release wheel.
+[tool.mia.colab]
+vllm-cpu-wheel-sha256 = "4d22dac8259e7e24dbc615531c73cbd1a6d4b4214a3329ccddb7854f26c9dac8"
+
+[tool.uv]
+# Triton CPU and CUDA Triton are alternative builds of the SAME distribution.
+# These profiles are deliberately separate, even on a CUDA-capable CPU host.
+conflicts = [
+    [{ extra = "cpu" }, { extra = "cuda" }],
+    [{ extra = "cpu" }, { extra = "metal" }],
+    [{ extra = "cuda" }, { extra = "metal" }],
+]
+
 [tool.uv.sources]
 vllm = [
-    { git = "https://github.com/vllm-project/vllm", rev = "98dff2a81d747d1dba01a47f939f48c3526d4206", extra = "cpu" },
+    # Official release wheel for disposable Linux x86_64 runners. Fail rather
+    # than silently compile vLLM if the published artifact cannot be installed.
+    { url = "https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl", extra = "cpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { git = "https://github.com/vllm-project/vllm", rev = "98dff2a81d747d1dba01a47f939f48c3526d4206", extra = "cpu", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" },
 ]
 triton = [
     { git = "https://github.com/triton-lang/triton-cpu", rev = "c8e7cc932320d05d08f39ffc99bfda32dc4f22fa", extra = "cpu" },
@@ -48,7 +88,6 @@ triton = [
 torch = [
     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 's390x')" },
 ]
-
 # Keep optional audio/vision wheels on the CPU index too; otherwise their
 # PyPI wheels can expect CUDA libraries inside the CPU-only environment.
 torchaudio = [
@@ -57,6 +96,7 @@ torchaudio = [
 torchvision = [
     { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 's390x')" },
 ]
+vllm-metal = { git = "https://github.com/vllm-project/vllm-metal", tag = "v0.29.0", extra = "metal" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -70,3 +110,4 @@ explicit = true
 # no manual Triton patch is required. This revision still needs runtime validation
 # with MIA. TOML cannot set compiler flags, install libomp, or configure runtime
 # OpenMP settings. Keep manually provisioned environments separate from uv sync.
+# Metal's Rust/native toolchain and matching vLLM core remain installer work.

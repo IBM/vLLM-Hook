@@ -1,6 +1,9 @@
 # CPU dependency setup for behavioral tests
 
-The `cpu` extra in `pyproject.toml` describes the CPU dependencies. It keeps
+`pyproject.toml` retains the original optional CPU, CUDA, and Metal dependency
+profiles, platform conditions, source pins, and mutually exclusive environments.
+Choose the profile matching the runtime you are provisioning. This guide covers
+the CPU path. The `cpu` extra describes its dependencies and keeps
 `setup.py` authoritative for MIA's version, base dependencies, and plugin entry
 points. The `test` and `cpu-build` groups list test and native build tools.
 
@@ -12,10 +15,14 @@ are not validated by this guide.
 
 `pip` ignores `tool.uv.sources`. Provision CPU builds before installing MIA with
 `--no-deps`; installing the extra alone is not a complete CPU installer. The uv
-source entries record pinned vLLM and Triton CPU revisions and select PyTorch's
-CPU index on supported Linux architectures. Full `uv sync` provisioning has not
+source entries select the official vLLM CPU wheel on Linux x86_64, pinned vLLM
+source on other platforms, pinned Triton CPU source, and PyTorch's CPU index on
+supported Linux architectures. Full `uv sync` provisioning has not
 been validated. These settings do not install system compilers or OpenMP.
 Keep manually provisioned environments separate from `uv sync`.
+The original wheel checksum metadata remains in the project settings; the Colab
+download/checksum helper mentioned in its comment is excluded from this PR.
+That metadata alone does not make uv verify the download against the stored hash.
 
 ## 1. Prerequisites and paths
 
