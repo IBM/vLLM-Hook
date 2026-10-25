@@ -1,32 +1,26 @@
-# CPU dependency setup for behavioral tests
+# CPU setup for behavioral tests
 
-`pyproject.toml` retains the original optional CPU, CUDA, and Metal dependency
-profiles, platform conditions, source pins, and mutually exclusive environments.
-Choose the profile matching the runtime you are provisioning. This guide covers
-the CPU path. The `cpu` extra describes its dependencies and keeps
-`setup.py` authoritative for MIA's version, base dependencies, and plugin entry
-points. The `test` and `cpu-build` groups list test and native build tools.
+Use this guide to prepare a CPU environment and run MIA's four behavioral tests.
+The build steps below are for **macOS on Apple Silicon**. Linux and Windows
+installation steps have not been validated here.
 
-Use a separate environment for CPU. CPU and CUDA use alternative builds of
-vLLM, PyTorch, and Triton, even on a machine that has both a CPU and a GPU.
-The CPU profile is independent of the operating system, but this manual build
-recipe is specifically for macOS on Apple Silicon. Linux and Windows installs
-are not validated by this guide.
+[pyproject.toml](../../pyproject.toml) lists optional dependencies for CPU, CUDA,
+and Metal. Choose the option that matches your runtime. Use a separate Python
+environment for each one: CPU and CUDA need different builds of the same libraries.
 
-`pip` ignores `tool.uv.sources`. Provision CPU builds before installing MIA with
-`--no-deps`; installing the extra alone is not a complete CPU installer. The uv
-source entries select the official vLLM CPU wheel on Linux x86_64, pinned vLLM
-source on other platforms, pinned Triton CPU source, and PyTorch's CPU index on
-supported Linux architectures. Full `uv sync` provisioning has not
-been validated. These settings do not install system compilers or OpenMP.
-Keep manually provisioned environments separate from `uv sync`.
-The original wheel checksum metadata remains in the project settings; the Colab
-download/checksum helper mentioned in its comment is excluded from this PR.
-That metadata alone does not make uv verify the download against the stored hash.
+For CPU, the steps are:
+
+1. Install the build tools and create a Python environment.
+2. Build Triton CPU and vLLM CPU.
+3. Install MIA and run the tests.
+
+Installing the `cpu` option alone does not complete this setup. Follow the build
+steps below before installing MIA.
 
 ## 1. Prerequisites and paths
 
-Use native arm64 Python 3.12, Homebrew, Git, and Apple development tools.
+You need Python 3.12 running natively on Apple Silicon, Homebrew, Git, and
+Apple development tools. Install the build tools and check your setup:
 
 ```bash
 uname -m
@@ -37,10 +31,10 @@ rustc --version
 cargo --version
 ```
 
-Both architecture checks should print `arm64`. Run the following from anywhere
-inside your vLLM-Hook checkout, and keep using the same shell. The repository
-path is detected automatically. The sandbox defaults to a sibling directory;
-set `MIA_SANDBOX` first if you want another location outside the checkout:
+Both architecture checks should print `arm64`.
+
+Next, set the paths used throughout this guide. Run these commands from inside
+your vLLM-Hook checkout, and keep using the same terminal session:
 
 ```bash
 export MIA_REPO="$(git rev-parse --show-toplevel)"
@@ -50,13 +44,13 @@ export MIA_SANDBOX="$(cd "$MIA_SANDBOX" && pwd -P)"
 export CPU_PY="$MIA_REPO/.venv-install-test-cpu/bin/python"
 ```
 
-These paths do not depend on a username, home directory, or checkout name.
-Relative sandbox overrides are converted to absolute paths before builds run.
+`MIA_REPO` is your vLLM-Hook checkout. `MIA_SANDBOX` is a sibling folder that
+will hold the Triton CPU and vLLM CPU source code. Set `MIA_SANDBOX` before this
+step if you want to use another folder. `CPU_PY` points to the Python environment
+created in the next step.
 
-The two CPU dependency checkouts, `triton-cpu` and `vllm-cpu`, are siblings
-under the selected sandbox. No repository is cloned inside another.
-Skip clone commands when a checkout already exists. Do not discard local edits.
-Reusing an existing environment is not a clean-install test.
+If a source checkout already exists, skip its clone command and keep any local
+edits. Reusing an existing Python environment does not verify a fresh install.
 
 ## 2. CPU environment and Triton CPU
 
@@ -150,3 +144,23 @@ the upstream Darwin assembly fix, but a fresh install of that revision and a
 complete build from this guide have not been validated. Compiler and OpenMP
 workarounds remain platform-specific. No GitHub workflow or runner setup is
 included.
+
+## How the dependency settings work
+
+`setup.py` defines MIA's version, base dependencies, and vLLM plugin entries.
+`pyproject.toml` adds the optional CPU, CUDA, and Metal dependencies. Its `test`
+and `cpu-build` groups list the test and build tools.
+
+The `tool.uv.sources` settings tell uv which dependency builds to use. They select
+the official vLLM CPU wheel on Linux x86_64, pinned vLLM source on other platforms,
+pinned Triton CPU source, and PyTorch's CPU index on supported Linux architectures.
+`pip` ignores these settings, so the manual steps above prepare the CPU builds
+before installing MIA with `--no-deps`.
+
+A full install with `uv sync` has not been validated. Keep environments prepared
+with the manual steps separate from `uv sync`. Neither the dependency settings
+nor the `cpu` option installs system compilers or OpenMP.
+
+The original wheel checksum remains in the project settings. The Colab download
+helper mentioned in its comment is excluded from this PR. The stored checksum
+alone does not make uv verify the download against it.
