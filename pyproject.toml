@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-hook-mia"
+requires-python = ">=3.11,<3.15"
+# Keep setup.py authoritative for the version, base dependencies (including
+# vllm==0.29.0 and zstandard), package discovery, and vLLM plugin entry points.
+dynamic = ["version", "dependencies", "entry-points"]
+
+[project.optional-dependencies]
+# Select one backend per environment. uv sources below select the CPU builds;
+# pip ignores tool.uv.sources, so pip users must provision those builds first.
+# CPU is OS-neutral at the profile level; available compilers/wheels still limit
+# supported platforms. Linux uses CPU-only PyTorch; macOS uses its standard wheel.
+cpu = [
+    "vllm==0.29.0",
+    "torch==2.13.0",
+    "triton",
+    "torchaudio",
+    "torchvision",
+]
+
+[dependency-groups]
+test = ["pytest"]
+cpu-build = [
+    "setuptools==77.0.3",
+    "wheel",
+    "cmake>=3.26.1,<4",
+    "ninja",
+    "setuptools-rust",
+    "setuptools-scm",
+    "nanobind==2.10.2",
+    "packaging>=24.2",
+    "jinja2>=3.1.6",
+    "regex",
+    "lit",
+]
+
+[tool.uv.sources]
+vllm = [
+    { git = "https://github.com/vllm-project/vllm", rev = "98dff2a81d747d1dba01a47f939f48c3526d4206", extra = "cpu" },
+]
+triton = [
+    { git = "https://github.com/triton-lang/triton-cpu", rev = "c8e7cc932320d05d08f39ffc99bfda32dc4f22fa", extra = "cpu" },
+]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 's390x')" },
+]
+
+# Keep optional audio/vision wheels on the CPU index too; otherwise their
+# PyPI wheels can expect CUDA libraries inside the CPU-only environment.
+torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 's390x')" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 's390x')" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# Build prerequisites, not runtime dependencies. Install these before using
+# --no-build-isolation for the local source-build workflow in the CPU notes.
+# Set VLLM_TARGET_DEVICE=cpu when building vLLM, including on CUDA hosts.
+# The pinned Triton CPU revision includes the upstream Darwin assembly fix;
+# no manual Triton patch is required. This revision still needs runtime validation
+# with MIA. TOML cannot set compiler flags, install libomp, or configure runtime
+# OpenMP settings. Keep manually provisioned environments separate from uv sync.
