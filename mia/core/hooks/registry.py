@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from mia._profiler import PROF
+from mia.core.runtime.memory_owner import device_buffer
 from mia.core.hooks.hosts import QKCaptureHost
 
 INCREMENTAL_ROUTING = os.environ.get("MIA_INCREMENTAL_ROUTING", "1") != "0"
@@ -76,6 +77,7 @@ class HostRegistry:
         cap: int,
         device: torch.device | str,
         should_capture: bool = True,
+        *, memory_owner=None, memory_prefix="hs",
     ) -> None:
         self.num_layers = int(num_layers)
         self.cap = int(cap)
@@ -84,12 +86,10 @@ class HostRegistry:
 
         self.sentinel_row = 0
 
-        self.capture_index_all = torch.zeros(
-            self.num_layers, self.cap, dtype=torch.int64, device=self.device
-        )
-        self.any_active = torch.zeros(
-            self.num_layers, dtype=torch.int32, device=self.device
-        )
+        self.capture_index_all = device_buffer(memory_owner, f"{memory_prefix}.capture_index",
+            (self.num_layers, self.cap), torch.int64, self.device)
+        self.any_active = device_buffer(memory_owner, f"{memory_prefix}.any_active",
+            (self.num_layers,), torch.int32, self.device)
 
         pin = self.device.type == "cuda"
         self._aperture = PinnedMirror(
@@ -126,8 +126,8 @@ class HostRegistry:
         self.slot_layer_mask = None
         if self._gpu_routing_env:
             pin = self.device.type == "cuda"
-            self.slot_layer_mask = torch.zeros(cap, self.num_layers, dtype=torch.bool,
-                                               device=self.device)
+            self.slot_layer_mask = device_buffer(memory_owner, f"{memory_prefix}.slot_layer_mask",
+                                               (cap, self.num_layers), torch.bool, self.device)
             self._slot_mask_h = torch.zeros(cap, self.num_layers, dtype=torch.bool,
                                             pin_memory=pin)
 

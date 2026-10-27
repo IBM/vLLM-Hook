@@ -13,8 +13,24 @@ except Exception:  # noqa: BLE001
 
 if _HAVE_TRITON:
     @triton.jit
+    def _request_for_column(qsl_ptr, cols, nreq, BLOCK: tl.constexpr):
+        # searchsorted(qsl, cols, right=True) - 1, clamped, without a device temporary
+        lo = tl.full((BLOCK,), 0, tl.int32)
+        hi = tl.full((BLOCK,), nreq + 1, tl.int32)
+        remaining = nreq + 1
+        while remaining > 0:
+            active = lo < hi
+            mid = (lo + hi) // 2
+            boundary = tl.load(qsl_ptr + mid, mask=active, other=0)
+            right = active & (boundary <= cols)
+            hi = tl.where(active & ~right, mid, hi)
+            lo = tl.where(right, mid + 1, lo)
+            remaining = remaining // 2
+        return tl.minimum(tl.maximum(lo - 1, 0), nreq - 1)
+
+    @triton.jit
     def _scatter_routing_kernel(
-        req_ptr,
+        qsl_ptr,
         svid_ptr,
         smode_ptr,
         scoeff_ptr,
@@ -24,6 +40,7 @@ if _HAVE_TRITON:
         vecid_ptr,
         mode_ptr,
         real_n,
+        nreq,
         width,
         num_layers,
         cap,
@@ -35,7 +52,7 @@ if _HAVE_TRITON:
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         cmask = cols < width
         valid = cols < real_n
-        req = tl.load(req_ptr + cols, mask=cmask, other=0)
+        req = _request_for_column(qsl_ptr, cols, nreq, BLOCK)
         m = tl.load(smask_ptr + req * num_layers + L, mask=cmask, other=0)
         active = valid & (m != 0)
         if HAS_COL:
@@ -54,35 +71,27 @@ _BLOCK = 256
 _NUM_WARPS = 4
 
 
-def _req_of_col(qsl_dev, width):
-    bs = int(qsl_dev.numel()) - 1
-    col = torch.arange(width, device=qsl_dev.device, dtype=qsl_dev.dtype)
-    r = torch.searchsorted(qsl_dev, col, right=True) - 1
-    return r.clamp_(0, max(bs - 1, 0)).to(torch.int32)
-
-
 def _scatter_torch(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
                    coeff_all, vec_id_all, mode_all, real_n, width, slot_col=None):
-    dev = coeff_all.device
-    num_layers, cap = coeff_all.shape
-    w = max(1, min(int(width), cap))
-    bs = int(qsl_dev.numel()) - 1
-    if bs <= 0:
-        coeff_all[:, :w].zero_(); vec_id_all[:, :w].zero_(); mode_all[:, :w].zero_()
-        return
-    col = torch.arange(w, device=dev, dtype=qsl_dev.dtype)
-    req = (torch.searchsorted(qsl_dev, col, right=True) - 1).clamp_(0, bs - 1)
-    valid = col < int(real_n)
-    if slot_col is not None:
-        sc = slot_col[req]
-        valid = valid & ((sc == -1) | (col.to(sc.dtype) == sc))
-    vid_c = torch.where(valid, slot_vid[req], torch.zeros_like(req))
-    mode_c = torch.where(valid, slot_mode[req], torch.zeros_like(req))
-    coef_c = torch.where(valid, slot_coeff[req], torch.zeros(w, dtype=torch.float32, device=dev))
-    mask = slot_layer_mask[req].transpose(0, 1) & valid.unsqueeze(0)
-    coeff_all[:, :w] = torch.where(mask, coef_c.unsqueeze(0).expand(num_layers, -1), 0.0)
-    vec_id_all[:, :w] = torch.where(mask, vid_c.unsqueeze(0).expand(num_layers, -1), 0)
-    mode_all[:, :w] = torch.where(mask, mode_c.unsqueeze(0).expand(num_layers, -1), 0)
+    # Host-side fallback: in-place slab writes, no CUDA temporaries
+    qsl = qsl_dev.cpu().tolist()
+    masks = slot_layer_mask.cpu().tolist()
+    vids, modes = slot_vid.cpu().tolist(), slot_mode.cpu().tolist()
+    coeffs = slot_coeff.cpu().tolist()
+    cols = slot_col.cpu().tolist() if slot_col is not None else None
+    w = max(1, min(int(width), coeff_all.shape[1]))
+    coeff_all[:, :w].zero_(); vec_id_all[:, :w].zero_(); mode_all[:, :w].zero_()
+    for req in range(len(qsl) - 1):
+        start, end = max(0, int(qsl[req])), min(w, int(real_n), int(qsl[req + 1]))
+        if cols is not None and cols[req] != -1:
+            start, end = max(start, cols[req]), min(end, cols[req] + 1)
+        if start >= end:
+            continue
+        for layer in range(coeff_all.shape[0]):
+            if masks[req][layer]:
+                coeff_all[layer, start:end].fill_(coeffs[req])
+                vec_id_all[layer, start:end].fill_(vids[req])
+                mode_all[layer, start:end].fill_(modes[req])
 
 
 def scatter_routing(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
@@ -102,14 +111,12 @@ def scatter_routing(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
     if int(qsl_dev.numel()) <= 1:
         coeff_all[:, :w].zero_(); vec_id_all[:, :w].zero_(); mode_all[:, :w].zero_()
         return
-    req = _req_of_col(qsl_dev, w)
-    smask_i8 = slot_layer_mask.to(torch.int8)
     grid = (num_layers, (w + _BLOCK - 1) // _BLOCK)
     _scatter_routing_kernel[grid](
-        req, slot_vid, slot_mode, slot_coeff, smask_i8,
+        qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
         slot_col if slot_col is not None else slot_vid,
         coeff_all, vec_id_all, mode_all,
-        int(real_n), w, num_layers, cap,
+        int(real_n), int(qsl_dev.numel()) - 1, w, num_layers, cap,
         BLOCK=_BLOCK, HAS_COL=slot_col is not None, num_warps=_NUM_WARPS,
     )
 
@@ -117,10 +124,10 @@ def scatter_routing(qsl_dev, slot_vid, slot_mode, slot_coeff, slot_layer_mask,
 if _HAVE_TRITON:
     @triton.jit
     def _scatter_capture_kernel(
-        req_ptr,
+        qsl_ptr,
         smask_ptr,
         out_ptr,
-        real_n, width, num_layers, cap,
+        real_n, nreq, width, num_layers, cap,
         BLOCK: tl.constexpr,
     ):
         L = tl.program_id(0)
@@ -128,7 +135,7 @@ if _HAVE_TRITON:
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         cmask = cols < width
         valid = cols < real_n
-        req = tl.load(req_ptr + cols, mask=cmask, other=0)
+        req = _request_for_column(qsl_ptr, cols, nreq, BLOCK)
         m = tl.load(smask_ptr + req * num_layers + L, mask=cmask, other=0)
         active = valid & (m != 0)
         idx = (cols + 1).to(out_ptr.dtype.element_ty)
@@ -136,18 +143,17 @@ if _HAVE_TRITON:
 
 
 def _scatter_capture_torch(qsl_dev, slot_layer_mask, capture_index_all, real_n, w):
-    dev = capture_index_all.device
-    num_layers, cap = capture_index_all.shape
-    bs = int(qsl_dev.numel()) - 1
-    if bs <= 0:
-        capture_index_all[:, :w].zero_(); return
-    col = torch.arange(w, device=dev, dtype=qsl_dev.dtype)
-    req = (torch.searchsorted(qsl_dev, col, right=True) - 1).clamp_(0, bs - 1)
-    valid = col < int(real_n)
-    mask = slot_layer_mask[req].transpose(0, 1) & valid.unsqueeze(0)
-    idx = (torch.arange(w, device=dev, dtype=capture_index_all.dtype) + 1).unsqueeze(0)
-    capture_index_all[:, :w] = torch.where(mask, idx.expand(num_layers, -1),
-                                           torch.zeros((), dtype=capture_index_all.dtype, device=dev))
+    qsl = qsl_dev.cpu().tolist()
+    masks = slot_layer_mask.cpu().tolist()
+    capture_index_all[:, :w].zero_()
+    for req in range(len(qsl) - 1):
+        start, end = max(0, int(qsl[req])), min(w, int(real_n), int(qsl[req + 1]))
+        if start >= end:
+            continue
+        indices = torch.arange(start + 1, end + 1, dtype=capture_index_all.dtype, device="cpu")
+        for layer in range(capture_index_all.shape[0]):
+            if masks[req][layer]:
+                capture_index_all[layer, start:end].copy_(indices)
 
 
 def scatter_capture_routing(qsl_dev, slot_layer_mask, capture_index_all, real_n, width,
@@ -163,11 +169,9 @@ def scatter_capture_routing(qsl_dev, slot_layer_mask, capture_index_all, real_n,
         return
     if int(qsl_dev.numel()) <= 1:
         capture_index_all[:, :w].zero_(); return
-    req = _req_of_col(qsl_dev, w)
-    smask_i8 = slot_layer_mask.to(torch.int8)
     grid = (num_layers, (w + _BLOCK - 1) // _BLOCK)
-    _scatter_capture_kernel[grid](req, smask_i8, capture_index_all,
-                                  int(real_n), w, num_layers, cap,
+    _scatter_capture_kernel[grid](qsl_dev, slot_layer_mask, capture_index_all,
+                                  int(real_n), int(qsl_dev.numel()) - 1, w, num_layers, cap,
                                   BLOCK=_BLOCK, num_warps=_NUM_WARPS)
 
 

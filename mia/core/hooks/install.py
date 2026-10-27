@@ -12,6 +12,7 @@ import torch
 from vllm.forward_context import get_forward_context
 
 from mia._profiler import PROF
+from mia.core.runtime.memory_owner import device_buffer, validate_layer_matches
 from mia.core.hooks.ops import register_graph_ops
 from mia.core.aperture.capture_aperture import CaptureAperture, ApertureBackpressureError
 from mia.core.hooks.hosts import QKCaptureHost
@@ -97,16 +98,17 @@ def _aperture_reserve_or_block(aperture: CaptureAperture, n: int, consumer=None)
         f"the off-loop drain is not keeping up.")
 
 
-def _weights_bytes(worker):
-    """Bytes vLLM measured for the model weights, or None before/without a load."""
-    try:
-        return int(worker.model_runner.model_memory_usage) or None
-    except Exception:  # noqa: BLE001
-        return None
-
 
 def _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype, device,
                               rows_needed=None) -> tuple:
+    owner = getattr(worker, "_mia_memory_owner", None)
+    if owner is not None:
+        plan = owner.plan
+        if (num_layers != plan.layers or plan.buffer("q.0").shape[1] != q_dim
+                or plan.buffer("k.0").shape[1] != k_dim
+                or str(buf_dtype).removeprefix("torch.") != plan.dtype):
+            raise MiaConfigurationError("QK aperture geometry differs from the startup plan")
+        return plan.rows, plan.aperture_bytes
     elem = torch.empty(0, dtype=buf_dtype).element_size()
     if str(device).startswith("cuda"):
         total_gpu = int(torch.cuda.get_device_properties(device).total_memory)
@@ -120,9 +122,8 @@ def _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype, devic
     per_slot_bytes = (int(q_dim) + int(k_dim)) * elem
     aperture_bytes = resolve_aperture_bytes_auto(
         total_gpu, gpu_util, rows_needed=rows_needed,
-        row_bytes=int(num_layers) * per_slot_bytes, what="QK capture",
-        weights_bytes=_weights_bytes(worker))
-    R = int(aperture_bytes // (num_layers * per_slot_bytes))
+        row_bytes=int(num_layers) * per_slot_bytes, what="QK capture")
+    R = int(aperture_bytes // (num_layers * per_slot_bytes)) - 1
     if R < 1:
         raise MiaSizingError(
             f"QK capture aperture too small: aperture_bytes={aperture_bytes} num_layers={num_layers} "
@@ -276,14 +277,16 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
 
     # lazy: child_process reads env at import; keep it out of plugin load
     from mia.core.delivery.writer_process import init_writer_process
-    init_writer_process(worker)
 
     cap = _resolve_max_num_batched_tokens(worker)
 
     device = next(model.parameters()).device
 
     matched = list(iter_matched_modules(model, match_attn))
+    validate_layer_matches(getattr(worker, "_mia_memory_owner", None), matched)
     if not matched:
+        if getattr(worker, "_mia_memory_owner", None) is not None:
+            raise MiaConfigurationError("No attention modules matched the MIA memory plan")
         print("[graph/install] no attention modules matched ATTN_PATTERNS; "
               "QK graph capture inactive")
         set_registry(worker, "qk", None)
@@ -295,6 +298,7 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
 
     buf_dtype = model.dtype if hasattr(model, "dtype") else next(model.parameters()).dtype
 
+    owner = getattr(worker, "_mia_memory_owner", None)
     registry: Optional[HostRegistry] = None
     aperture: Optional[CaptureAperture] = None
     n_hosts = 0
@@ -310,7 +314,7 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
                   f"Steady decode still fits.")
         registry = HostRegistry(
             num_layers=num_layers, cap=cap, device=device,
-            should_capture=should_capture,
+            should_capture=should_capture, memory_owner=owner, memory_prefix="qk",
         )
         elem = torch.empty(0, dtype=buf_dtype).element_size()
         aperture = CaptureAperture(row_bytes=k_dim * elem, n_slots=R, device=device,
@@ -327,8 +331,8 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
 
     for name, module, layer_num in matched:
         if should_capture:
-            q_buf = torch.zeros(R + 1, q_dim, dtype=buf_dtype, device=device)
-            k_buf = torch.zeros(R + 1, k_dim, dtype=buf_dtype, device=device)
+            q_buf = device_buffer(owner, f"q.{layer_num}", (R + 1, q_dim), buf_dtype, device)
+            k_buf = device_buffer(owner, f"k.{layer_num}", (R + 1, k_dim), buf_dtype, device)
             host = QKCaptureHost(
                 module_name=name,
                 layer_num=layer_num,
@@ -359,6 +363,7 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
               f"aperture_bytes={aperture_bytes / (1024**2):.0f} MiB budget, token cap={cap}, "
               f"sentinel_row={registry.sentinel_row}; q_dim={q_dim} k_dim={k_dim})")
 
+    init_writer_process(worker)
     set_registry(worker, "qk", registry)
     print(f"[graph/install] QK aperture hosts installed: {n_hosts} host(s) over "
           f"{num_layers} layer slot(s); should_capture={should_capture}; cap={cap}; "

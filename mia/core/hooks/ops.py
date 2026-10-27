@@ -42,13 +42,12 @@ def _steer_buffer_impl(
     _FIRE_COUNT[0] += 1
     n = residual.shape[0]
     if _STEER_FUSED and residual.is_cuda:
-        try:
-            # lazy: Triton kernels load on first use; a failed import falls back below
-            from mia.core.hooks.steer_triton import steer_buffer_fused
-            steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n)
-            return None
-        except Exception:  # noqa: BLE001
-            pass
+        # lazy: Triton kernels load on first use; no CUDA fallback, it allocates temporaries
+        from mia.core.hooks.steer_triton import steer_buffer_fused
+        steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n)
+        return None
+    if residual.is_cuda:
+        raise RuntimeError("MIA CUDA steering requires MIA_STEER_FUSED=1")
     vids = vec_id[:n].to(torch.long)
     units = vec_table.index_select(0, vids).to(residual.dtype)
     c_add = coeff[:n].to(residual.dtype)
@@ -112,6 +111,8 @@ def _capture_qk_impl(
     _FIRE_COUNT[0] += 1
     if q_buf is None or k_buf is None or index is None:
         return None
+    if q.is_cuda and (q.dtype != q_buf.dtype or k.dtype != k_buf.dtype):
+        raise RuntimeError("MIA QK input dtype differs from its preallocated buffers")
     n = q.shape[0]
     idx = index[:n].to(torch.long)
     q_src = q if q.dtype == q_buf.dtype else q.to(q_buf.dtype)
@@ -146,14 +147,13 @@ def _capture_hs_impl(
             and hidden.dtype == residual.dtype
             and hs_buf.dtype == hidden.dtype
             and hs_buf.dtype in _FUSED_OK_DTYPES):
-        try:
-            # lazy: Triton kernels load on first use; a failed import falls back below
-            from mia.core.hooks.capture_triton import capture_hs_fused
-            capture_hs_fused(hidden, residual, hs_buf, index, has_residual)
-            _FUSED_FIRE_COUNT[0] += 1
-            return None
-        except Exception:  # noqa: BLE001
-            pass
+        # lazy: Triton kernels load on first use; no CUDA fallback, it allocates temporaries
+        from mia.core.hooks.capture_triton import capture_hs_fused
+        capture_hs_fused(hidden, residual, hs_buf, index, has_residual)
+        _FUSED_FIRE_COUNT[0] += 1
+        return None
+    if hidden.is_cuda:
+        raise RuntimeError("MIA CUDA HS capture requires fused matching-dtype buffers")
     n = hidden.shape[0]
     idx = index[:n].to(torch.long)
     combined = hidden + residual if has_residual else hidden

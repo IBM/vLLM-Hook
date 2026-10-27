@@ -1,5 +1,6 @@
 """Capture-aperture byte budgets and the safe max_num_batched_tokens cap."""
 import os
+import math
 from typing import Optional, Tuple
 
 from mia.errors import MiaSizingError
@@ -14,32 +15,23 @@ _FALSE = ("", "0", "false", "off", "no")
 
 
 def aperture_room_bytes(total_gpu_bytes: int, gpu_mem_util: float,
-                        weights_bytes: Optional[int] = None) -> float:
-    """Room for the aperture inside vLLM's ``gpu_memory_utilization`` share.
-
-    The aperture is allocated when the model loads, before vLLM profiles memory, so vLLM counts
-    it with the weights and sizes the KV cache from what is left of
-    ``gpu_memory_utilization x total``. It is not taken from the fraction vLLM leaves unclaimed.
-    """
-    room = float(gpu_mem_util) * int(total_gpu_bytes)
-    if weights_bytes:
-        room -= int(weights_bytes)
-    return room
+                        weights_bytes: Optional[int] = None) -> int:
+    """Bytes outside vLLM's ``gpu_memory_utilization`` share; weights are inside it, so unused."""
+    return int(total_gpu_bytes) - math.ceil(float(gpu_mem_util) * int(total_gpu_bytes))
 
 
 def resolve_aperture_bytes_fixed(total_gpu_bytes: int, fixed_bytes: int, gpu_mem_util: float,
                                  weights_bytes: Optional[int] = None) -> int:
-    """Fixed-size aperture path: return ``fixed_bytes`` verbatim after a fit check."""
+    """Fixed-size aperture path: return ``fixed_bytes`` verbatim if it fits outside the share."""
     fixed_bytes = int(fixed_bytes)
+    if fixed_bytes <= 0:
+        raise MiaSizingError("MIA_APERTURE_GPU_BYTES must be positive")
     room = aperture_room_bytes(total_gpu_bytes, gpu_mem_util, weights_bytes)
-    if fixed_bytes >= room:
-        after = (f" after {int(weights_bytes) / (1 << 30):.2f} GiB of weights"
-                 if weights_bytes else "")
+    if fixed_bytes > room:
         raise MiaSizingError(
-            f"aperture {fixed_bytes/(1<<30):.2f} GiB does not fit: it comes out of vLLM's "
-            f"gpu_memory_utilization={gpu_mem_util} share (the KV-cache budget), which has "
-            f"{max(room, 0)/(1<<30):.2f} GiB{after}. Raise gpu_memory_utilization or lower "
-            f"MIA_APERTURE_GPU_BYTES")
+            f"aperture {fixed_bytes/(1<<30):.2f} GiB exceeds the outside budget "
+            f"{max(room, 0)/(1<<30):.2f} GiB at gpu_memory_utilization={gpu_mem_util}. "
+            "Lower gpu_memory_utilization or MIA_APERTURE_GPU_BYTES")
     return fixed_bytes
 
 
@@ -57,13 +49,13 @@ def resolve_aperture_bytes_auto(total_gpu_bytes: int, gpu_mem_util: float,
     need = model_sized_aperture_bytes(rows_needed, row_bytes)
     if need is not None and need > budget:
         room = aperture_room_bytes(total_gpu_bytes, gpu_mem_util, weights_bytes)
-        if need >= room:
+        if need > room:
             raise MiaSizingError(
                 f"{what} aperture cannot hold one max-token step by default: "
-                f"{int(rows_needed)} rows (max_num_batched_tokens) x {int(row_bytes)} B/row "
-                f"(every captured layer) = {need / (1 << 30):.2f} GiB, but the aperture comes out "
-                f"of vLLM's gpu_memory_utilization={gpu_mem_util} share, which has "
-                f"{max(room, 0) / (1 << 30):.2f} GiB. Raise gpu_memory_utilization, lower "
+                f"{int(rows_needed)} rows plus sentinel x {int(row_bytes)} B/row "
+                f"(every captured layer) = {need / (1 << 30):.2f} GiB, but the outside budget "
+                f"at gpu_memory_utilization={gpu_mem_util} has "
+                f"{max(room, 0) / (1 << 30):.2f} GiB. Lower gpu_memory_utilization, lower "
                 f"max_num_batched_tokens, capture fewer layers, or set MIA_APERTURE_GPU_BYTES "
                 f"explicitly (an explicit value always wins; one smaller than {need} B risks "
                 f"ApertureBackpressureError on a max-token step).")
@@ -72,14 +64,14 @@ def resolve_aperture_bytes_auto(total_gpu_bytes: int, gpu_mem_util: float,
 
 
 def model_sized_aperture_bytes(rows_needed: Optional[int], row_bytes: Optional[int]) -> Optional[int]:
-    """Bytes one max-token step fills (rows x row bytes), or None when unknown."""
+    """Bytes for one max-token step plus its sentinel, or None when unknown."""
     try:
         rows, rb = int(rows_needed), int(row_bytes)
     except (TypeError, ValueError):
         return None
     if rows <= 0 or rb <= 0:
         return None
-    return rows * rb
+    return (rows + 1) * rb
 
 
 def aperture_bytes_is_explicit() -> bool:

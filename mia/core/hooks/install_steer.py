@@ -8,6 +8,8 @@ import numpy as np
 import torch
 
 from mia._profiler import PROF
+from mia.errors import MiaConfigurationError
+from mia.core.runtime.memory_owner import device_buffer, validate_layer_matches
 from mia.core.hooks.ops import register_graph_ops
 from mia.core.hooks.hosts import SteerHost
 from mia.core.hooks.install import (
@@ -94,7 +96,10 @@ def install_steer_hosts(worker) -> None:
         worker._env_config_path = os.environ.get("MIA_STEER_CONFIG")
 
     matched = list(iter_matched_modules(model, match_layer))
+    validate_layer_matches(getattr(worker, "_mia_memory_owner", None), matched)
     if not matched:
+        if getattr(worker, "_mia_memory_owner", None) is not None:
+            raise MiaConfigurationError("No steering layers matched the MIA memory plan")
         print("[graph/install_steer] no decoder layers matched LAYER_PATTERNS; "
               "steering inactive")
         return
@@ -107,7 +112,7 @@ def install_steer_hosts(worker) -> None:
 class SteerRegistry:
     """Per-worker owner of the steering routing slabs and the resident vector table."""
 
-    def __init__(self, num_layers, cap, hidden, v_max, device, dtype):
+    def __init__(self, num_layers, cap, hidden, v_max, device, dtype, *, memory_owner=None):
         self.num_layers = int(num_layers)
         self.cap = int(cap)
         self.hidden = int(hidden)
@@ -115,11 +120,11 @@ class SteerRegistry:
         self.device = torch.device(device)
         self.should_capture = True
 
-        self.coeff_all = torch.zeros(num_layers, cap, dtype=torch.float32, device=device)
-        self.vec_id_all = torch.zeros(num_layers, cap, dtype=torch.int64, device=device)
-        self.mode_all = torch.zeros(num_layers, cap, dtype=torch.int64, device=device)
-        self.vec_table = torch.zeros(v_max, hidden, dtype=dtype, device=device)
-        self.avg_proj_table = torch.zeros(v_max, dtype=torch.float32, device=device)
+        self.coeff_all = device_buffer(memory_owner, "steer.coeff", (num_layers, cap), torch.float32, device)
+        self.vec_id_all = device_buffer(memory_owner, "steer.vec_id", (num_layers, cap), torch.int64, device)
+        self.mode_all = device_buffer(memory_owner, "steer.mode", (num_layers, cap), torch.int64, device)
+        self.vec_table = device_buffer(memory_owner, "steer.vec_table", (v_max, hidden), dtype, device)
+        self.avg_proj_table = device_buffer(memory_owner, "steer.avg_proj", (v_max,), torch.float32, device)
 
         pin = self.device.type == "cuda"
         self._aperture = PinnedMirror(
@@ -163,10 +168,10 @@ class SteerRegistry:
         self._slot_req_key: Optional[tuple] = None
         if self._gpu_routing_env:
             pin = self.device.type == "cuda"
-            self.slot_vid = torch.zeros(cap, dtype=torch.int64, device=device)
-            self.slot_mode = torch.zeros(cap, dtype=torch.int64, device=device)
-            self.slot_coeff = torch.zeros(cap, dtype=torch.float32, device=device)
-            self.slot_layer_mask = torch.zeros(cap, num_layers, dtype=torch.bool, device=device)
+            self.slot_vid = device_buffer(memory_owner, "steer.slot_vid", (cap,), torch.int64, device)
+            self.slot_mode = device_buffer(memory_owner, "steer.slot_mode", (cap,), torch.int64, device)
+            self.slot_coeff = device_buffer(memory_owner, "steer.slot_coeff", (cap,), torch.float32, device)
+            self.slot_layer_mask = device_buffer(memory_owner, "steer.slot_layer_mask", (cap, num_layers), torch.bool, device)
             self._slot_vid_h = torch.zeros(cap, dtype=torch.int64, pin_memory=pin)
             self._slot_mode_h = torch.zeros(cap, dtype=torch.int64, pin_memory=pin)
             self._slot_coeff_h = torch.zeros(cap, dtype=torch.float32, pin_memory=pin)
@@ -175,7 +180,7 @@ class SteerRegistry:
             self._slot_mode_np = self._slot_mode_h.numpy()
             self._slot_coeff_np = self._slot_coeff_h.numpy()
             self._slot_mask_np = self._slot_mask_h.numpy()
-            self.slot_col = torch.full((cap,), STEER_COL_ALL, dtype=torch.int64, device=device)
+            self.slot_col = device_buffer(memory_owner, "steer.slot_col", (cap,), torch.int64, device, fill=STEER_COL_ALL)
             self._slot_col_h = torch.full((cap,), STEER_COL_ALL, dtype=torch.int64,
                                           pin_memory=pin)
 
@@ -467,7 +472,7 @@ class SteerRegistry:
         vid = self._next_vec_id
         self._next_vec_id += 1
         self.vec_table[vid].copy_(
-            data["dir"].to(self.vec_table.device, dtype=self.vec_table.dtype).view(-1))
+            data["dir"].to(device="cpu", dtype=self.vec_table.dtype).view(-1))
         if "avg_proj" in data:
             self.avg_proj_table[vid] = float(data["avg_proj"])
             self.vec_has_avgproj.add(vid)
@@ -485,7 +490,8 @@ def _install_steer_buffer(worker, model, matched, device) -> SteerRegistry:
     v_max = int(os.environ.get("MIA_STEER_VMAX", "16"))
     buf_dtype = model.dtype if hasattr(model, "dtype") else next(model.parameters()).dtype
 
-    registry = SteerRegistry(num_layers, cap, hidden, v_max, device, buf_dtype)
+    registry = SteerRegistry(num_layers, cap, hidden, v_max, device, buf_dtype,
+                             memory_owner=getattr(worker, "_mia_memory_owner", None))
 
     n_wired = 0
     for name, module, layer_num0 in matched:
