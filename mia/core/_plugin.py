@@ -48,16 +48,8 @@ from mia.core.delivery import (
 from mia.core.aperture.aperture_reader import load_qk_aperture_tp
 from mia.core.aperture.aperture_sizing import (
     CAPTURE_SUBSYSTEMS,
-    DEFAULT_AUTOCAP_HEADROOM_BYTES,
-    DEFAULT_AUTOCAP_SAFETY,
-    aperture_bytes_is_explicit,
     apply_min_only,
-    compute_safe_max_batched_tokens,
     parse_autocap_setting,
-    per_token_row_bytes,
-    resolve_aperture_bytes,
-    resolve_aperture_bytes_auto,
-    safe_cap_with_model_sized_aperture,
 )
 from mia.core.delivery.delivered_probes import (
     DeliveryReadTimeout,
@@ -81,6 +73,7 @@ from mia.core.delivery.delivery_selector import DP_SIZE_ENV, STAMP_ENV
 from mia.core.delivery.run_artifact import artifact_wait_s
 from mia.core.hooks.run_mode import DEFAULT_MIA_WORKER, capture_mode_from_env, parse_mia_worker_env
 from mia.core.hooks.run_mode import MIA_WORKER_VALUES, UnknownMiaWorkerError  # noqa: F401  (re-exported)
+from mia.core.runtime.memory_plan import safe_token_cap
 from mia.core.runtime.tp_shard import (
     HS_ALL_RANKS_ENV,
     HS_LAYER_SHARD_RULE,
@@ -92,12 +85,10 @@ from mia.core.runtime.tp_shard import (
     TP_SHARD_KEY,
     TPShardError,
     hs_expected_ranks,
-    hs_max_owned_layers,
     hs_requested_layers,
     merge_hs_payloads,
     merge_qk_payloads,
     parse_rank_dir,
-    qk_shard,
     rank_dir_name,
     refuse_pipeline_parallel,
     resolve_hs_shard_mode,
@@ -772,20 +763,6 @@ def _worker_kind(worker_ext) -> str:
     return cls_kind if cls_kind is not None else DEFAULT_MIA_WORKER
 
 
-_DTYPE_BYTES = {
-    "torch.float32": 4, "torch.float": 4, "torch.float16": 2, "torch.half": 2,
-    "torch.bfloat16": 2, "torch.float64": 8, "torch.double": 8,
-    "torch.int8": 1, "torch.uint8": 1, "torch.float8_e4m3fn": 1, "torch.float8_e5m2": 1,
-}
-
-
-def _dtype_element_size(dt) -> int:
-    itemsize = getattr(dt, "itemsize", None)
-    if isinstance(itemsize, int) and itemsize > 0:
-        return itemsize
-    return _DTYPE_BYTES.get(str(dt), 2)
-
-
 def _autocap_setting():
     return parse_autocap_setting(os.environ.get("MIA_APERTURE_MAX_BATCHED_TOKENS"))
 
@@ -798,61 +775,14 @@ def _enabled_subsystems(worker_kinds) -> set:
     return {_WORKER_KIND_TO_SUBSYSTEM[k] for k in kinds if k in _WORKER_KIND_TO_SUBSYSTEM}
 
 
-def _model_dims(config) -> dict:
-    mc = config.model_config
-    tc = mc.hf_text_config
-    hidden = int(getattr(tc, "hidden_size"))
-    dims = {
-        "hidden": hidden,
-        "dtype_bytes": _dtype_element_size(getattr(mc, "dtype", None)),
-        "layers": int(getattr(tc, "num_hidden_layers")),
-    }
-    h_q = getattr(tc, "num_attention_heads", None)
-    if h_q:
-        h_q = int(h_q)
-        h_kv = int(getattr(tc, "num_key_value_heads", None) or h_q)
-        head_dim = int(getattr(tc, "head_dim", 0) or (hidden // h_q))
-        tp = int(getattr(getattr(config, "parallel_config", None),
-                         "tensor_parallel_size", 1) or 1)
-        shard = qk_shard(0, tp, h_q, h_kv, head_dim)
-        dims["n_q_heads"] = shard.num_local_q_heads
-        dims["n_kv_heads"] = shard.num_local_kv_heads
-        dims["head_dim"] = head_dim
-        dims["tp"] = tp
-    return dims
-
-
-def _hs_layers_per_rank(config, n_layers: int) -> int:
-    tp = int(getattr(getattr(config, "parallel_config", None), "tensor_parallel_size", 1) or 1)
-    return hs_max_owned_layers(int(n_layers), tp, resolve_hs_shard_mode(tp))
-
-
 def _derive_safe_max_batched_tokens(config, worker_kinds):
     # lazy: current_platform looked up at call time so it can be patched
     from vllm.platforms import current_platform
-    dims = _model_dims(config)
-    n_layers = dims["layers"]
-    gpu_util = float(config.cache_config.gpu_memory_utilization)
-    total_gpu = int(current_platform.get_device_total_memory(0))
-    budget = resolve_aperture_bytes_auto(total_gpu, gpu_util)
-    slices = resolve_aperture_bytes(
-        _enabled_subsystems(worker_kinds), gpu_bytes_budget=budget, model_dims=dims)
-    if not slices:
-        return None
-    if set(slices) == {"hs"}:
-        n_layers = _hs_layers_per_rank(config, n_layers)
-    aperture_bytes = sum(slices.values())
-    plt = sum(per_token_row_bytes(s, dims) for s in slices)
-    safety = int(os.environ.get("MIA_APERTURE_AUTOCAP_SAFETY") or DEFAULT_AUTOCAP_SAFETY)
-    headroom = int(os.environ.get("MIA_APERTURE_AUTOCAP_HEADROOM_BYTES") or DEFAULT_AUTOCAP_HEADROOM_BYTES)
-    cap = compute_safe_max_batched_tokens(
-        total_gpu, gpu_util, aperture_bytes, n_layers, plt, safety=safety, headroom_bytes=headroom)
-    if (cap is not None and len(slices) == 1 and not aperture_bytes_is_explicit()
-            and cap * n_layers * plt > aperture_bytes):
-        cap = safe_cap_with_model_sized_aperture(
-            total_gpu, gpu_util, aperture_bytes, n_layers, plt,
-            safety=safety, headroom_bytes=headroom)
-    return cap
+    kinds = [worker_kinds] if isinstance(worker_kinds, str) else list(worker_kinds)
+    if len(kinds) != 1:
+        raise MiaConfigurationError("MIA memory planning expects one worker kind")
+    return safe_token_cap(config, kinds[0],
+                          total_bytes=int(current_platform.get_device_total_memory(0)))
 
 
 def _maybe_autocap_max_batched_tokens(config, worker_kinds) -> None:
@@ -2673,8 +2603,11 @@ def register() -> None:
         from mia.core.hooks.install import patch_worker_load_model
         patch_worker_load_model()
     except Exception as e:  # noqa: BLE001
-        print(f"[mia] graph load_model patch unavailable ({e}); "
-              f"eager path unaffected.")
+        raise MiaConfigurationError("MIA could not install its model-load lifecycle hook") from e
+
+    # After the load_model patch, so startup cleanup also covers graph-install failures
+    from mia.core.runtime.memory_startup import install_memory_startup_patch
+    install_memory_startup_patch()
 
     _original_generate = AsyncLLM.generate
     AsyncLLM.generate = _patched_generate

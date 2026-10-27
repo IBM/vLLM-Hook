@@ -1,5 +1,6 @@
 """Capture-aperture byte budgets and the safe max_num_batched_tokens cap."""
 import os
+import math
 from typing import Optional, Tuple
 
 from mia.errors import MiaSizingError
@@ -13,54 +14,64 @@ _TRUE = ("1", "true", "on", "yes", "auto")
 _FALSE = ("", "0", "false", "off", "no")
 
 
-def resolve_aperture_bytes_fixed(total_gpu_bytes: int, fixed_bytes: int, gpu_mem_util: float) -> int:
-    """Fixed-size aperture path: return ``fixed_bytes`` verbatim after a fit check."""
+def aperture_room_bytes(total_gpu_bytes: int, gpu_mem_util: float,
+                        weights_bytes: Optional[int] = None) -> int:
+    """Bytes outside vLLM's ``gpu_memory_utilization`` share; weights are inside it, so unused."""
+    return int(total_gpu_bytes) - math.ceil(float(gpu_mem_util) * int(total_gpu_bytes))
+
+
+def resolve_aperture_bytes_fixed(total_gpu_bytes: int, fixed_bytes: int, gpu_mem_util: float,
+                                 weights_bytes: Optional[int] = None) -> int:
+    """Fixed-size aperture path: return ``fixed_bytes`` verbatim if it fits outside the share."""
     fixed_bytes = int(fixed_bytes)
-    total_gpu_bytes = int(total_gpu_bytes)
-    free_margin = (1.0 - gpu_mem_util) * total_gpu_bytes
-    if fixed_bytes > free_margin:
+    if fixed_bytes <= 0:
+        raise MiaSizingError("MIA_APERTURE_GPU_BYTES must be positive")
+    room = aperture_room_bytes(total_gpu_bytes, gpu_mem_util, weights_bytes)
+    if fixed_bytes > room:
         raise MiaSizingError(
-            f"aperture {fixed_bytes/(1<<30):.2f} GiB + gpu_memory_utilization={gpu_mem_util} leaves no "
-            f"room (free margin {free_margin/(1<<30):.2f} GiB): lower gpu_memory_utilization or "
-            f"MIA_APERTURE_GPU_BYTES")
+            f"aperture {fixed_bytes/(1<<30):.2f} GiB exceeds the outside budget "
+            f"{max(room, 0)/(1<<30):.2f} GiB at gpu_memory_utilization={gpu_mem_util}. "
+            "Lower gpu_memory_utilization or MIA_APERTURE_GPU_BYTES")
     return fixed_bytes
 
 
 def resolve_aperture_bytes_auto(total_gpu_bytes: int, gpu_mem_util: float,
                                 rows_needed: Optional[int] = None,
                                 row_bytes: Optional[int] = None,
-                                what: str = "capture") -> int:
+                                what: str = "capture",
+                                weights_bytes: Optional[int] = None) -> int:
     """Resolve the aperture byte budget: ``MIA_APERTURE_GPU_BYTES`` if set, else the default."""
     raw_fixed = os.environ.get("MIA_APERTURE_GPU_BYTES")
     if raw_fixed is not None and raw_fixed.strip() != "":
-        return resolve_aperture_bytes_fixed(total_gpu_bytes, int(raw_fixed), gpu_mem_util)
+        return resolve_aperture_bytes_fixed(total_gpu_bytes, int(raw_fixed), gpu_mem_util,
+                                            weights_bytes)
     budget = DEFAULT_APERTURE_GPU_BYTES
     need = model_sized_aperture_bytes(rows_needed, row_bytes)
     if need is not None and need > budget:
-        free_margin = (1.0 - gpu_mem_util) * int(total_gpu_bytes)
-        if need > free_margin:
+        room = aperture_room_bytes(total_gpu_bytes, gpu_mem_util, weights_bytes)
+        if need > room:
             raise MiaSizingError(
                 f"{what} aperture cannot hold one max-token step by default: "
-                f"{int(rows_needed)} rows (max_num_batched_tokens) x {int(row_bytes)} B/row "
-                f"(every captured layer) = {need / (1 << 30):.2f} GiB, but "
-                f"gpu_memory_utilization={gpu_mem_util} leaves {free_margin / (1 << 30):.2f} GiB. "
-                f"Lower gpu_memory_utilization, lower max_num_batched_tokens, capture fewer "
-                f"layers, or set MIA_APERTURE_GPU_BYTES explicitly (an explicit value always "
-                f"wins; one smaller than {need} B risks ApertureBackpressureError on a "
-                f"max-token step).")
+                f"{int(rows_needed)} rows plus sentinel x {int(row_bytes)} B/row "
+                f"(every captured layer) = {need / (1 << 30):.2f} GiB, but the outside budget "
+                f"at gpu_memory_utilization={gpu_mem_util} has "
+                f"{max(room, 0) / (1 << 30):.2f} GiB. Lower gpu_memory_utilization, lower "
+                f"max_num_batched_tokens, capture fewer layers, or set MIA_APERTURE_GPU_BYTES "
+                f"explicitly (an explicit value always wins; one smaller than {need} B risks "
+                f"ApertureBackpressureError on a max-token step).")
         budget = need
-    return resolve_aperture_bytes_fixed(total_gpu_bytes, budget, gpu_mem_util)
+    return resolve_aperture_bytes_fixed(total_gpu_bytes, budget, gpu_mem_util, weights_bytes)
 
 
 def model_sized_aperture_bytes(rows_needed: Optional[int], row_bytes: Optional[int]) -> Optional[int]:
-    """Bytes one max-token step fills (rows x row bytes), or None when unknown."""
+    """Bytes for one max-token step plus its sentinel, or None when unknown."""
     try:
         rows, rb = int(rows_needed), int(row_bytes)
     except (TypeError, ValueError):
         return None
     if rows <= 0 or rb <= 0:
         return None
-    return rows * rb
+    return (rows + 1) * rb
 
 
 def aperture_bytes_is_explicit() -> bool:

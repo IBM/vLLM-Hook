@@ -93,9 +93,11 @@ not supported, and Q/K `score` capture requires TP = 1.
 - Python 3.11–3.14; validated on 3.12.
 - About 12 GB for the environment, plus the models, downloaded on first use (the hidden-state,
   steering, attention-tracker and capture-aperture demos need about 33 GB).
-- GPU memory: capture keeps a 4 GiB buffer outside vLLM's `gpu_memory_utilization` share. The demos
+- GPU memory: MIA reserves its GPU buffers (a 4 GiB capture aperture plus small routing tables)
+  outside vLLM's `gpu_memory_utilization` share, so they do not shrink the KV cache. The demos
   use 0.7 and models up to 8B (a 40 GB card or larger); on a smaller card lower
-  `gpu_memory_utilization` (`--gpu-memory-utilization` on a server) or set `MIA_APERTURE_GPU_BYTES`
+  `gpu_memory_utilization` (`--gpu-memory-utilization` on a server) or set a smaller
+  `MIA_APERTURE_GPU_BYTES`
   ([sizing](docs/configs.md#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)).
 - Gated models (Llama, Mistral) need `hf auth login`.
 

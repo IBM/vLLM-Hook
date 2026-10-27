@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from mia._profiler import PROF
+from mia.core.runtime.memory_owner import device_buffer, validate_layer_matches
 from mia.core.hooks.ops import register_graph_ops
 from mia.core.aperture.capture_aperture import CaptureAperture, ApertureBackpressureError
 from mia.core.hooks.hosts import HSCaptureHost
@@ -167,14 +168,12 @@ def install_hs_hosts(worker) -> Optional[HostRegistry]:
     if not getattr(worker, "_disk_states", None):
         worker._disk_states = {}
 
-    if should_capture:
-        init_writer_process(worker)
-    else:
-        mark_no_writer(worker, "HS sink rank: captures nothing")
-
     matched = list(iter_matched_modules(model, match_layer))
+    validate_layer_matches(getattr(worker, "_mia_memory_owner", None), matched)
     worker._mia_layer_names = [[ln + 1, name] for name, _m, ln in matched]
     if not matched:
+        if getattr(worker, "_mia_memory_owner", None) is not None:
+            raise MiaConfigurationError("No decoder layers matched the MIA memory plan")
         print("[graph/install_hs] no decoder layers matched LAYER_PATTERNS; "
               "HS graph capture inactive")
         set_registry(worker, "hs", None)
@@ -186,11 +185,23 @@ def install_hs_hosts(worker) -> Optional[HostRegistry]:
         worker, model, matched, num_layers, hidden_size,
         should_capture, device_t, bake_op, owned_rows=owned_rows, symmetric=symmetric)
     set_registry(worker, "hs", registry)
+    if should_capture:
+        init_writer_process(worker)
+    else:
+        mark_no_writer(worker, "HS sink rank: captures nothing")
     return registry
+
 
 
 def _resolve_aperture_rows(worker, num_layers, hidden_size, buf_dtype, device,
                            rows_needed=None) -> tuple:
+    owner = getattr(worker, "_mia_memory_owner", None)
+    if owner is not None:
+        plan = owner.plan
+        if (num_layers != len(plan.owned_layers) or hidden_size != plan.hidden
+                or str(buf_dtype).removeprefix("torch.") != plan.dtype):
+            raise MiaConfigurationError("HS aperture geometry differs from the startup plan")
+        return plan.rows, plan.aperture_bytes
     elem_size = torch.empty(0, dtype=buf_dtype).element_size()
     if str(device).startswith("cuda"):
         total_gpu = int(torch.cuda.get_device_properties(device).total_memory)
@@ -205,7 +216,7 @@ def _resolve_aperture_rows(worker, num_layers, hidden_size, buf_dtype, device,
     aperture_bytes = resolve_aperture_bytes_auto(
         total_gpu, gpu_util, rows_needed=rows_needed,
         row_bytes=int(num_layers) * per_layer_row_bytes, what="HS capture")
-    R = int(aperture_bytes // (num_layers * per_layer_row_bytes))
+    R = int(aperture_bytes // (num_layers * per_layer_row_bytes)) - 1
     if R < 1:
         raise MiaSizingError(
             f"HS capture aperture too small: aperture_bytes={aperture_bytes} num_layers={num_layers} "
@@ -224,6 +235,7 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
     owned = (list(range(num_layers)) if owned_rows is None
              else sorted({int(r) for r in owned_rows if 0 <= int(r) < num_layers}))
     owned_set = set(owned)
+    owner = getattr(worker, "_mia_memory_owner", None)
     cap = _resolve_max_num_batched_tokens(worker)
     buf_dtype = model.dtype if hasattr(model, "dtype") \
         else next(model.parameters()).dtype
@@ -253,7 +265,7 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
     if bake_op:
         registry = HostRegistry(
             num_layers=num_layers, cap=cap, device=device,
-            should_capture=should_capture,
+            should_capture=should_capture, memory_owner=owner, memory_prefix="hs",
         )
         aperture = CaptureAperture(row_bytes=hidden_size * torch.empty(0, dtype=buf_dtype).element_size(),
                               n_slots=R, device=device, dtype=buf_dtype, row_shape=(hidden_size,))
@@ -271,15 +283,15 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
 
     sink_index = sink_active = None
     if symmetric and n_owned < num_layers:
-        sink_index = torch.zeros(num_layers, cap, dtype=torch.int64, device=device)
-        sink_active = torch.zeros(num_layers, dtype=torch.int32, device=device)
+        sink_index = device_buffer(owner, "hs.sink_index", (num_layers, cap), torch.int64, device)
+        sink_active = device_buffer(owner, "hs.sink_active", (num_layers,), torch.int32, device)
         worker._hs_sink_index = sink_index
         worker._hs_sink_active = sink_active
 
     n_hosts = n_sinks = 0
     for name, module, layer_num0 in matched:
         if bake_op and 0 <= layer_num0 < num_layers and layer_num0 in owned_set:
-            hs_buf = torch.zeros(R + 1, hidden_size, dtype=buf_dtype, device=device)
+            hs_buf = device_buffer(owner, f"hs.{layer_num0}", (R + 1, hidden_size), buf_dtype, device)
             host = HSCaptureHost(
                 module_name=name,
                 layer_num=layer_num0,
@@ -297,7 +309,7 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
             n_hosts += 1
         elif sink_index is not None and 0 <= layer_num0 < num_layers:
             _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, device,
-                              sink_index, sink_active)
+                              sink_index, sink_active, owner)
             n_sinks += 1
         _wrap_layer_class(type(module))
 
@@ -321,7 +333,7 @@ def _install_hs_buffer(worker, model, matched, num_layers, hidden_size,
 
 
 def _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, device,
-                      sink_index, sink_active) -> None:
+                      sink_index, sink_active, owner=None) -> None:
     host = HSCaptureHost(
         module_name=name,
         layer_num=layer_num0,
@@ -332,15 +344,16 @@ def _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, dev
         device=device,
         has_residual=1,
         do_capture=True,
-        hs_buf=torch.zeros(1, hidden_size, dtype=buf_dtype, device=device),
+        hs_buf=device_buffer(owner, f"hs.sink.{layer_num0}", (1, hidden_size), buf_dtype, device),
     )
     host.bind_views(sink_index[layer_num0], sink_active[layer_num0])
     setattr(module, _HS_HOST_ATTR, host)
 
 
 def _install_hs_sink(worker, matched, num_layers, hidden_size, cap, buf_dtype, device) -> None:
-    sink_index = torch.zeros(num_layers, cap, dtype=torch.int64, device=device)
-    sink_active = torch.zeros(num_layers, dtype=torch.int32, device=device)
+    owner = getattr(worker, "_mia_memory_owner", None)
+    sink_index = device_buffer(owner, "hs.sink_index", (num_layers, cap), torch.int64, device)
+    sink_active = device_buffer(owner, "hs.sink_active", (num_layers,), torch.int32, device)
     worker._hs_sink_index = sink_index
     worker._hs_sink_active = sink_active
     worker._capture_aperture = None
@@ -348,7 +361,7 @@ def _install_hs_sink(worker, matched, num_layers, hidden_size, cap, buf_dtype, d
     for name, module, layer_num0 in matched:
         if 0 <= layer_num0 < num_layers:
             _attach_sink_host(module, name, layer_num0, cap, hidden_size, buf_dtype, device,
-                              sink_index, sink_active)
+                              sink_index, sink_active, owner)
             n_hosts += 1
         _wrap_layer_class(type(module))
     sink_bytes = (sink_index.numel() * sink_index.element_size()
