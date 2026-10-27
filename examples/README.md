@@ -285,10 +285,10 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
 - **Start it** from the repo root, in its own shell; it is ready when the log prints
   `Application startup complete.` (about a minute).
 - **Run the client** in a second shell. **Stop the server** with Ctrl-C.
-- **GPU memory:** a capture server's 4 GiB capture buffer comes out of its
-  `--gpu-memory-utilization` share (the KV cache); the demos' commands pass 0.8. On a small card set
-  a smaller `MIA_APERTURE_GPU_BYTES` ([sizing](../docs/configs.md#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)).
-  A steering server needs no such room.
+- **GPU memory:** a capture server's 4 GiB capture buffer sits outside its
+  `--gpu-memory-utilization` share; the demos' commands pass 0.8. On a small card pass a lower value
+  or set a smaller `MIA_APERTURE_GPU_BYTES` ([sizing](../docs/configs.md#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)).
+  A steering server needs only its small routing tables.
 
 Eager is the opt-out, and the reason to reach for it is bit-exactness — graph-mode capture can
 move per-token logprobs slightly, eager cannot: add `--enforce-eager`.

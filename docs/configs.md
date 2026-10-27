@@ -164,7 +164,7 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=steer \
   vllm serve microsoft/Phi-3-mini-4k-instruct --max-model-len 2048 --port 8770
 ```
 
-A capture server needs room for the capture aperture inside its `--gpu-memory-utilization` share
+A capture server needs room for the aperture outside its `--gpu-memory-utilization` share
 ([sizing](#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)).
 
 The server exposes captured activations at `/v1/mia/delivered`: protect it with `--api-key KEY`
@@ -283,66 +283,57 @@ look for `.safetensors` files only when it is set.
 ## Sizing the capture aperture, and the GPU memory it costs
 
 The aperture is a **fixed** GPU allocation — fixed because a buffer that grows with traffic
-OOMs under load. It is allocated before vLLM sizes its KV cache, so it comes out of vLLM's
-`gpu_memory_utilization` share (the KV-cache budget), and MIA checks that at engine start rather than letting the allocation
-fail later.
+OOMs under load. In graph mode MIA reserves it, with small routing tables, before vLLM measures
+free memory at startup, so it sits **outside** vLLM's `gpu_memory_utilization` share and does not
+shrink the KV cache. Capture layers write into views of that reservation; nothing grows later.
 
 | env var | default | effect |
 |---|---|---|
-| `MIA_APERTURE_GPU_BYTES` | **4 GiB** | the aperture's byte budget. **Per rank** at TP > 1, not per engine |
-| `MIA_APERTURE_MAX_BATCHED_TOKENS` | off | `auto` lowers `max_num_batched_tokens` (an integer sets the cap) so a heavy capture step fits in GPU memory at high batch; it never raises vLLM's value |
-| `MIA_APERTURE_BACKPRESSURE_TIMEOUT_S` | `10` (s) | how long a step waits for free capture space before `ApertureBackpressureError`. Capture blocks; it never silently drops rows. Raise it if a slow disk makes a heavy run hit it |
+| `MIA_APERTURE_GPU_BYTES` | **4 GiB** | the aperture's exact byte budget, sentinel row included. **Per rank** at TP > 1, not per engine |
+| `MIA_APERTURE_MAX_BATCHED_TOKENS` | off | `auto` lowers `max_num_batched_tokens` (an integer sets the cap) so a max-token step and MIA's buffers fit on every rank; it never raises vLLM's value |
+| `MIA_APERTURE_BACKPRESSURE_TIMEOUT_S` | `10` (s) | how long a step waits for free capture space before `ApertureBackpressureError`. Capture blocks; it never silently drops rows |
 
-### The one rule: `gpu_memory_utilization` must leave room for the aperture
+### The one rule: `gpu_memory_utilization` must leave room for MIA
 
 `gpu_memory_utilization` is vLLM's flag, not MIA's (`--gpu-memory-utilization` on the server,
-default 0.9); it tells vLLM what fraction of the card to claim for weights and KV cache. **The
-aperture is counted inside that fraction** (vLLM sizes the KV cache from what is left), and engine
-start fails unless:
+default 0.9): the fraction of the card vLLM claims for weights, activations and KV cache. MIA's
+buffers must fit in the rest, on every rank:
 
 ```
-MIA_APERTURE_GPU_BYTES  <  gpu_memory_utilization × total GPU bytes  −  weights
+aperture + routing tables  ≤  total GPU bytes − ceil(gpu_memory_utilization × total GPU bytes)
 ```
 
-Measured on an A100 80 GB (Qwen2-1.5B-Instruct fp16, `capture_hs` layers 1–14,
-`max_num_batched_tokens=8192`, vLLM 0.29.0; KV cache from vLLM's "Available KV cache memory" log):
+Engine start also fails if, after MIA's reservation, less than vLLM's share is still physically
+free (another process or NCCL using the card). Either way you get a named `MiaSizingError`
+instead of a CUDA OOM mid-run. On an 80 GiB card with the 4 GiB default:
 
-| `gpu_memory_utilization` | `MIA_APERTURE_GPU_BYTES` | vLLM KV cache |
+| `gpu_memory_utilization` | room outside the share | 4 GiB aperture |
 |---|---|---|
-| 0.85 | 128 MiB | 63.06 GiB |
-| 0.85 | 512 MiB | 62.65 GiB |
-| 0.92 | 512 MiB | 68.21 GiB |
-| 0.92 | 6.59 GiB | 62.13 GiB |
-
-Raising the aperture by 6.09 GiB at gmu 0.92 cut the KV cache by 6.08 GiB.
-
-On a small card, the 4 GiB default can leave too little after the weights for a KV cache: set a
-smaller `MIA_APERTURE_GPU_BYTES`, or raise `gpu_memory_utilization`.
-
-Two things worth knowing about that check. It is computed from the *fraction* and the measured
-weight size — so it does not know about anything else sharing the card; and it runs at engine
-construction, so you get a named error instead of a CUDA OOM mid-run:
+| 0.80 | 16 GiB | fits |
+| 0.90 | 8 GiB | fits |
+| 0.95 | 4 GiB | refused: the routing tables need a little more |
+| 0.97 | 2.4 GiB | refused |
 
 ```
-aperture 4.00 GiB does not fit: it comes out of vLLM's gpu_memory_utilization=0.85 share (the
-KV-cache budget), which has 1.81 GiB after 2.98 GiB of weights. Raise gpu_memory_utilization or
-lower MIA_APERTURE_GPU_BYTES
+MIA outside budget insufficient: aperture=4294967296 B, auxiliary=2097152 B,
+scratch=0 B; outside=4294967296 B, model=81604378624 B.
+Lower gpu_memory_utilization or MIA_APERTURE_GPU_BYTES/token/vector capacity.
 ```
 
-When you set nothing, MIA also checks the default against what **one max-token step** actually
-needs (`max_num_batched_tokens × row bytes × captured layers`). If a step needs more than 4 GiB
-it grows the budget to fit — but only within that same share. If it cannot, it refuses and
-names all four ways out: lower `gpu_memory_utilization`, lower `max_num_batched_tokens`, capture
-fewer layers, or set `MIA_APERTURE_GPU_BYTES` yourself.
+When you set nothing, the default grows to hold one max-token step plus its sentinel row
+(`(max_num_batched_tokens + 1) × row bytes × captured layers`), still under the rule above.
+An explicit `MIA_APERTURE_GPU_BYTES` is used as is — including when it is *smaller* than one
+step needs, which is legal and surfaces as `ApertureBackpressureError` on a max-token step.
 
-An explicit `MIA_APERTURE_GPU_BYTES` always wins and skips that growth — including when it is
-*smaller* than one step needs, which is legal and will surface as `ApertureBackpressureError`
-when a max-token step cannot be admitted. The demos use `gpu_memory_utilization=0.7`, which
-on an 80 GiB card leaves ample KV cache after the 4 GiB default.
+At TP > 1 every check is per rank, which is cheaper than it sounds for hidden states: a step
+costs `max_num_batched_tokens × ceil(L / tp) × hidden × 2` on each rank, so 2.5 GiB for
+Llama-3.1-70B at TP4 rather than 10 GiB. Steering reserves only its vector and routing tables.
 
-At TP > 1 the budget is per rank, which is cheaper than it sounds for hidden states: a step costs
-`max_num_batched_tokens × ceil(L / tp) × hidden × 2` on each rank, so 2.5 GiB for
-Llama-3.1-70B at TP4 rather than 10 GiB.
+This applies to vLLM 0.29.0 with CUDA graphs; the eager path does not use the reservation.
+`kv_cache_memory_bytes` is refused because it bypasses `gpu_memory_utilization`, and HS capture
+and steering need their fused Triton kernels (`MIA_CAPTURE_FUSED`, `MIA_STEER_FUSED`, on by
+default). `collective_rpc("mia_memory_budget")` reports each worker's reserved bytes and vLLM's
+KV-cache figures.
 
 ---
 
