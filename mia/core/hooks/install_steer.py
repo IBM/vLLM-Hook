@@ -65,6 +65,8 @@ def _wrap_layer_class(cls: type) -> None:
                 if (isinstance(out, tuple) and len(out) >= 2
                         and isinstance(out[1], torch.Tensor)):
                     host.steer(out[1])
+                elif (isinstance(out, tuple) and len(out) >=2 and out[1] is None and isinstance(out[0], torch.Tensor)):
+                    host.steer(out[0])
                 elif isinstance(out, torch.Tensor):
                     host.steer(out)
             return out
