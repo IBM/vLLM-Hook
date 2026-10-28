@@ -13,14 +13,14 @@ A passing workflow does not necessarily mean the experimental macOS job passed.
 
 ## Run the checks
 
-Checks start automatically when a pull request opens or its branch changes in
-`tburleyinfo/vLLM-Hook`. New commits cancel older runs for the same PR.
+Checks start automatically when a pull request opens or its branch changes.
+New commits cancel older runs for the same PR.
 Branch protection controls whether a failing check prevents merging.
 
 To run manually, the workflow must first be present on the default branch.
-Then open **Actions → CPU platform validation → Run workflow**, select a branch,
-and enter the full commit SHA to test. Enable **fresh_build** to bypass the
-compiled-package cache.
+Then open **Actions → CPU platform validation → Run workflow** and select a branch
+to test its latest commit. Optionally enter a full commit SHA to test a specific
+revision. Enable **fresh_build** to bypass the compiled-package cache.
 
 ## Find results
 

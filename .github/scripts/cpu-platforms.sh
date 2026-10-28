@@ -55,14 +55,14 @@ wheel)
   source "$root/.venv/bin/activate"
   if compgen -G "$root/wheelhouse/triton-*.whl" > /dev/null; then
     echo 'reused compiled wheel' | tee "$out/wheel-source.txt"
-    python "$root/.github/scripts/mlr58-wheel.py" check
+    python "$root/.github/scripts/cpu-wheel.py" check
   else
     echo 'built compiled wheel (cache miss)' | tee "$out/wheel-source.txt"
     git clone https://github.com/triton-lang/triton-cpu.git "$root/triton-cpu"
     git -C "$root/triton-cpu" checkout --detach "$TRITON_SHA"
     test "$(git -C "$root/triton-cpu" rev-parse HEAD)" = "$TRITON_SHA"
     python -m pip wheel --no-deps --no-build-isolation -v "$root/triton-cpu" -w "$root/wheelhouse"
-    python "$root/.github/scripts/mlr58-wheel.py" write
+    python "$root/.github/scripts/cpu-wheel.py" write
   fi
   python -m pip install --no-deps --force-reinstall "$root/wheelhouse/"triton-*.whl
   cp "$root/wheelhouse/wheel.sha256" "$out/"

@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       test_sha:
-        description: Exact CPU PR commit to test
-        required: true
-        default: d943ce6c5104b81c83a6f3643806353efbf1ebf9
+        description: Optional full commit SHA (defaults to the selected branch)
+        required: false
       fresh_build:
         description: Ignore wheel cache for a full build
         type: boolean
@@ -18,7 +17,6 @@ permissions:
   contents: read
 jobs:
   cpu:
-    if: github.repository == 'tburleyinfo/vLLM-Hook'
     name: CPU / ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -57,7 +55,7 @@ jobs:
         run: '[[ "$TEST_SHA" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@v4
         with:
-          repository: tburleyinfo/vLLM-Hook
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ inputs.test_sha || github.event.pull_request.head.sha || github.sha }}
           path: target
           persist-credentials: false
@@ -65,11 +63,11 @@ jobs:
         with:
           python-version: '3.12'
       - name: Record host and check compatibility
-        run: bash .github/scripts/mlr58-cpu.sh host
+        run: bash .github/scripts/cpu-platforms.sh host
       - name: Wheel compatibility key
         id: key
         run: |
-          python .github/scripts/mlr58-key.py
+          python .github/scripts/cpu-key.py
       - uses: actions/cache/restore@v4
         id: cache
         if: ${{ !inputs.fresh_build }}
@@ -77,19 +75,19 @@ jobs:
           path: wheelhouse
           key: ${{ steps.key.outputs.key }}
       - name: Install CPU dependencies
-        run: bash .github/scripts/mlr58-cpu.sh setup
+        run: bash .github/scripts/cpu-platforms.sh setup
       - name: Build or reuse Triton CPU wheel
         id: wheel
-        run: bash .github/scripts/mlr58-cpu.sh wheel
+        run: bash .github/scripts/cpu-platforms.sh wheel
       - uses: actions/cache/save@v4
         if: ${{ steps.wheel.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
         with:
           path: wheelhouse
           key: ${{ steps.key.outputs.key }}
       - name: Verify CPU backends and dependencies
-        run: bash .github/scripts/mlr58-cpu.sh verify
+        run: bash .github/scripts/cpu-platforms.sh verify
       - name: Run unchanged CPU scenarios
-        run: bash .github/scripts/mlr58-cpu.sh scenarios
+        run: bash .github/scripts/cpu-platforms.sh scenarios
       - name: Record installed packages even on setup failure
         if: always()
         run: |
@@ -102,7 +100,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mlr58-${{ matrix.platform }}-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cpu-${{ matrix.platform }}-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/
           retention-days: 30
           if-no-files-found: warn
@@ -110,7 +108,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mlr58-${{ matrix.platform }}-triton-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cpu-${{ matrix.platform }}-triton-wheel-${{ github.run_id }}-${{ github.run_attempt }}
           path: wheelhouse/
           retention-days: 30
           if-no-files-found: warn
