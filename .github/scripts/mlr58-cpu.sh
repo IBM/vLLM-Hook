@@ -18,8 +18,6 @@ PYHOST
     cat /etc/os-release; lscpu; free -h; ldd --version
   elif [[ "$CPU_PLATFORM" = macos ]]; then
     sw_vers; sysctl -n machdep.cpu.brand_string; sysctl hw.memsize; clang --version
-  else
-    powershell.exe -NoProfile -Command 'Get-CimInstance Win32_Processor | Format-List *; Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize'
   fi
   df -h
   gcc --version || true
@@ -40,14 +38,10 @@ setup)
     brew install libomp
   fi
   python -m venv "$root/.venv"
-  if [[ "$CPU_PLATFORM" = windows ]]; then source "$root/.venv/Scripts/activate"; else source "$root/.venv/bin/activate"; fi
+  source "$root/.venv/bin/activate"
   python -m pip install --upgrade pip
-  python -m pip install setuptools==77.0.3 wheel 'cmake>=3.26.1,<4' ninja nanobind==2.10.2 packaging jinja2 regex lit pytest
-  if [[ "$CPU_PLATFORM" = windows ]]; then
-    # Native Windows is an installation probe, never a claimed behavioral pass.
-    echo 'Experimental native Windows dependency probe; scenarios require a working CPU vLLM.'
-    python -m pip install 'vllm==0.29.0' 'torch==2.13.0'
-  elif [[ "$CPU_PLATFORM" = macos ]]; then
+  python -m pip install setuptools==77.0.3 wheel 'cmake>=3.26.1,<4' ninja nanobind==2.10.2 packaging jinja2 regex lit pytest zstandard
+  if [[ "$CPU_PLATFORM" = macos ]]; then
     python -m pip install torch==2.13.0 torchvision torchaudio setuptools-rust setuptools-scm zstandard
   else
   curl -fL --retry 3 'https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl' -o "$out/vllm-0.29.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl"
@@ -58,7 +52,7 @@ setup)
   python -m pip install --no-deps -e "$root/target"
   ;;
 wheel)
-  if [[ "$CPU_PLATFORM" = windows ]]; then source "$root/.venv/Scripts/activate"; else source "$root/.venv/bin/activate"; fi
+  source "$root/.venv/bin/activate"
   if compgen -G "$root/wheelhouse/triton-*.whl" > /dev/null; then
     echo 'reused compiled wheel' | tee "$out/wheel-source.txt"
     python "$root/.github/scripts/mlr58-wheel.py" check
@@ -74,7 +68,7 @@ wheel)
   cp "$root/wheelhouse/wheel.sha256" "$out/"
   ;;
 verify|scenarios)
-  if [[ "$CPU_PLATFORM" = windows ]]; then source "$root/.venv/Scripts/activate"; else source "$root/.venv/bin/activate"; fi
+  source "$root/.venv/bin/activate"
   # The release wheel needs Intel OpenMP loaded before torch/vLLM.
   if [[ "$CPU_PLATFORM" = macos ]]; then
     if [[ "$phase" = verify ]]; then

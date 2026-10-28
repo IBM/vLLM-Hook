@@ -6,11 +6,9 @@ unchanged. Every run records the exact tested head SHA, workflow SHA, host,
 dependencies, phase exit codes and test output.
 
 `CPU platform validation` runs on pushes to `codex/MLR-58-linux-cpu-actions`
-and pull requests in the fork. Linux is blocking. macOS ARM64 and native Windows
-are experimental (`continue-on-error`); inspect their job steps and artifacts,
+and pull requests in the fork. Linux is blocking. macOS ARM64 is experimental (`continue-on-error`); inspect their job steps and artifacts,
 not just the overall green status. Branch protection is not changed by this work.
-Native Windows is an installation probe: upstream vLLM does not support it.
-An installation failure is not a skipped or passed behavioral test. macOS builds
+Windows is omitted. An installation failure is not a passed behavioral test. macOS builds
 the pinned vLLM source; Linux uses the PR's checksummed CPU release wheel.
 
 All environments use Python 3.12, vLLM 0.29.0 and Triton CPU source
@@ -23,8 +21,8 @@ The compiled wheel is also uploaded as a downloadable artifact.
 
 ## Launch and download
 
-Push a commit to this branch to run all three jobs. A pull request also starts
-all three jobs. For manual dispatch, GitHub requires the workflow on the fork's
+Push a commit to this branch to run both jobs. A pull request also starts
+both jobs. For manual dispatch, GitHub requires the workflow on the fork's
 default branch first; this branch does not change the default branch.
 Once installed there:
 

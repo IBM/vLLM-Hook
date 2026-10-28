@@ -29,9 +29,6 @@ jobs:
           - platform: macos
             runner: macos-14
             experimental: true
-          - platform: windows
-            runner: windows-2022
-            experimental: true
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 330
