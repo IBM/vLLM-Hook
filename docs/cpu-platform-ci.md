@@ -5,8 +5,8 @@ This fork branch starts at IBM/vLLM-Hook PR #47 revision
 unchanged. Every run records the exact tested head SHA, workflow SHA, host,
 dependencies, phase exit codes and test output.
 
-`CPU platform validation` runs on pushes to `codex/MLR-58-linux-cpu-actions`
-and pull requests in the fork. Linux is blocking. macOS ARM64 is experimental (`continue-on-error`); inspect their job steps and artifacts,
+`CPU platform validation` runs when a fork pull request opens or its branch
+changes. New commits cancel superseded runs. Linux is blocking. macOS ARM64 is experimental (`continue-on-error`); inspect their job steps and artifacts,
 not just the overall green status. Branch protection is not changed by this work.
 Windows is omitted. An installation failure is not a passed behavioral test. macOS builds
 the pinned vLLM source; Linux uses the PR's checksummed CPU release wheel.
@@ -21,8 +21,8 @@ The compiled wheel is also uploaded as a downloadable artifact.
 
 ## Launch and download
 
-Push a commit to this branch to run both jobs. A pull request also starts
-both jobs. For manual dispatch, GitHub requires the workflow on the fork's
+Open a fork pull request from this branch to start both jobs. Every subsequent
+push to the PR branch starts both jobs automatically. For manual dispatch, GitHub requires the workflow on the fork's
 default branch first; this branch does not change the default branch.
 Once installed there:
 

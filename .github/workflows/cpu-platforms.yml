@@ -1,8 +1,6 @@
 name: CPU platform validation
 on:
   pull_request:
-  push:
-    branches: [codex/MLR-58-linux-cpu-actions]
   workflow_dispatch:
     inputs:
       test_sha:
@@ -13,6 +11,9 @@ on:
         description: Ignore wheel cache for a full build
         type: boolean
         default: false
+concurrency:
+  group: cpu-platforms-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -89,6 +90,14 @@ jobs:
         run: bash .github/scripts/mlr58-cpu.sh verify
       - name: Run unchanged CPU scenarios
         run: bash .github/scripts/mlr58-cpu.sh scenarios
+      - name: Record installed packages even on setup failure
+        if: always()
+        run: |
+          mkdir -p evidence
+          if [ -x .venv/bin/python ]; then
+            .venv/bin/python -m pip freeze > evidence/dependencies-final.txt 2>&1
+            .venv/bin/python -m pip --version >> evidence/dependencies-final.txt 2>&1
+          fi
       - name: Preserve evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4
