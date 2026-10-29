@@ -171,11 +171,6 @@ def _encode(samples, keys, names, config) -> bytes:
     return encode_delivery(samples, keys=keys, names=names, config=config)
 
 
-def _not_ready(rid: str, e: DeliveryTimeoutError) -> str:
-    why = "; ".join(sorted(set(str(v) for v in (e.missing or {}).values()))) or "not delivered"
-    return f"delivery for {rid!r} not ready: {why}"
-
-
 def build_router():
     # lazy: optional dependency (fastapi)
     from fastapi import APIRouter, Query, Request
@@ -198,7 +193,8 @@ def build_router():
             if key and not key_pattern(ext, 1, suffix=_suffix()).match(key):
                 raise ValueError("key does not belong to this response")
         except ValueError as e:
-            return JSONResponse({"error": str(e)}, status_code=400)
+            logger.info("mia delivered read %r rejected: %s", rid, e)
+            return JSONResponse({"error": "invalid delivered-read request"}, status_code=400)
         if (os.environ.get(STAMP_ENV) or "").partition(":")[0] != "hybrid":
             return JSONResponse({"error": "no capture for this id"}, status_code=404)
         loop = asyncio.get_running_loop()
@@ -211,11 +207,12 @@ def build_router():
                                               info["names"], info["config"])
         except AmbiguousDelivery as e:
             logger.warning("mia delivered read %r: %s: %s", rid, e, e.names)
-            return JSONResponse({"error": f"ambiguous: {e.count} deliveries match this id"},
+            return JSONResponse({"error": "ambiguous: more than one delivery matches this id"},
                                 status_code=409)
         except DeliveryTimeoutError as e:
-            logger.warning("mia delivered read timed out: %s", e)
-            return JSONResponse({"error": _not_ready(rid, e)}, status_code=504)
+            why = "; ".join(sorted({str(v) for v in (e.missing or {}).values()})) or "not delivered"
+            logger.warning("mia delivered read timed out: %s; %s", e, why)
+            return JSONResponse({"error": f"delivery for {rid!r} not ready"}, status_code=504)
         except (GatherError, OSError) as e:
             logger.error("mia delivered read %r failed: %s", rid, e)
             return JSONResponse({"error": "delivery for this id is unreadable"},
