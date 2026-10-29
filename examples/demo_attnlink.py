@@ -362,8 +362,9 @@ def report(args, out_dir, ids, spec, result, execution) -> None:
               "layer": 22, "head": 12, "pooling": "span_mean", "dtype": "bfloat16",
               "execution": execution, "prompt_tokens": len(ids), "average_precision": ap,
               "input_sha256": hashlib.sha256(INPUT_SEQ.encode()).hexdigest(),
-              "versions": {name: importlib.metadata.version(name) for name in
-                           ("vllm", "mia", "torch", "transformers")},
+              "versions": {name: importlib.metadata.version(dist) for name, dist in
+                           (("vllm", "vllm"), ("mia", "vllm-hook-mia"), ("torch", "torch"),
+                            ("transformers", "transformers"))},
               "selection": selection, "ranking": ranking}
     (out_dir / "result.json").write_text(json.dumps(record, indent=2) + "\n")
     print(f"\nQuestion: {question}\nModel: {MODEL} | layer 22 / head 12")
