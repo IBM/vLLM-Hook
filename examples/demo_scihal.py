@@ -175,7 +175,7 @@ def main():
 #     if len(response_token_ids) != len(prompt_ids_list) or not all(response_token_ids):
 #         raise RuntimeError(
 #             "the server returned no generated token ids; pass return_token_ids and check "
-#             "this is vLLM 0.29, where completion choices carry `token_ids`.")
+#             "this is vLLM 0.32, where completion choices carry `token_ids`.")
 #
 #     # Pass 2: re-prompt on prompt+response and capture the hidden states at that point.
 #     capture_prompts = [list(p) + list(r[:-2])
