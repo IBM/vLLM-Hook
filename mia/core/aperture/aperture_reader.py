@@ -97,8 +97,11 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
     header, entries = read_qk_sidecar(meta_path)
     q_dtype, q_is_bf16 = _np_dtype_for(header["dtype"])
     k_dtype, k_is_bf16 = q_dtype, q_is_bf16
-    q_row_shape = tuple(header["q_row_shape"])
-    k_row_shape = tuple(header["k_row_shape"])
+
+    def _row_shape(kind: str, layer: int) -> tuple:
+        # per-layer widths (Gemma 4) only when they differ; older runs have one shape
+        shapes = header.get(f"{kind}_row_shapes")
+        return tuple(shapes[layer] if shapes else header[f"{kind}_row_shape"])
 
     q_mmaps: dict = {}
     k_mmaps: dict = {}
@@ -126,7 +129,7 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
                 f"return a wrong k_all. Capture with prefix caching off (the graph default) or "
                 f"eager.")
 
-        kmm = _mm(k_mmaps, f"qk_k_layer_{layer}.raw", layer, k_dtype, k_row_shape)
+        kmm = _mm(k_mmaps, f"qk_k_layer_{layer}.raw", layer, k_dtype, _row_shape("k", layer))
 
         k_parts, q_parts, prefix_ends = [], [], []
         for e in es:
@@ -135,7 +138,8 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
                 kb = kb.view(torch.bfloat16)
             k_parts.append(kb)
             if e.q_rows > 0 and e.q_start >= 0:
-                qmm = _mm(q_mmaps, f"qk_q_layer_{layer}.raw", layer, q_dtype, q_row_shape)
+                qmm = _mm(q_mmaps, f"qk_q_layer_{layer}.raw", layer, q_dtype,
+                          _row_shape("q", layer))
                 qb = torch.from_numpy(np.array(qmm[e.q_start:e.q_start + e.q_rows]))
                 if q_is_bf16:
                     qb = qb.view(torch.bfloat16)
@@ -145,7 +149,8 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
 
         k_full = k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=0)
         q_cat = (q_parts[0] if len(q_parts) == 1
-                 else (torch.cat(q_parts, dim=0) if q_parts else k_full.new_empty((0,) + q_row_shape)))
+                 else (torch.cat(q_parts, dim=0) if q_parts
+                       else k_full.new_empty((0,) + _row_shape("q", layer))))
         k_all = [k_full[:L] for L in prefix_ends]
         out.setdefault(req_id, {})[layer] = {
             "q": q_cat,
@@ -346,10 +351,13 @@ def merge_qk_aperture_ranks(rank_dirs, meta_paths=None, *, check_replicas: bool 
                 raise TPShardError(
                     f"req {req_id!r} layer {layer}: tp_rank {s.tp_rank} k_prefix_ends "
                     f"{list(e['k_prefix_ends'])[:4]}... != rank {ranked[0].tp_rank}'s {ends0[:4]}...")
-        q = merge_head_tensors("q", [(s, e["q"]) for s, e in zip(ranked, per_rank)],
-                               check_replicas)
-        k_full = merge_head_tensors("k", [(s, e["k_full"]) for s, e in zip(ranked, per_rank)],
-                                    check_replicas)
+        if len(per_rank) == 1:  # one TP=1 rank: nothing to merge, widths may vary per layer
+            q, k_full = per_rank[0]["q"], per_rank[0]["k_full"]
+        else:
+            q = merge_head_tensors("q", [(s, e["q"]) for s, e in zip(ranked, per_rank)],
+                                   check_replicas)
+            k_full = merge_head_tensors("k", [(s, e["k_full"]) for s, e in zip(ranked, per_rank)],
+                                        check_replicas)
         out.setdefault(req_id, {})[layer] = {
             "q": q,
             "k_all": [k_full[:L] for L in ends0],

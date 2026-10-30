@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import math
 import os
 import time
 from typing import Any, Dict, Optional
@@ -23,11 +22,13 @@ from mia.core.runtime.tp_shard import (
     check_attn_modules_match_shard,
     dp_layout,
     dp_run_base,
-    qk_conf_head_dim,
-    qk_shard,
+    qk_conf,
+    qk_kv_sources,
+    qk_layer_shards,
     rank_dir_name,
     refuse_pipeline_parallel,
     resolve_tp_coords,
+    text_layer_geometry,
 )
 from mia.errors import MiaConfigurationError, MiaRefusal, MiaSizingError
 from mia.core.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
@@ -99,13 +100,17 @@ def _aperture_reserve_or_block(aperture: CaptureAperture, n: int, consumer=None)
 
 
 
-def _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype, device,
-                              rows_needed=None) -> tuple:
+def _resolve_qk_aperture_rows(worker, shards, buf_dtype, device, rows_needed=None,
+                              shared=()) -> tuple:
+    num_layers = len(shards)
     owner = getattr(worker, "_mia_memory_owner", None)
     if owner is not None:
         plan = owner.plan
-        if (num_layers != plan.layers or plan.buffer("q.0").shape[1] != q_dim
-                or plan.buffer("k.0").shape[1] != k_dim
+        want = {f"{kind}.{layer}": width for layer, s in enumerate(shards)
+                for kind, width in (("q", s.q_width), ("k", s.k_width))}
+        if (num_layers != plan.layers
+                or any(want.get(b.name) != b.shape[1] for b in plan.buffers
+                       if b.category.startswith("aperture"))
                 or str(buf_dtype).removeprefix("torch.") != plan.dtype):
             raise MiaConfigurationError("QK aperture geometry differs from the startup plan")
         return plan.rows, plan.aperture_bytes
@@ -119,15 +124,16 @@ def _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype, devic
                                  "gpu_memory_utilization", 0.9))
     except Exception:  # noqa: BLE001
         gpu_util = 0.9
-    per_slot_bytes = (int(q_dim) + int(k_dim)) * elem
+    # a KV-shared layer (in ``shared``) has no k buffer of its own
+    row_bytes = sum(s.q_width + (0 if layer in shared else s.k_width)
+                    for layer, s in enumerate(shards)) * elem
     aperture_bytes = resolve_aperture_bytes_auto(
-        total_gpu, gpu_util, rows_needed=rows_needed,
-        row_bytes=int(num_layers) * per_slot_bytes, what="QK capture")
-    R = int(aperture_bytes // (num_layers * per_slot_bytes)) - 1
+        total_gpu, gpu_util, rows_needed=rows_needed, row_bytes=row_bytes, what="QK capture")
+    R = int(aperture_bytes // row_bytes) - 1
     if R < 1:
         raise MiaSizingError(
             f"QK capture aperture too small: aperture_bytes={aperture_bytes} num_layers={num_layers} "
-            f"q_dim={q_dim} k_dim={k_dim} dtype={buf_dtype} -> R={R} rows/layer (<1). Raise "
+            f"row_bytes={row_bytes} dtype={buf_dtype} -> R={R} rows/layer (<1). Raise "
             f"MIA_APERTURE_GPU_BYTES or reduce the model.")
     return R, aperture_bytes
 
@@ -240,23 +246,11 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
 
     cfg = model.config
     text_cfg = getattr(cfg, "text_config", cfg)
-    num_h = int(getattr(text_cfg, "num_attention_heads"))
-    num_kv = int(getattr(text_cfg, "num_key_value_heads", num_h))
-    hidden = int(getattr(text_cfg, "hidden_size"))
-    head_dim = qk_conf_head_dim(text_cfg)
-    buf_head_dim = head_dim
-    attn_mult = float(getattr(text_cfg, "attention_multiplier", 1 / math.sqrt(head_dim)))
-    shard = qk_shard(tp_rank, tp_size, num_h, num_kv, buf_head_dim)
+    shards = qk_layer_shards(text_layer_geometry(text_cfg), tp_rank, tp_size)
+    shard = shards[0]
     q_dim = shard.q_width
     k_dim = shard.k_width
 
-    worker._conf = dict(
-        num_attention_heads=num_h,
-        num_key_value_heads=num_kv,
-        hidden_size=hidden,
-        head_dim=head_dim,
-        attention_multiplier=attn_mult,
-    )
     worker._should_capture = should_capture
     worker._qk_shard = shard
     worker._tp_rank = tp_rank
@@ -284,6 +278,7 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
 
     matched = list(iter_matched_modules(model, match_attn))
     validate_layer_matches(getattr(worker, "_mia_memory_owner", None), matched)
+    worker._conf = qk_conf(text_cfg, matched)
     if not matched:
         if getattr(worker, "_mia_memory_owner", None) is not None:
             raise MiaConfigurationError("No attention modules matched the MIA memory plan")
@@ -292,7 +287,8 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
         set_registry(worker, "qk", None)
         return None
     num_layers = max(layer_num for _, _, layer_num in matched) + 1
-    check_attn_modules_match_shard(matched, shard)
+    check_attn_modules_match_shard(matched, shards)
+    kv_sources = qk_kv_sources(text_cfg, matched, worker.vllm_config.cache_config)
     worker._qk_num_layers = num_layers
     worker._qk_module_names = {int(ln): str(name) for name, _, ln in matched}
 
@@ -303,8 +299,8 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
     aperture: Optional[CaptureAperture] = None
     n_hosts = 0
     if should_capture:
-        R, aperture_bytes = _resolve_qk_aperture_rows(worker, num_layers, q_dim, k_dim, buf_dtype,
-                                                      device, rows_needed=cap)
+        R, aperture_bytes = _resolve_qk_aperture_rows(worker, shards[:num_layers], buf_dtype,
+                                                      device, rows_needed=cap, shared=kv_sources)
         if R < cap:
             _src = ("explicit MIA_APERTURE_GPU_BYTES" if aperture_bytes_is_explicit()
                     else "default aperture")
@@ -320,6 +316,7 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
         aperture = CaptureAperture(row_bytes=k_dim * elem, n_slots=R, device=device,
                               dtype=buf_dtype, row_shape=(k_dim,))
         registry._qk_aperture = aperture
+        registry._qk_kv_sources = kv_sources
         registry._qk_step_entries = []
         registry.sentinel_row = aperture.SENTINEL
         registry.incremental_enabled = False
@@ -331,14 +328,20 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
 
     for name, module, layer_num in matched:
         if should_capture:
-            q_buf = device_buffer(owner, f"q.{layer_num}", (R + 1, q_dim), buf_dtype, device)
-            k_buf = device_buffer(owner, f"k.{layer_num}", (R + 1, k_dim), buf_dtype, device)
+            layer_shard = shards[layer_num]
+            src = kv_sources.get(layer_num)
+            q_buf = device_buffer(owner, f"q.{layer_num}", (R + 1, layer_shard.q_width),
+                                  buf_dtype, device)
+            # vLLM fills one KV cache for a shared layer and its source: so are their key rows
+            k_buf = (registry.hosts[src].k_buf if src is not None else
+                     device_buffer(owner, f"k.{layer_num}", (R + 1, layer_shard.k_width),
+                                   buf_dtype, device))
             host = QKCaptureHost(
                 module_name=name,
                 layer_num=layer_num,
                 cap=cap,
-                q_dim=q_dim,
-                k_dim=k_dim,
+                q_dim=layer_shard.q_width,
+                k_dim=layer_shard.k_width,
                 dtype=buf_dtype,
                 device=device,
                 do_capture=True,
@@ -355,8 +358,8 @@ def install_qk_hosts(worker) -> Optional[HostRegistry]:
         registry.assign_views()
         buf_bytes = sum(
             h.q_buf.numel() * h.q_buf.element_size()
-            + h.k_buf.numel() * h.k_buf.element_size()
-            for _, h in registry.iter_hosts()
+            + (0 if ln in kv_sources else h.k_buf.numel() * h.k_buf.element_size())
+            for ln, h in registry.iter_hosts()
         )
         print(f"[graph/install] QK capture aperture: {buf_bytes / (1024**2):.1f} MiB on {device} "
               f"(R={aperture.n_slots} rows/layer, {num_layers} layers, "
@@ -393,6 +396,7 @@ def _build_routing(step: StepView, registry: HostRegistry) -> list:
     default_hookq_mode = getattr(registry, "_worker_hookq_mode", "all_tokens")
     score_mode_default = getattr(registry, "_worker_score_mode", False)
 
+    kv_sources = getattr(registry, "_qk_kv_sources", None) or {}
     plans: list = []
     records: list = []
     for i in range(bs):
@@ -455,7 +459,10 @@ def _build_routing(step: StepView, registry: HostRegistry) -> list:
         registry._qk_step_rows += n
         phys = aperture.physical_slots(start_slot, n)
         phys_t = torch.tensor(phys, dtype=torch.int64)
-        layer_idx_t = torch.tensor(req_layers, dtype=torch.long)
+        # a KV-shared layer's keys are written by its source layer, so route that one too
+        routed = req_layers if not kv_sources else req_layers + sorted(
+            {kv_sources[L] for L in req_layers if L in kv_sources} - set(req_layers))
+        layer_idx_t = torch.tensor(routed, dtype=torch.long)
         capture_index_pinned[layer_idx_t[:, None], start:end] = phys_t[None, :]
 
         if emit_q:
@@ -671,6 +678,12 @@ def install_execute_model_wrapper(model_runner, worker) -> None:
         if shard is not None:
             header.update(shard.as_header())
         header["num_layers"] = int(getattr(worker, "_qk_num_layers", len(layers)))
+        widths = {ln: (int(q.shape[1]), int(k.shape[1])) for ln, q, k in layers}
+        shared = getattr(registry, "_qk_kv_sources", None) or {}
+        row_elems = sum(q + (0 if ln in shared else k) for ln, (q, k) in widths.items())
+        if len(set(widths.values())) > 1:
+            header["q_row_shapes"] = [[widths[ln][0]] for ln in range(header["num_layers"])]
+            header["k_row_shapes"] = [[widths[ln][1]] for ln in range(header["num_layers"])]
         _shape = predict_capture_write_shape(
             worker, "qk", str(header.get("hookq_mode") or "all_tokens"), int(aperture.n_slots))
         if _sync_drain:
@@ -722,7 +735,7 @@ def install_execute_model_wrapper(model_runner, worker) -> None:
             if _cap_rows > 0:
                 _elt = layers[0][1].element_size()
                 PROF.gauge("captured.bytes.qk",
-                           float(_cap_rows) * len(layers) * (q_dim + k_dim) * _elt)
+                           float(_cap_rows) * row_elems * _elt)
         if plans and drain is not None:
             entries = getattr(registry, "_qk_step_entries", None) or []
             if _sync_drain:

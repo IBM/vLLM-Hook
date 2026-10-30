@@ -52,10 +52,12 @@ class QKCaptureHost(nn.Module):
         self.any_active = any_active
 
 
-    def capture(self, q: torch.Tensor, k: torch.Tensor) -> None:
-        """Scatter post-RoPE ``q``/``k`` rows into the static buffers."""
+    def capture(self, q: torch.Tensor, k: torch.Tensor | None) -> None:
+        """Scatter post-RoPE ``q``/``k`` rows into the static buffers; ``k=None`` writes q only."""
+        # a KV-shared layer's k_buf is its source's storage: never hand it to this layer's op
         torch.ops.mia.capture_qk(
-            q, k, self.q_buf, self.k_buf, self.capture_index, self.any_active
+            q, k, self.q_buf, None if k is None else self.k_buf, self.capture_index,
+            self.any_active
         )
 
 

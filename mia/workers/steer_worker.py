@@ -222,6 +222,12 @@ class SteerWorker:
             is_tuple = isinstance(output, tuple)
             if is_tuple:
                 hidden_states, residuals = output
+
+                if residuals is None: 
+                    PROF.incr("steer.fire")
+                    with PROF.timed("steer.apply", tier=2):
+                        hidden_states = self._steer_per_request(hidden_states, entries, step)
+                    return (hidden_states, None) 
             else:
                 hidden_states = None
                 residuals = output

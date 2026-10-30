@@ -91,6 +91,8 @@ ATTN_PATTERNS = [
     re.compile(r"^model\.decoder\.layers\.(\d+)\.self_attn\.attn$"),
 
     re.compile(r"^model\.layers\.(\d+)\.self_attn\.attn$"),
+
+    re.compile(r"^language_model\.model\.layers\.(\d+)\.self_attn\.attn$"),
 ]
 
 def match_attn(name: str):

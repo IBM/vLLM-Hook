@@ -128,7 +128,7 @@ def _read_cached_keys(
 
 
 def _prepend_cached_keys(module_name, metadata, i: int, k, seq_lens, start: int, end: int,
-                         num_computed: int = 0):
+                         num_computed: int = 0, window=None):
     if seq_lens is None:
         if num_computed > 0:
             raise CachedKeysUnavailable("the attention metadata has no seq_lens")
@@ -149,7 +149,11 @@ def _prepend_cached_keys(module_name, metadata, i: int, k, seq_lens, start: int,
     if tuple(prefix_k.shape) != (num_cached, k.shape[-1]):
         raise CachedKeysUnavailable(f"{tuple(prefix_k.shape)} cached key rows, expected "
                                     f"({num_cached}, {k.shape[-1]})")
-    return torch.cat([prefix_k.to(k.device, dtype=k.dtype), k], dim=0)
+    out = torch.cat([prefix_k.to(k.device, dtype=k.dtype), k], dim=0)
+    if window:
+        # vLLM may free sliding blocks below num_computed - window + 1 (get_num_skipped_tokens)
+        out[:max(0, num_cached - int(window) + 1)] = float("nan")
+    return out
 
 
 def _k_all_cpu_list(entry: dict, _census_acc: dict | None = None) -> list:
@@ -222,20 +226,25 @@ def compute_head_scores(q_flat: torch.Tensor, k_flat: torch.Tensor, heads: list,
     q_sel = q.index_select(1, hq).permute(1, 0, 2)
     k_sel = k.index_select(1, hkv).permute(1, 0, 2)
     s = torch.bmm(q_sel, k_sel.transpose(1, 2)) * mult
+    window = conf.get("sliding_window")
     offset = S_k - S_q
-    if S_q > 1 or offset < 0:
-        mask = torch.ones(S_q, S_k, dtype=torch.bool, device=s.device).tril(diagonal=offset)
-        s = s.masked_fill(~mask, float("-inf"))
+    if S_q > 1 or offset < 0 or (window and S_k > window):
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import visible_keys
+        s = s.masked_fill(~visible_keys(S_q, S_k, window, s.device), float("-inf"))
     return torch.softmax(s, dim=-1).to(dtype)
 
 
 def compute_head_score(q_flat: torch.Tensor, k_flat: torch.Tensor, head: int,
                        conf: dict, dtype: torch.dtype = torch.float16) -> torch.Tensor:
-    """One head's causal attention score: softmax((q_h k_h^T) * mult + causal), [S_q, S_k]."""
+    """One head's score: softmax((q_h k_h^T) * mult + causal and sliding-window mask), [S_q, S_k]."""
     return compute_head_scores(q_flat, k_flat, [head], conf, dtype)[0]
 
 
 def _scores_from_qk_entry(entry: dict, conf: dict, dtype: torch.dtype = torch.float16) -> list:
+    # lazy: keep mia.core.runtime out of import mia
+    from mia.core.runtime.tp_shard import layer_conf
+    conf = layer_conf(conf, entry["layer_num"])
     heads = entry.get("heads") or [int(entry.get("head", 0))]
     q_list = _cpu_list(entry["q"], None)
     prefix_ends = entry.get("k_prefix_ends")
@@ -353,28 +362,24 @@ class QKCaptureWorker:
         from mia.core.delivery.writer_process import init_writer_process
         init_writer_process(self)
 
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import (
+            check_attn_modules_match_shard, layer_conf, qk_conf, qk_kv_sources, qk_layer_shards,
+            refuse_pipeline_parallel, resolve_tp_coords, text_layer_geometry)
         cfg = model.config
         text_cfg = getattr(cfg, "text_config", cfg)
-        num_h = int(getattr(text_cfg, "num_attention_heads"))
-        num_kv = int(getattr(text_cfg, "num_key_value_heads", num_h))
-        hidden = int(getattr(text_cfg, "hidden_size"))
-        from mia.core.runtime.tp_shard import check_attn_modules_match_shard, qk_conf_head_dim
-        head_dim = qk_conf_head_dim(text_cfg)
-        attn_mult = float(getattr(text_cfg, "attention_multiplier", 1 / math.sqrt(head_dim)))
-        self._conf = dict(
-            num_attention_heads=num_h,
-            num_key_value_heads=num_kv,
-            hidden_size=hidden,
-            head_dim=head_dim,
-            attention_multiplier=attn_mult,
-        )
+        matched_modules = list(iter_matched_modules(model, match_attn))
+        self._conf = qk_conf(text_cfg, matched_modules)
+        kv_sources = qk_kv_sources(text_cfg, matched_modules, self.vllm_config.cache_config)
+        kv_targets = set(kv_sources.values())
+        self._qk_source_k = {}
 
-        from mia.core.runtime.tp_shard import qk_shard, refuse_pipeline_parallel, resolve_tp_coords
         refuse_pipeline_parallel(getattr(self.parallel_config, "pipeline_parallel_size", 1),
                                  "QK install_hooks")
         tp_rank, tp_size = resolve_tp_coords(self)
         self._tp_rank = tp_rank
-        self._qk_shard = qk_shard(tp_rank, tp_size, num_h, num_kv, head_dim)
+        shards = qk_layer_shards(text_layer_geometry(text_cfg), tp_rank, tp_size)
+        self._qk_shard = shards[0]
         self._should_capture = True
         if tp_size > 1 and self._score_mode_default:
             raise MiaConfigurationError(
@@ -407,6 +412,14 @@ class QKCaptureWorker:
             last_indices = query_start_loc
 
             layer_num = match_attn(module_name)
+            k_in = input[1]
+            if layer_num in kv_targets:
+                self._qk_source_k[layer_num] = k_in
+            elif k_in is None and layer_num in kv_sources:
+                # vLLM gives a KV-shared layer no k; its keys are its source's, from this step
+                k_in = self._qk_source_k[kv_sources[layer_num]]
+            # a shared layer reads its source's cache, whose window is the same
+            window = layer_conf(self._conf, layer_num).get("sliding_window")
 
             refused = getattr(self, "_qk_refused", None)
             n_comp = getattr(step, "num_computed_tokens_np", None)
@@ -462,14 +475,15 @@ class QKCaptureWorker:
                         q_view = input[0][end - 1:end, :].detach()
                     else:
                         q_view = input[0][start:end, :].detach()
-                    k_view = input[1][start:end, :].detach()
+                    k_view = k_in[start:end, :].detach()
                     try:
                         k_view = _prepend_cached_keys(module_name, metadata, i, k_view,
-                                                      seq_lens, start, end, n_done)
+                                                      seq_lens, start, end, n_done, window)
                     except CachedKeysUnavailable as e:
                         self._refuse_qk_request(req_id, layer_num, e)
                         continue
-                    score = compute_head_scores(q_view, k_view, score_heads, self._conf, self._score_dtype)
+                    score = compute_head_scores(q_view, k_view, score_heads,
+                                                layer_conf(self._conf, layer_num), self._score_dtype)
                     PROF.incr("hook.fire.qk")
                     PROF.gauge("captured.bytes.qk", score.numel() * score.element_size())
                     bucket = self._disk_states if extra.get("save_to_disk") else self._captured_states
@@ -485,11 +499,11 @@ class QKCaptureWorker:
                     q_tok = input[0][start:end, :].detach().clone()
                 else:
                     q_tok = input[0][end - 1, :].detach().clone()
-                k_tok = input[1][start:end, :].detach().clone()
+                k_tok = k_in[start:end, :].detach().clone()
 
                 try:
                     k_tok = _prepend_cached_keys(module_name, metadata, i, k_tok, seq_lens,
-                                                 start, end, n_done)
+                                                 start, end, n_done, window)
                 except CachedKeysUnavailable as e:
                     self._refuse_qk_request(req_id, layer_num, e)
                     continue
@@ -517,11 +531,10 @@ class QKCaptureWorker:
                     ls["_q_scale"].append(q_scale)
                     ls["_k_all_scale"].append(k_scale)
 
-        check_attn_modules_match_shard(list(iter_matched_modules(model, match_attn)),
-                                       self._qk_shard)
+        check_attn_modules_match_shard(matched_modules, shards)
         self._hooks = []
         matched = []
-        for name, module, _ in iter_matched_modules(model, match_attn):
+        for name, module, _ in matched_modules:
             hook = module.register_forward_hook(
                 lambda _m, i, _o, n=name: qkv_hook(i, n, _m)
             )

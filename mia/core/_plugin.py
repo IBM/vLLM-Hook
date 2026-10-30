@@ -92,6 +92,7 @@ from mia.core.runtime.tp_shard import (
     rank_dir_name,
     refuse_pipeline_parallel,
     resolve_hs_shard_mode,
+    text_layer_geometry,
 )
 from mia.optimizations import env_is_on
 from mia.registry import PluginRegistry
@@ -1271,6 +1272,30 @@ def _qk_model_dims(engine):
     return dims
 
 
+def _qk_geometry(engine):
+    cached = getattr(engine, "_mia_qk_geometry", "missing")
+    if cached != "missing":
+        return cached
+    try:
+        geometry = text_layer_geometry(engine.model_config.hf_text_config)
+    except Exception:  # noqa: BLE001
+        geometry = None
+    try:
+        engine._mia_qk_geometry = geometry
+    except Exception:  # noqa: BLE001
+        pass
+    return geometry
+
+
+def _qk_head_width(engine, output_qk) -> int:
+    """Sum of head_dim over the requested (layer, head) pairs; 0 if unknown."""
+    geometry = _qk_geometry(engine)
+    if not geometry or not isinstance(output_qk, dict):
+        return 0
+    return sum(len(heads) * geometry[int(layer)][2] for layer, heads in output_qk.items()
+               if 0 <= int(layer) < len(geometry))
+
+
 def _hs_num_layers(engine) -> int | None:
     cached = getattr(engine, "_mia_hs_nlayers", "missing")
     if cached != "missing":
@@ -1310,19 +1335,17 @@ def _emit_capture_evidence(engine, output, extra, wants_hs, wants_qk, gen_tokens
                     PROF.gauge("captured.bytes.hs", float(n_layers) * tokens * bpt)
         elif wants_qk:
             oq = extra.get("output_qk")
-            n_layers = (len(oq) if isinstance(oq, (dict, list, tuple)) and oq
-                        else (_hs_num_layers(engine) or 0))
+            geometry = _qk_geometry(engine) or []
+            layers = ([int(L) for L in oq] if isinstance(oq, (dict, list, tuple)) and oq
+                      else range(len(geometry)))
             mode = extra.get("hookq_mode", "all_tokens")
             tokens = (prefill_tok + decode_tok) if mode == "all_tokens" \
                 else ((1 if prefill_tok else 0) + decode_tok)
-            num_h = int(getattr(tc, "num_attention_heads"))
-            num_kv = int(getattr(tc, "num_key_value_heads", num_h) or num_h)
-            head_dim = int(getattr(tc, "head_dim", 0) or (int(getattr(tc, "hidden_size")) // num_h))
-            bpt = (num_h + num_kv) * head_dim * elt
-            if n_layers > 0:
-                PROF.incr("hook.fire.qk", n_layers)
+            bpt = sum((geometry[L][0] + geometry[L][1]) * geometry[L][2] for L in layers) * elt
+            if layers:
+                PROF.incr("hook.fire.qk", len(layers))
                 if tokens > 0:
-                    PROF.gauge("captured.bytes.qk", float(n_layers) * tokens * bpt)
+                    PROF.gauge("captured.bytes.qk", float(tokens) * bpt)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1352,20 +1375,14 @@ def _maybe_storage_route(engine, prompt, extra, max_tokens) -> bool | None:
     gen_len = estimate_gen_len(max_tokens)
     try:
         if wants_qk:
-            dims = _qk_model_dims(engine)
-            if not dims:
-                _log("qk dims=None -> no route")
-                return None
-            H_q, _H_kv, head_dim = dims
-            oqk = extra.get("output_qk") or {}
-            head_layers = sum(len(v) for v in oqk.values()) if isinstance(oqk, dict) else 0
-            if head_layers <= 0:
+            width = _qk_head_width(engine, extra.get("output_qk"))
+            if width <= 0:
+                _log("qk geometry or heads unknown -> no route")
                 return None
             gran = extra.get("hookq_mode", "all_tokens")
-            kb = predict_artifact_kb("qk", gran, P, head_layers, 1, head_dim,
-                                     H_q * head_dim, 2, gen_len, hooks_on)
+            kb = predict_artifact_kb("qk", gran, P, 1, 1, width, 0, 2, gen_len, hooks_on)
             d = route_to_disk("qk", kb)
-            _log(f"qk P={P} hl={head_layers} gran={gran} kb={kb:.0f} "
+            _log(f"qk P={P} width={width} gran={gran} kb={kb:.0f} "
                  f"rpc_ms={predicted_rpc_ms('qk', kb):.0f} -> {'DISK' if d else 'RPC'}")
             return d
         else:
@@ -1517,20 +1534,14 @@ def _decide_aperture_route_qk(engine, prompt, extra, max_tokens):
     P = _prompt_token_len(prompt)
     if not P:
         return _explicit_disk_route(extra)
-    dims = _qk_model_dims(engine)
-    if not dims:
-        return _explicit_disk_route(extra)
-    H_q, _H_kv, head_dim = dims
-    oqk = extra.get("output_qk") or {}
-    head_layers = sum(len(v) for v in oqk.values()) if isinstance(oqk, dict) else 0
-    if head_layers <= 0:
+    width = _qk_head_width(engine, extra.get("output_qk"))
+    if width <= 0:
         return _explicit_disk_route(extra)
     gran = extra.get("hookq_mode", "all_tokens")
     hooks_on = extra.get("hooks_on", "both")
     gen_len = estimate_gen_len(max_tokens)
     try:
-        kb = predict_artifact_kb("qk", gran, P, head_layers, 1, head_dim,
-                                 H_q * head_dim, 2, gen_len, hooks_on)
+        kb = predict_artifact_kb("qk", gran, P, 1, 1, width, 0, 2, gen_len, hooks_on)
         predicted_bytes = int(kb * 1024)
         reducible = _analyzer_reducible(extra.get("analyzer"), extra.get("analyzer_spec"))
         t_rpc, t_analyze = _aperture_route_thresholds("qk")
@@ -1820,12 +1831,12 @@ async def _patched_generate(
             and not _engine_graph(self)):
         if os.environ.get("MIA_QK_AUTO_SELECT") == "1":
             try:
-                _dims = _qk_model_dims(self)
+                _geom = _qk_geometry(self)
                 _plen = _prompt_token_len(prompt)
                 _oqk = extra.get("output_qk")
-                if _dims and _plen and isinstance(_oqk, dict):
+                if _geom and _plen and isinstance(_oqk, dict):
                     _pick = qk_score_size_select(
-                        _plen, extra.get("hookq_mode", "all_tokens"), _oqk, *_dims)
+                        _plen, extra.get("hookq_mode", "all_tokens"), _oqk, _geom)
                     extra["qk_capture"] = _pick
                     if _pick == "score":
                         extra.setdefault("score_head", 0)

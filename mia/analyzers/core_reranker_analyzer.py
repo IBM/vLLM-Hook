@@ -83,6 +83,8 @@ class CorerAnalyzer:
         past_prefill: Optional[Dict] = None
     ) -> List[torch.Tensor]:
         """Per request, each document's token scores in run ``run_id``, plus the run's prefill Q."""
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import layer_conf
         cache = load_and_merge_qk_cache(self.hook_dir, run_id)
         config = cache["config"]
         if any("scores" in e for e in cache["qk_cache"].values()):
@@ -100,11 +102,13 @@ class CorerAnalyzer:
         prefill_qk_cache = {}
 
         all_layer = []
+        all_layer_conf = []
         all_key_cache = []
         all_query_cache = []
 
         for module_name, qk_data in qk_cache.items():
             layer_num = qk_data['layer_num']
+            lc = layer_conf(config, layer_num)
 
             k_all = qk_data['k_all']
             prefill = None if past_prefill is None else past_prefill[module_name]
@@ -124,15 +128,18 @@ class CorerAnalyzer:
                 query_len = q_query[i].shape[0]
                 seq_len = k_all[i].shape[0]
 
-                q_head = q_query[i].view(query_len, config["num_attention_heads"], config["head_dim"])
+                q_head = q_query[i].view(query_len, lc["num_attention_heads"], lc["head_dim"])
                 q_head = q_head.permute(1, 0, 2)
                 q_heads.append(q_head)
 
-                k_head = k_all[i].view(seq_len, config["num_key_value_heads"], config["head_dim"])
+                k_head = k_all[i].view(seq_len, lc["num_key_value_heads"], lc["head_dim"])
                 k_head = k_head.permute(1, 0, 2)
                 k_heads.append(k_head)
 
             all_layer.append(layer_num)
+            # uniform models keep CoRe's 1/sqrt(head_dim); per-layer configs carry the model's
+            # scale and sliding window
+            all_layer_conf.append(lc if "layers" in config else None)
             all_query_cache.append(q_heads)
             all_key_cache.append(k_heads)
 
@@ -141,7 +148,9 @@ class CorerAnalyzer:
             if self.layer_to_heads is not None:
                 attn_weights = []
                 for i in range(len(all_key_cache)):
-                    attn_weights.append((self.get_attn_all(all_key_cache[i][j], all_query_cache[i][j])).mean(-2))
+                    attn_weights.append((self.get_attn_all(all_key_cache[i][j], all_query_cache[i][j],
+                                                           all_layer_conf[i],
+                                                           query_start_tok_idx[j])).mean(-2))
                 attn_weights = torch.stack(attn_weights)
                 attn_weights = attn_weights.sum(0).sum(0)
 
@@ -180,8 +189,10 @@ class CorerAnalyzer:
                              f"holds them; capture with prefix caching off")
         return torch.cat([prefill['q'][i][start - lo:cut - lo], own], dim=0)
 
-    def get_attn_all(self, key_states, query_states):
+    def get_attn_all(self, key_states, query_states, layer=None, query_start=None):
         """Causal softmax attention of every query head over the keys (KV heads repeated, GQA)."""
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import visible_keys
         num_heads, q_len, head_dim = query_states.size()
         num_key_value_heads = key_states.size(0)
         num_key_value_groups = num_heads // num_key_value_heads
@@ -190,7 +201,9 @@ class CorerAnalyzer:
         key_states = key_states.unsqueeze(1).expand(num_key_value_heads, num_key_value_groups, kv_seq_len, head_dim)
         key_states = key_states.reshape(num_heads, kv_seq_len, head_dim)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2,-1)) / math.sqrt(head_dim)
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2,-1))
+        attn_weights = (attn_weights / math.sqrt(head_dim) if layer is None
+                        else attn_weights * layer["attention_multiplier"])
 
         del key_states, query_states
         torch.cuda.empty_cache()
@@ -200,6 +213,12 @@ class CorerAnalyzer:
         causal_mask = causal_mask.transpose(-1,-2)
         causal_mask = (1-causal_mask) * torch.finfo(causal_mask.dtype).min
         attn_weights += causal_mask
+        if layer is not None:
+            # query row r is prompt position query_start + r (_query_rows), not the last q_len
+            attn_weights = attn_weights.masked_fill(
+                ~visible_keys(q_len, kv_seq_len, layer.get("sliding_window"),
+                              attn_weights.device, query_start),
+                torch.finfo(attn_weights.dtype).min)
         attn_lses = torch.logsumexp(attn_weights, dim=-1, keepdim=True)
         attn_weights = torch.exp(attn_weights - attn_lses)
 

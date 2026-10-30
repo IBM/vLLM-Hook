@@ -101,32 +101,35 @@ def _import_direct_register_custom_op():
 
 def _capture_qk_impl(
     q: torch.Tensor,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     q_buf: torch.Tensor,
-    k_buf: torch.Tensor,
+    k_buf: torch.Tensor | None,
     index: torch.Tensor,
     active: torch.Tensor,
 ) -> None:
     del active
     _FIRE_COUNT[0] += 1
-    if q_buf is None or k_buf is None or index is None:
+    if q_buf is None or index is None:
         return None
-    if q.is_cuda and (q.dtype != q_buf.dtype or k.dtype != k_buf.dtype):
+    # a KV-shared layer passes k=None and k_buf=None: its keys are its source layer's rows
+    write_k = k is not None and k_buf is not None
+    if q.is_cuda and (q.dtype != q_buf.dtype or (write_k and k.dtype != k_buf.dtype)):
         raise RuntimeError("MIA QK input dtype differs from its preallocated buffers")
     n = q.shape[0]
     idx = index[:n].to(torch.long)
     q_src = q if q.dtype == q_buf.dtype else q.to(q_buf.dtype)
-    k_src = k if k.dtype == k_buf.dtype else k.to(k_buf.dtype)
     q_buf.index_copy_(0, idx, q_src)
-    k_buf.index_copy_(0, idx, k_src)
+    if write_k:
+        k_src = k if k.dtype == k_buf.dtype else k.to(k_buf.dtype)
+        k_buf.index_copy_(0, idx, k_src)
     return None
 
 
 def _capture_qk_fake(
     q: torch.Tensor,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     q_buf: torch.Tensor,
-    k_buf: torch.Tensor,
+    k_buf: torch.Tensor | None,
     index: torch.Tensor,
     active: torch.Tensor,
 ) -> None:
@@ -236,9 +239,9 @@ def register_graph_ops() -> None:
 
 def capture_qk(
     q: torch.Tensor,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     q_buf: torch.Tensor,
-    k_buf: torch.Tensor,
+    k_buf: torch.Tensor | None,
     index: torch.Tensor,
     active: torch.Tensor,
 ) -> None:

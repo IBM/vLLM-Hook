@@ -19,11 +19,8 @@ class MiaMemoryOwner:
         plan.check_fit()
         owner = cls(plan)
         try:
-            for category, size in [('aperture', plan.aperture_bytes),
-                                   ('auxiliary', plan.auxiliary_bytes),
-                                   ('scratch', plan.scratch_bytes)]:
-                if size:
-                    owner._storage[category] = torch.zeros(size, dtype=torch.uint8, device=device)
+            for category, size in plan.storage_bytes.items():
+                owner._storage[category] = torch.zeros(size, dtype=torch.uint8, device=device)
             for spec in plan.buffers:
                 storage = owner._storage[spec.category]
                 if spec.offset + spec.nbytes > storage.numel():
