@@ -736,9 +736,9 @@ def _note_vllm_version() -> None:
         from packaging.version import Version
         raw = vllm.__version__
         ver = Version(raw)
-        if ver.release[:2] == (0, 29):
+        if ver.release[:2] == (0, 32):
             return
-        print(f"[mia] NOTE: this branch is developed and GPU-validated on vLLM 0.29.x "
+        print(f"[mia] NOTE: this branch is developed and GPU-validated on vLLM 0.32.x "
               f"with the V2 model runner; found {raw} — UNTESTED on this branch.",
               flush=True)
     except Exception:  # noqa: BLE001
@@ -963,9 +963,8 @@ def validate_v2_runner_selected(config) -> None:
         raise UnsupportedRunnerError(
             "MIA requires vLLM's V2 model runner, but this engine config resolves to V1 "
             "(VllmConfig.use_v2_model_runner is False) with VLLM_USE_V2_MODEL_RUNNER unset. "
-            "vLLM 0.29 falls back to V1 for ngram speculative decode, sequence parallelism at "
-            "TP>1, STOCK_TORCH_COMPILE, pipeline parallelism with the external launcher, some "
-            "ROCm architectures, and a missing Triton — check vLLM's own "
+            "vLLM falls back to V1 for features its V2 runner does not yet support and when Triton "
+            "is missing — check vLLM's own "
             "'using the V1 model runner instead' log line for which one applies here. MIA "
             "refuses at config time rather than installing against V1 and capturing nothing."
         )
@@ -1140,7 +1139,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
     if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "0":
         raise RuntimeError(
             "MIA requires vLLM's V2 model runner, but VLLM_USE_V2_MODEL_RUNNER=0 is set. "
-            "Unset it (0.29 defaults to V2) or set it to 1."
+            "Unset it (vLLM 0.32 defaults to V2) or set it to 1."
         )
 
     refuse_pipeline_parallel(getattr(self, "pipeline_parallel_size", 1), "engine arguments")

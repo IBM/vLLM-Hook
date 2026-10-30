@@ -253,7 +253,7 @@ model's tokenizer for computing spans (pass `tokenizer_for=<model id>` to the co
 #### No prefix-cache reset over serve
 
 The in-process path calls `llm.llm_engine.reset_prefix_cache()` between captures of the same
-prompt. **vLLM 0.29 exposes no endpoint for that.** A Q/K server already runs without prefix
+prompt. **vLLM 0.32 exposes no endpoint for that.** A Q/K server already runs without prefix
 caching (unless you enable it); a hidden-state server whose run captures the same prefix twice
 needs `--no-enable-prefix-caching`. A cached prefix means the second pass captures nothing for
 those tokens, and the run still looks like it worked.
@@ -329,7 +329,7 @@ At TP > 1 every check is per rank, which is cheaper than it sounds for hidden st
 costs `max_num_batched_tokens × ceil(L / tp) × hidden × 2` on each rank, so 2.5 GiB for
 Llama-3.1-70B at TP4 rather than 10 GiB. Steering reserves only its vector and routing tables.
 
-This applies to vLLM 0.29.0 with CUDA graphs; the eager path does not use the reservation.
+This applies to vLLM 0.32.0 with CUDA graphs; the eager path does not use the reservation.
 `kv_cache_memory_bytes` is refused because it bypasses `gpu_memory_utilization`, and HS capture
 and steering need their fused Triton kernels (`MIA_CAPTURE_FUSED`, `MIA_STEER_FUSED`, on by
 default). `collective_rpc("mia_memory_budget")` reports each worker's reserved bytes and vLLM's

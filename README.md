@@ -13,7 +13,7 @@ This includes dynamic analysis of:
 - activations  
 - custom intervention behaviors  
 
-MIA is vLLM-Hook for vLLM 0.29 and its V2 model runner, under CUDA graphs by default. Two ways to run it:
+MIA is vLLM-Hook for vLLM 0.32 and its V2 model runner, under CUDA graphs by default. Two ways to run it:
 - **`MiaLLM`** (offline): builds the vLLM engine in your own Python process; for scripts, notebooks and batch jobs.
 - **`vllm serve` + `MiaClient`** (served): MIA runs inside the vLLM server; for serving, or several clients sharing one engine.
 
@@ -110,12 +110,12 @@ cd ./vLLM-Hook
 
 ### 2. Create an environment and install
 
-MIA is validated on **vLLM 0.29.0 with torch 2.13.0**:
+MIA is validated on **vLLM 0.32.0 with torch 2.13.0**:
 
 ```bash
 conda create -n vllm-hook-mia python=3.12 pip
 conda activate vllm-hook-mia
-pip install -r requirement.txt    # vLLM 0.29.0, torch 2.13.0 and the other validated versions
+pip install -r requirement.txt    # vLLM 0.32.0, torch 2.13.0 and the other validated versions
 pip uninstall -y torchcodec       # vLLM's audio/video decoder; MIA does not use it
 pip install -e . --no-deps        # the plugin itself, from the repo root
 pip install pytest                # for the check below

@@ -7,7 +7,7 @@ commented block ([Server mode](#8-server-mode)).
 
 ## Getting started
 
-Install MIA as in the root [`README.md`](../README.md#-installation) (vLLM 0.29.0, torch 2.13.0),
+Install MIA as in the root [`README.md`](../README.md#-installation) (vLLM 0.32.0, torch 2.13.0),
 then run a demo from the repository root:
 
 ```bash
