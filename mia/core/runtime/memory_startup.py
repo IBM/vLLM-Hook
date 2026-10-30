@@ -1,4 +1,4 @@
-"""Reserve MIA's GPU storage before vLLM 0.29 takes its startup memory snapshot."""
+"""Reserve MIA's GPU storage before vLLM 0.32 takes its startup memory snapshot."""
 from __future__ import annotations
 
 from contextvars import ContextVar
@@ -117,30 +117,33 @@ def install_memory_startup_patch(module=None, *, version=None) -> None:
         import vllm
         from vllm.v1.worker import gpu_worker as module
         version = vllm.__version__
-    if str(version).split('+', 1)[0] != '0.29.0':
-        raise MiaConfigurationError(f'MIA outside-buffer startup requires vLLM 0.29.0, got {version}')
+    if str(version).split('+', 1)[0] != '0.32.0':
+        raise MiaConfigurationError(f'MIA outside-buffer startup requires vLLM 0.32.0, got {version}')
     if getattr(module, '_mia_memory_startup_patched', False):
         return
     if not callable(getattr(module, 'request_memory', None)):
-        raise MiaConfigurationError('vLLM 0.29 request_memory startup boundary is unavailable')
+        raise MiaConfigurationError('vLLM 0.32 request_memory startup boundary is unavailable')
     original_init = module.Worker.init_device
     original_request = module.request_memory
     original_shutdown = getattr(module.Worker, "shutdown", None)
 
     @wraps(original_request)
-    def request(snapshot, cache):
+    def request(snapshot, cache, external_weight_memory=0):
         worker = _INITIALIZING.get()
         if worker is None:
-            return original_request(snapshot, cache)
+            return original_request(snapshot, cache, external_weight_memory)
         if getattr(worker, '_mia_memory_baseline_finalized', False):
             raise MiaConfigurationError('MIA initial memory baseline reached twice')
+        if external_weight_memory:
+            raise MiaConfigurationError('Externally held weights shrink the engine budget; '
+                                        'unsupported with MIA outside-buffer budgeting')
         reserve_before_model_baseline(worker, snapshot)
         snapshot.measure()
         if snapshot.free_memory < worker.vllm_config.cache_config.gpu_memory_utilization * snapshot.total_memory:
             raise MiaSizingError('MIA allocation fits the nominal outside budget but leaves '
                                  'insufficient physical GPU memory for the model budget')
         worker._mia_memory_baseline_finalized = True
-        result = original_request(snapshot, cache)
+        result = original_request(snapshot, cache, external_weight_memory)
         owner = getattr(worker, '_mia_memory_owner', None)
         if owner is not None:
             _LOG.info('MIA outside GPU storage: %s; physical free after reservation=%d B',

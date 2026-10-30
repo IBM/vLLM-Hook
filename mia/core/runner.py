@@ -27,7 +27,7 @@ def require_v2_runner(runner) -> None:
         raise UnsupportedRunnerError(
             "MIA requires vLLM's V2 model runner (vllm.v1.worker.gpu.model_runner), but "
             f"the live runner is {type(runner).__module__}.{type(runner).__name__}. "
-            "Unset VLLM_USE_V2_MODEL_RUNNER (or set it to 1) and use vLLM 0.29.0."
+            "Unset VLLM_USE_V2_MODEL_RUNNER (or set it to 1) and use vLLM 0.32.0."
         )
 
 
