@@ -46,6 +46,8 @@ class AttnLinkAnalyzer:
     def analyze(self, analyzer_spec: Dict, run_id: Optional[str] = None,
                 probes: Optional[Dict] = None) -> Dict:
         """Score each candidate span from one last-token QK capture, then select a top-p subset."""
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import layer_conf, visible_keys
         candidates = analyzer_spec["candidates"]
         spans = analyzer_spec["candidate_spans"]
         length = analyzer_spec["prompt_length"]
@@ -72,7 +74,7 @@ class AttnLinkAnalyzer:
             raise ValueError("AttnLink demo expects one prompt and one prefill pass.")
 
         q, k = queries[0], keys[0]
-        config = probes["config"]
+        config = layer_conf(probes["config"], self.layer)
         heads = config["num_attention_heads"]
         kv_heads = config["num_key_value_heads"]
         dim = config["head_dim"]
@@ -87,12 +89,18 @@ class AttnLinkAnalyzer:
         kv_head = self.head // heads_per_kv_head
         query = q.reshape(heads, dim)[self.head].float()
         key = k.reshape(length, kv_heads, dim)[:, kv_head].float()
-        if not torch.isfinite(query).all() or not torch.isfinite(key).all():
+        window = config.get("sliding_window")
+        # keys outside the window may be NaN (freed cache blocks); the query never reads them
+        seen = visible_keys(1, length, window)[0] if window else slice(None)
+        if not torch.isfinite(query).all() or not torch.isfinite(key[seen]).all():
             raise ValueError("Captured QK contains nonfinite values.")
 
         scale = config.get("attention_multiplier", 1.0 / math.sqrt(dim))
         with PROF.timed("analyzer.kernel"):
-            whole_prompt_attention = torch.softmax(torch.mv(key, query) * scale, dim=0)
+            logits = torch.mv(key, query) * scale
+            if window:
+                logits = logits.masked_fill(~seen, float("-inf"))
+            whole_prompt_attention = torch.softmax(logits, dim=0)
             scores = [whole_prompt_attention[start:end].mean().item() for start, end in spans]
         selection = select_columns(scores, analyzer_spec.get("temperature", 1.0),
                                    analyzer_spec.get("top_p", 0.8))

@@ -5,13 +5,14 @@ import os
 
 
 def qk_score_size_select(prompt_len: int, mode: str, layer_to_heads: dict,
-                         H_q: int, H_kv: int, d: int) -> str:
+                         geometry) -> str:
     """Size model: return "qk" or "score" — the smaller capture artifact."""
     if not layer_to_heads:
         return "qk"
     S = int(prompt_len)
     qk_elems = sc_elems = 0
-    for _layer, heads in layer_to_heads.items():
+    for layer, heads in layer_to_heads.items():
+        H_q, H_kv, d = geometry[int(layer)]
         n = len(heads) or 1
         if mode == "all_tokens":
             qk_elems += S * (H_q + H_kv) * d

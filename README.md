@@ -82,7 +82,7 @@ MIA requires vLLM's **V2 model runner** and runs every worker under CUDA graphs 
 
 Tensor parallelism (TP > 1) is supported for `capture_hs`, `capture_qk` and `steer`: each capturing
 rank writes its own `tp_rank_<r>/` directory and MIA's loaders merge them. Pipeline parallelism is
-not supported, and Q/K `score` capture requires TP = 1.
+not supported, Q/K `score` capture requires TP = 1, and Q/K capture on per-layer-geometry models (Gemma 4) requires TP = 1.
 
 ---
 

@@ -36,6 +36,8 @@ class AttntrackerAnalyzer:
 
     def compute_attention_from_qk(self, run_id: str = None, probes: Optional[Dict] = None) -> Dict[str, Dict]:
         """Per prompt, the configured heads' last-token attention per layer (from scores or Q/K)."""
+        # lazy: keep mia.core.runtime out of import mia
+        from mia.core.runtime.tp_shard import layer_conf, visible_keys
         if probes is not None:
             config = probes["config"]
             qk_cache = probes["qk_cache"]
@@ -74,6 +76,7 @@ class AttntrackerAnalyzer:
 
             important_head_indices = self.layer_to_heads[layer_num]
             q_list, k_list = unpack_qk(qk_data)
+            lc = layer_conf(config, layer_num)
 
             if batch_attention_weights is None:
                 batch_attention_weights = [dict() for _ in range(len(q_list))]
@@ -81,17 +84,20 @@ class AttntrackerAnalyzer:
             for i, (q_last, k_all) in enumerate(zip(q_list, k_list)):
                 seq_len = k_all.shape[0]
 
-                q_heads = q_last.view(config["num_attention_heads"], config["head_dim"])
+                q_heads = q_last.view(lc["num_attention_heads"], lc["head_dim"])
                 q_heads = q_heads.unsqueeze(0).unsqueeze(2)
 
-                k_heads = k_all.view(seq_len, config["num_key_value_heads"], config["head_dim"])
+                k_heads = k_all.view(seq_len, lc["num_key_value_heads"], lc["head_dim"])
                 k_heads = k_heads.permute(1, 0, 2).unsqueeze(0)
 
-                if config["num_key_value_heads"] < config["num_attention_heads"]:
-                    num_repeat = config["num_attention_heads"] // config["num_key_value_heads"]
+                if lc["num_key_value_heads"] < lc["num_attention_heads"]:
+                    num_repeat = lc["num_attention_heads"] // lc["num_key_value_heads"]
                     k_heads = k_heads.repeat_interleave(num_repeat, dim=1)
 
-                scores = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * config["attention_multiplier"]
+                scores = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * lc["attention_multiplier"]
+                if lc.get("sliding_window"):
+                    scores = scores.masked_fill(
+                        ~visible_keys(1, seq_len, lc["sliding_window"]), float("-inf"))
 
                 full_attention = F.softmax(scores, dim=-1).squeeze(2).squeeze(0)
 

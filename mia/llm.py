@@ -151,11 +151,9 @@ class MiaLLM:
 
         self._model_dims = None
         try:
-            tc = self.llm_engine.model_config.hf_text_config
-            H_q = int(getattr(tc, "num_attention_heads"))
-            H_kv = int(getattr(tc, "num_key_value_heads", H_q))
-            hidden = int(getattr(tc, "hidden_size"))
-            self._model_dims = {"H_q": H_q, "H_kv": H_kv, "d": hidden // H_q}
+            # lazy: keep mia.core.runtime out of import mia
+            from mia.core.runtime.tp_shard import text_layer_geometry
+            self._model_dims = text_layer_geometry(self.llm_engine.model_config.hf_text_config)
         except Exception:
             self._model_dims = None
         self._autosel_log_n = 0
@@ -245,8 +243,7 @@ class MiaLLM:
         dims = self._model_dims
         if not dims or not self.layer_to_heads:
             return "qk"
-        return qk_score_size_select(prompt_len, mode, self.layer_to_heads,
-                                    dims["H_q"], dims["H_kv"], dims["d"])
+        return qk_score_size_select(prompt_len, mode, self.layer_to_heads, dims)
 
     def _maybe_auto_select(self, prompt, sp, extra: dict) -> None:
         if self.worker_name != "capture_qk":

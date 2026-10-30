@@ -1,6 +1,7 @@
 """Tensor-parallel capture geometry: per-rank heads and HS layers, rank dirs, and shard merging."""
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from vllm.distributed import parallel_state as ps
 
 from mia.errors import MiaConfigurationError
 from mia.core.delivery.delivery_selector import DP_SIZE_ENV, _dp_size
+from mia.workers._common import match_attn
 
 RANK_DIR_PREFIX = "tp_rank_"
 _RANK_DIR_RE = re.compile(r"^tp_rank_(\d+)$")
@@ -221,9 +223,115 @@ def qk_conf_head_dim(text_cfg) -> int:
     return int(getattr(text_cfg, "head_dim", None) or hidden // num_h)
 
 
-def check_attn_modules_match_shard(matched, shard) -> None:
-    """Refuse if a matched attention module's local head geometry contradicts ``shard``."""
-    for name, module, _ in matched:
+def text_layer_geometry(text_cfg) -> List[Tuple[int, int, int]]:
+    """``(H_q, H_kv, head_dim)`` per layer, from ``per_layer_config[i]`` when the config has one."""
+    n = int(text_cfg.num_hidden_layers)
+    # Gemma 4's global head_dim raises; each per-layer config resolves it
+    per_layer = getattr(text_cfg, "per_layer_config", None)
+    cfgs = [per_layer[i] for i in range(n)] if per_layer is not None else [text_cfg] * n
+    out = []
+    for c in cfgs:
+        h_q = int(c.num_attention_heads)
+        out.append((h_q, int(getattr(c, "num_key_value_heads", None) or h_q), qk_conf_head_dim(c)))
+    return out
+
+
+def text_layer_kv_sources(text_cfg) -> List[Optional[int]]:
+    """Per layer, the earlier layer whose KV cache it reuses (vLLM gemma4's rule), else None."""
+    n = int(text_cfg.num_hidden_layers)
+    first = n - int(getattr(text_cfg, "num_kv_shared_layers", 0) or 0)
+    if first >= n:
+        return [None] * n
+    types = list(text_cfg.layer_types)
+    # the last non-shared layer of the same attention type
+    return [None] * first + [first - 1 - types[:first][::-1].index(types[i])
+                             for i in range(first, n)]
+
+
+def qk_layer_shards(geometry, tp_rank: int, tp_size: int) -> List[QKShard]:
+    """Each layer's QK shard; per-layer geometry is refused at TP > 1 (unvalidated)."""
+    if int(tp_size) > 1 and len(set(geometry)) > 1:
+        raise MiaConfigurationError(
+            f"Q/K capture at tensor_parallel_size={tp_size} is not supported when the attention "
+            f"geometry varies per layer ((H_q, H_kv, head_dim) in {sorted(set(geometry))}); run "
+            f"Q/K capture at tensor_parallel_size=1.")
+    return [qk_shard(tp_rank, tp_size, *g) for g in geometry]
+
+
+def module_layer_scale(module) -> float:
+    """The softmax scale a vLLM attention module applies."""
+    return float(module.impl.scale)
+
+
+def module_kv_source(module) -> Optional[int]:
+    """The layer whose KV cache this attention module reads, or None if it owns one."""
+    target = getattr(module, "kv_sharing_target_layer_name", None)
+    return None if target is None else match_attn(target)
+
+
+def qk_kv_sources(text_cfg, matched, cache_config=None) -> dict:
+    """``{layer: source}`` for the KV-shared layers; refuses if the modules and config disagree."""
+    planned = text_layer_kv_sources(text_cfg)
+    got = {int(layer): module_kv_source(module) for _, module, layer in matched}
+    bad = {layer: (src, planned[layer]) for layer, src in got.items() if src != planned[layer]}
+    if bad:
+        raise MiaConfigurationError(
+            f"KV-sharing sources of the attention modules differ from the config's (layer: "
+            f"(module, config)) {bad}; MIA planned the shared layers' keys from the config, so "
+            f"it cannot alias them correctly.")
+    sources = {layer: src for layer, src in got.items() if src is not None}
+    if sources and getattr(cache_config, "kv_sharing_fast_prefill", False):
+        raise MiaConfigurationError(
+            "Q/K capture does not support kv_sharing_fast_prefill: the KV-shared layers then run "
+            "on only part of the batch's tokens, so their q rows would be captured against the "
+            "wrong tokens. Start vLLM without kv_sharing_fast_prefill.")
+    return sources
+
+
+def qk_conf(text_cfg, matched) -> dict:
+    """The Q/K run config: layer 0's geometry, plus ``layers`` when layers differ (heads or KV)."""
+    geometry = text_layer_geometry(text_cfg)
+    h_q, h_kv, d = geometry[0]
+    conf = dict(num_attention_heads=h_q, num_key_value_heads=h_kv,
+                hidden_size=int(text_cfg.hidden_size), head_dim=d,
+                attention_multiplier=float(getattr(text_cfg, "attention_multiplier",
+                                                   1 / math.sqrt(d))))
+    sources = {layer: module_kv_source(module) for _, module, layer in matched}
+    if matched and (len(set(geometry)) > 1 or any(s is not None for s in sources.values())):
+        conf["layers"] = {
+            str(layer): dict(num_key_value_heads=geometry[layer][1], head_dim=geometry[layer][2],
+                             attention_multiplier=module_layer_scale(module),
+                             sliding_window=getattr(module, "sliding_window", None),
+                             kv_source=sources[layer])
+            for _, module, layer in sorted(matched, key=lambda m: m[2])}
+        # the lowest matched layer: layer 0 whenever the match is complete
+        conf["attention_multiplier"] = next(iter(conf["layers"].values()))["attention_multiplier"]
+    return conf
+
+
+def layer_conf(conf: dict, layer: int) -> dict:
+    """``conf`` with layer ``layer``'s ``conf["layers"]`` entry applied."""
+    own = (conf.get("layers") or {}).get(str(int(layer)))
+    return {**conf, **own} if own else conf
+
+
+def visible_keys(q_len: int, k_len: int, window=None, device=None, offset=None) -> torch.Tensor:
+    """``[q_len, k_len]`` keys each query sees: causal, and ``t - p < window``.
+
+    Query row r sits at position ``offset + r``; the default is the last ``q_len`` positions.
+    """
+    offset = k_len - q_len if offset is None else int(offset)
+    mask = torch.ones(q_len, k_len, dtype=torch.bool, device=device).tril(diagonal=offset)
+    if window:
+        # HF Gemma: key p is visible to the query at t only while t - p < sliding_window
+        mask &= torch.ones_like(mask).triu(diagonal=offset - int(window) + 1)
+    return mask
+
+
+def check_attn_modules_match_shard(matched, shards) -> None:
+    """Refuse if a matched attention module's local head geometry contradicts its layer's shard."""
+    for name, module, layer in matched:
+        shard = shards[layer]
         got = {k: getattr(module, k, None) for k in ("num_heads", "num_kv_heads", "head_size")}
         want = {"num_heads": shard.num_local_q_heads, "num_kv_heads": shard.num_local_kv_heads,
                 "head_size": shard.head_dim}
@@ -712,6 +820,8 @@ __all__ = [
     "rank_dir_name", "parse_rank_dir", "refuse_pipeline_parallel", "resolve_tp_coords",
     "DP_DIR_PREFIX", "dp_dir_name", "parse_dp_dir", "dp_layout", "dp_run_base",
     "qk_shard", "qk_shard_from_header", "qk_conf_head_dim", "check_attn_modules_match_shard",
+    "text_layer_geometry", "text_layer_kv_sources", "qk_layer_shards", "module_layer_scale",
+    "module_kv_source", "qk_kv_sources", "qk_conf", "layer_conf", "visible_keys",
     "check_complete_shard_set", "merge_head_tensors",
     "merge_qk_entries", "merge_qk_payloads", "drain_holds_data", "discover_rank_dirs",
 ]

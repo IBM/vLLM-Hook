@@ -8,7 +8,8 @@ import os
 
 from mia.errors import MiaConfigurationError, MiaSizingError
 from mia.core.aperture.aperture_sizing import DEFAULT_APERTURE_GPU_BYTES
-from mia.core.runtime.tp_shard import hs_rows_for_mode, resolve_hs_shard_mode, qk_shard
+from mia.core.runtime.tp_shard import (hs_rows_for_mode, qk_layer_shards, resolve_hs_shard_mode,
+                                       text_layer_geometry, text_layer_kv_sources)
 
 _SIZES = {'float16': 2, 'bfloat16': 2, 'float32': 4, 'int64': 8,
           'int32': 4, 'bool': 1, 'uint8': 1}
@@ -115,22 +116,19 @@ def build_memory_plan(config, worker_kind: str, *, total_bytes: int, tp_rank: in
     if worker_kind == 'hidden_states':
         owned = tuple(hs_rows_for_mode(resolve_hs_shard_mode(tp), n, tp, tp_rank))
         symmetric = tp > 1 and os.environ.get('MIA_HS_TP_SYMMETRIC', '1') != '0'
-        widths = [('hs', h)]
-        captured = owned
+        captured = {layer: [('hs', h)] for layer in owned}
     elif worker_kind == 'qk':
-        nq = int(tc.num_attention_heads)
-        nk = int(getattr(tc, 'num_key_value_heads', None) or nq)
-        hd = int(getattr(tc, 'head_dim', None) or h // nq)
-        shard = qk_shard(tp_rank, tp, nq, nk, hd)
-        widths = [('q', shard.q_width), ('k', shard.k_width)]
-        captured = tuple(range(n))
+        shards = qk_layer_shards(text_layer_geometry(tc), tp_rank, tp)
+        # a KV-shared layer's keys live in its source layer's k buffer
+        captured = {layer: [('q', s.q_width)] + ([] if src is not None else [('k', s.k_width)])
+                    for layer, (s, src) in enumerate(zip(shards, text_layer_kv_sources(tc)))}
         symmetric = False
     else:
-        captured, widths, symmetric = (), [], False
+        captured, symmetric = {}, False
 
     if captured:
         raw = os.environ.get('MIA_APERTURE_GPU_BYTES', '').strip()
-        row_bytes = len(captured) * sum(w for _, w in widths) * _SIZES[dtype]
+        row_bytes = sum(w for widths in captured.values() for _, w in widths) * _SIZES[dtype]
         try:
             aperture = int(raw) if raw else max(DEFAULT_APERTURE_GPU_BYTES, (cap + 1) * row_bytes)
         except ValueError as e:
@@ -140,7 +138,7 @@ def build_memory_plan(config, worker_kind: str, *, total_bytes: int, tp_rank: in
         rows = aperture // row_bytes - 1
         if rows < 1:
             raise MiaSizingError('Aperture must hold at least one capture row plus its sentinel')
-        for layer in captured:
+        for layer, widths in captured.items():
             for label, width in widths:
                 add(f'{label}.{layer}', (rows + 1, width),
                     category='aperture_k' if label == 'k' else 'aperture')
