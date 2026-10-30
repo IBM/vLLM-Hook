@@ -21,6 +21,8 @@ for p in (PROJECT_ROOT, EXAMPLES_DIR):
 
 
 def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "behavioral: existing demo scenarios on automatically detected runtimes")
     # Select engine tests with -m (`-m gpu` / `-m "not gpu"`), never -k: -k matches names only.
     config.addinivalue_line(
         "markers", "gpu: boots a real vLLM engine; needs a GPU (skipped otherwise)")

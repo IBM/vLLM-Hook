@@ -88,6 +88,9 @@ not supported, Q/K `score` capture requires TP = 1, and Q/K capture on per-layer
 
 ## 📦 Installation
 
+For CPU behavioral tests on Apple Silicon, see the [CPU setup guide](docs/cross-platform-install/README.md).
+The instructions below cover the CUDA environment.
+
 **Requirements**
 - Linux and an NVIDIA GPU with a CUDA 13 driver; validated on an H100 80 GB.
 - Python 3.11–3.14; validated on 3.12.
