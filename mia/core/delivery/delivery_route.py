@@ -12,7 +12,7 @@ import vllm.envs as envs
 from . import run_artifact
 from mia.core.aperture.aperture_gather import (DELIVERY_HARD_CAP_S, DeliveryTimeoutError, GatherError,
                               NoDeliveryError, delivery_base, delivery_root, delivery_timeout_s,
-                              discover_delivery_ranks, poll_delivered)
+                              discover_delivery_ranks, poll_delivered, poll_qk_delivered)
 from .delivered_probes import (AmbiguousDelivery, check_id, encode_delivery, external_id,
                                hs_probes, key_pattern, match_keys, response_id)
 from .delivery_selector import STAMP_ENV
@@ -53,9 +53,11 @@ def merge_info(results) -> dict:
     config: dict = {}
     roots: List[str] = []
     run_ids: Optional[set] = set()
+    kind: Optional[str] = None
     for r in results or ():
         if not isinstance(r, dict):
             continue
+        kind = kind or r.get("kind")
         for ln, n in r.get("names") or ():
             names.setdefault(int(ln), str(n))
         config = config or dict(r.get("config") or {})
@@ -69,7 +71,7 @@ def merge_info(results) -> dict:
             else:
                 run_ids = None
     return {"names": names, "config": config, "roots": roots,
-            "run_ids": sorted(run_ids) if run_ids else None}
+            "run_ids": sorted(run_ids) if run_ids else None, "kind": kind}
 
 
 async def engine_info(engine) -> dict:
@@ -152,6 +154,29 @@ async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float]
         await asyncio.sleep(_POLL_S)
 
 
+async def await_qk_delivery(root: str, keys, *, tp_size: int = 1, run_ids=None,
+                            timeout_s: Optional[float] = None, pool=None) -> List[str]:
+    """The delivered dirs of ``keys`` under ``root`` (every TP rank's), polled off the loop."""
+    loop = asyncio.get_running_loop()
+    pool = _READ_POOL if pool is None else pool
+    idle = delivery_timeout_s() if timeout_s is None else float(timeout_s)
+    start = last = loop.time()
+    seen = None
+    while True:
+        got, missing, mark = await loop.run_in_executor(pool, poll_qk_delivered, root, list(keys),
+                                                        run_ids, tp_size)
+        if got is not None:
+            return got
+        now = loop.time()
+        if mark != seen:
+            seen, last = mark, now
+        if now - last >= idle or now - start >= DELIVERY_HARD_CAP_S:
+            why = "; ".join(sorted(set(missing.values()))) or "not delivered"
+            raise DeliveryTimeoutError(f"Q/K {list(keys)}: {why}", missing=missing,
+                                       roots=[str(root)])
+        await asyncio.sleep(_POLL_S)
+
+
 def _parse_layers(s: str):
     s = (s or "").strip()
     if not s:
@@ -200,6 +225,10 @@ def build_router():
         loop = asyncio.get_running_loop()
         try:
             info = await engine_info(request.app.state.engine_client)
+            if info.get("kind") == "qk":
+                return JSONResponse({"error": "Q/K deliveries are read from save_to_disk runs or "
+                                              "the response body, not this route"},
+                                    status_code=404)
             keys, samples = await await_delivery(ext, n, lay, timeout_s=timeout_s,
                                                  run_ids=run_filter(info),
                                                  keys=sample_keys(key, n) if key else None)
@@ -349,7 +378,7 @@ def _done(task) -> None:
     if task.cancelled():
         return
     e = task.exception()
-    if e is not None:
+    if e is not None and type(e).__name__ != "_QkRefusalRecorded":
         print(f"[mia/delivery] save_to_disk write FAILED for {task.get_name()}: {e!r}",
               flush=True)
 

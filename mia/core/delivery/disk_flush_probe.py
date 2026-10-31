@@ -39,14 +39,17 @@ def probe_interval() -> int:
 
 def flush_class(*, graph: bool, wants_hs: bool, wants_qk: bool, wants_steer: bool,
                 sink: str, per_request: bool, durable_wait: bool,
-                run_id: str = "", hook_dir: str = "") -> Optional[str]:
+                run_id: str = "", hook_dir: str = "",
+                qk_hybrid: bool = False) -> Optional[str]:
     """The class key for a request whose ``flush_disk`` may be held back, or None."""
-    if not (graph and wants_hs and not wants_qk and not wants_steer
-            and sink == "disk" and not per_request and not durable_wait):
-        return None
+    common = graph and not wants_steer and sink == "disk" and not per_request and not durable_wait
     # Keyed by hook_dir: run_id is per request, so keying on it would never arm the skip.
+    if common and wants_hs and not wants_qk:
+        return f"hook\x00{hook_dir}"
+    if common and qk_hybrid and wants_qk and not wants_hs:
+        return f"qkhook\x00{hook_dir}"           # QK hybrid: the aperture owns the capture
     _ = run_id
-    return f"hook\x00{hook_dir}"
+    return None
 
 
 @dataclass

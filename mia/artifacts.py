@@ -5,8 +5,10 @@ import glob
 import inspect
 import json
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, unquote
 
 import torch
 from safetensors import safe_open
@@ -91,8 +93,9 @@ def _load_safetensors_shards(st_paths: List[str], cache_key: str, basename: str,
             shard = {"config": meta["config"], cache_key: shard_cache}
             if "peak_gpu_mb" in meta:
                 shard["peak_gpu_mb"] = meta.get("peak_gpu_mb", 0.0)
-            if "tp_shard" in meta:
-                shard["tp_shard"] = meta["tp_shard"]
+            for key in ("tp_shard", "tp_shards"):
+                if key in meta:
+                    shard[key] = meta[key]
             shards.append((tp_rank, shard))
     shards.sort(key=lambda x: x[0])
     return shards
@@ -351,6 +354,91 @@ def write_refused_qk(run_dir: str, refused: dict) -> None:
     os.replace(tmp, path)
 
 
+PENDING_DIR = ".mia_pending"
+
+
+def _pending_dir(hook_dir: str, run_id: str) -> str:
+    return os.path.join(hook_dir, str(run_id), PENDING_DIR)
+
+
+def note_pending(hook_dir: str, run_id: str, key: str) -> None:
+    """Mark a Q/K hybrid save_to_disk write for ``key`` as owed to ``run_id``."""
+    d = _pending_dir(hook_dir, run_id)
+    for attempt in (0, 1):
+        os.makedirs(d, exist_ok=True)
+        try:
+            open(os.path.join(d, quote(str(key), safe="")), "w").close()
+            return
+        except FileNotFoundError:
+            # a concurrent clear_pending removed the empty dir
+            if attempt:
+                raise
+
+
+def clear_pending(hook_dir: str, run_id: str, key: str) -> None:
+    try:
+        os.remove(os.path.join(_pending_dir(hook_dir, run_id), quote(str(key), safe="")))
+    except FileNotFoundError:
+        pass
+    try:
+        os.rmdir(_pending_dir(hook_dir, run_id))
+    except OSError:
+        pass
+
+
+def pending_keys(hook_dir: str, run_id: str) -> List[str]:
+    try:
+        return sorted(unquote(n) for n in os.listdir(_pending_dir(hook_dir, run_id)))
+    except FileNotFoundError:
+        return []
+
+
+def _pending_wait_s() -> float:
+    out = _artifact_wait_s()
+    raw = os.environ.get("MIA_DELIVERY_TIMEOUT_S", "")
+    try:
+        out = max(out, float(raw)) if raw.strip() else max(out, 60.0)
+    except ValueError:
+        pass
+    return out
+
+
+def wait_pending(hook_dir: str, run_id: str, *, timeout_s: Optional[float] = None) -> None:
+    """Block while a Q/K hybrid write for ``run_id`` is owed, up to the no-progress timeout."""
+    idle = _pending_wait_s() if timeout_s is None else float(timeout_s)
+    last, deadline = None, time.monotonic() + idle
+    while True:
+        keys = pending_keys(hook_dir, run_id)
+        if not keys:
+            return
+        if keys != last:
+            last, deadline = keys, time.monotonic() + idle
+        if time.monotonic() >= deadline:
+            raise MiaDeliveryError(
+                f"Q/K run {run_id!r} under {hook_dir}: request(s) {keys} are still owed a qk.pt "
+                f"write after {idle:g} s without progress (MIA_DELIVERY_TIMEOUT_S / "
+                f"MIA_ARTIFACT_WAIT_S): the server's writer is behind or stopped; the per-request "
+                f"deliveries stay under the server's delivery dir.")
+        time.sleep(0.05)
+
+
+def note_refused_qk(run_dir: str, refused: dict) -> None:
+    """Merge ``refused`` into ``run_dir``'s qk_refused.json."""
+    if not refused:
+        return
+    os.makedirs(run_dir, exist_ok=True)
+    path = os.path.join(run_dir, QK_REFUSED_FILE)
+    have = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            have = json.load(f)
+    have.update({str(k): str(v) for k, v in refused.items()})
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(have, f)
+    os.replace(tmp, path)
+
+
 def read_refused_qk(hook_dir: str, run_id: str) -> dict:
     """``{internal id: reason}`` of every request refused in ``run_id`` (all ranks)."""
     out: dict = {}
@@ -363,6 +451,7 @@ def read_refused_qk(hook_dir: str, run_id: str) -> dict:
 
 def load_and_merge_qk_cache(hook_dir: str, run_id: str):
     """Load all QK shards for run_id and merge them into a single cache."""
+    wait_pending(hook_dir, run_id)   # wait for an owed hybrid write
     refused = read_refused_qk(hook_dir, run_id)
     if refused:
         files = sorted(glob.glob(os.path.join(hook_dir, str(run_id), "**", QK_REFUSED_FILE),

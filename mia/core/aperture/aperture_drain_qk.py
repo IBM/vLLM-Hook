@@ -7,6 +7,7 @@ import queue
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -15,31 +16,47 @@ from mia._profiler import PROF
 from .capture_aperture import CaptureAperture
 from mia.core.delivery.per_request_delivery import PerRequestIndex
 from .aperture_drain_hs import (
-    _MmapLayerWriter,
     _STOP,
     _DrainItem,
     _Finish,
     _close_write_path,
     _dbg,
-    _raw_bytes,
     _aperture_debug,
     _sanitize_req_id,
 )
+from .aperture_gather import (
+    DELIVER_ENV as GATHER_DELIVER_ENV, ApertureGatherProcess, delivery_enabled)
+from .aperture_layout import QK_LAYOUT
+from .aperture_run_index import (
+    FLUSH_MS_ENV, GATHER_ENV, QkRunIndex, RunIndexFlusher, clear_chain, flush_interval_ms,
+    gather_enabled, new_run_id)
+from .aperture_trim import (
+    TRIM_ENV as GATHER_TRIM_ENV, trim_chunk_bytes, trim_enabled, trim_explicit, trim_lag_bytes)
 from .aperture_metadata import (
     QKStepEntry, QkSidecarLog, StepMeta, expand_qk_records, write_qk_sidecar)
 from .aperture_sink import (
     ApertureWriteConfigError, ApertureWriteError, ApertureWritePath, PerRequestSinks,
-    WRITE_MODE_ENV, WriteShape, WriteStats, alloc_host_rows, join_writes, join_writes_quietly,
+    WriteShape, WriteStats, alloc_host_rows, join_writes, join_writes_quietly,
     lock_run_dir, record_step_stats, release_run_lock, releases_run_lock_on_failure,
-    resolve_per_request_write_mode, resolve_write_mode, resolve_write_threads, timed_write)
+    resolve_per_request_write_mode, resolve_write_mode, resolve_write_threads, timed_write_at)
 from mia.core.runtime.thread_device import bind_thread_to_device
 from mia.core.delivery.offload_process import OffloadProcess
 from mia.workers._common import request_id_base
 
 logger = logging.getLogger(__name__)
 
-_GIB = 1024 ** 3
 
+@dataclass
+class _InFlight:
+    """A step with d2h issued and writes submitted, not yet joined or published."""
+    item: _DrainItem
+    futs: list
+    block: object
+    parity: int
+    t_first: Optional[float]
+    d2h_s: float
+    bookkeeping_s: float
+    issue_s: float
 
 def _match_disk_route(rid: str, route_keys) -> Optional[str]:
     rid = str(rid)
@@ -49,32 +66,16 @@ def _match_disk_route(rid: str, route_keys) -> Optional[str]:
     return base if base is not None and base in route_keys else None
 
 
-def _resolve_qk_mmap_capacity_bytes(n_slots: int, row_bytes: int) -> int:
-    override = os.environ.get("MIA_APERTURE_MMAP_BYTES")
-    if override:
-        return int(override)
-    return max(2 * _GIB, int(n_slots) * int(row_bytes))
-
-
 class _PerRequestQKDiskStaging:
     """QK disk-route staging: streams one request's q/k rows to its own run dir."""
 
-    def __init__(self, req_id: str, run_dir: str, header: dict, capacity_bytes: int,
-                 use_mmap: bool, write_mode: str = "legacy"):
+    def __init__(self, req_id: str, run_dir: str, header: dict):
         self.req_id = str(req_id)
         self.run_dir = run_dir
         os.makedirs(run_dir, exist_ok=True)
         self.header = dict(header)
         self.meta_path = os.path.join(run_dir, "qk_aperture_meta.jsonl")
-        self._capacity = int(capacity_bytes)
-        self.write_mode = str(write_mode)
-        self._legacy = self.write_mode == "legacy"
-        self._use_mmap = bool(use_mmap) and self._legacy
-        self._sinks = None if self._legacy else PerRequestSinks(f"qk staging req {req_id}")
-        self._q_writers: Dict[int, _MmapLayerWriter] = {}
-        self._k_writers: Dict[int, _MmapLayerWriter] = {}
-        self._q_plain: Dict[int, str] = {}
-        self._k_plain: Dict[int, str] = {}
+        self._sinks = PerRequestSinks(f"qk staging req {req_id}")
         self._q_rows: Dict[int, int] = {}
         self._k_rows: Dict[int, int] = {}
         self._entries: List[QKStepEntry] = []
@@ -86,36 +87,17 @@ class _PerRequestQKDiskStaging:
     def _k_path(self, layer: int) -> str:
         return os.path.join(self.run_dir, f"qk_k_layer_{layer}.raw")
 
-    def _append_one(self, writers: dict, plain: dict, path_fn, layer: int,
-                    rows_cpu: torch.Tensor, which: str) -> None:
-        if self._sinks is not None:
-            self._sinks.append((which, layer), path_fn(layer), rows_cpu)
-        elif self._use_mmap:
-            w = writers.get(layer)
-            if w is None:
-                w = _MmapLayerWriter(path_fn(layer), self._capacity)
-                writers[layer] = w
-            w.append(_raw_bytes(rows_cpu))
-        else:
-            p = plain.get(layer)
-            if p is None:
-                p = path_fn(layer)
-                open(p, "wb").close()
-                plain[layer] = p
-            with open(p, "ab") as f:
-                f.write(_raw_bytes(rows_cpu))
-
     def append(self, layer: int, q_rows_cpu, k_rows_cpu: torch.Tensor,
                prefix_end: int, num_computed: int) -> None:
         """Append one step's q/k rows for this (req, layer) and record the matching QKStepEntry."""
         k_start = self._k_rows.get(layer, 0)
         k_n = int(k_rows_cpu.shape[0])
-        self._append_one(self._k_writers, self._k_plain, self._k_path, layer, k_rows_cpu, "k")
+        self._sinks.append(("k", layer), self._k_path(layer), k_rows_cpu)
         self._k_rows[layer] = k_start + k_n
         if q_rows_cpu is not None and int(q_rows_cpu.shape[0]) > 0:
             q_start = self._q_rows.get(layer, 0)
             q_n = int(q_rows_cpu.shape[0])
-            self._append_one(self._q_writers, self._q_plain, self._q_path, layer, q_rows_cpu, "q")
+            self._sinks.append(("q", layer), self._q_path(layer), q_rows_cpu)
             self._q_rows[layer] = q_start + q_n
         else:
             q_start, q_n = -1, 0
@@ -126,19 +108,11 @@ class _PerRequestQKDiskStaging:
             prefix_end=int(prefix_end), num_computed=int(num_computed)))
 
     def close(self) -> None:
-        """Finalize on finish: sync and truncate every q/k writer, then write this request's sidecar."""
+        """Finalize on finish: close every q/k sink, then write this request's sidecar."""
         if self._closed:
             return
         self._closed = True
-        if self._sinks is not None:
-            self._sinks.close()
-        for w in (*self._q_writers.values(), *self._k_writers.values()):
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "qk per-request staging: writer close failed for req %r (partial staging); "
-                    "continuing", self.req_id)
+        self._sinks.close()
         try:
             if os.path.isdir(self.run_dir):
                 write_qk_sidecar(self.meta_path, [StepMeta(list(self._entries))], self.header)
@@ -148,16 +122,8 @@ class _PerRequestQKDiskStaging:
                 "staging); delivery skipped", self.req_id, self.run_dir)
 
     def discard(self) -> None:
-        """Abort cleanup: release open q/k writers without a sidecar and remove the staging dir."""
-        if self._sinks is not None:
-            self._sinks.close()
-        for w in (*self._q_writers.values(), *self._k_writers.values()):
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._q_writers = {}
-        self._k_writers = {}
+        """Abort cleanup: release open q/k sinks without a sidecar and remove the staging dir."""
+        self._sinks.close()
         self._closed = True
         shutil.rmtree(self.run_dir, ignore_errors=True)
 
@@ -185,34 +151,61 @@ class MultiLayerQKApertureDrain:
                             for ln, _, _ in self.layers}
         self.write_mode, self._write_mode_explicit = resolve_write_mode()
         self.shape = shape
-        self._perreq_write_mode = "legacy"
         self._wp: Optional[ApertureWritePath] = None
         self._sidecar: Optional[QkSidecarLog] = None
         self._io_lock = threading.Lock()
         self._wstats = WriteStats()
         self._write_note = ""
         self._pending_records: list = []
-        self._mmap_enabled = False
-        self._q_writers: Dict[int, _MmapLayerWriter] = {}
-        self._k_writers: Dict[int, _MmapLayerWriter] = {}
+        self.gather = gather_enabled()
+        self._run_index: Optional[QkRunIndex] = None
+        self._run_flusher: Optional[RunIndexFlusher] = None
+        self.run_id: Optional[str] = None
+        self._gather_proc: Optional[ApertureGatherProcess] = None
+        self.gather_stamp = False
+        self._flush_ms = 0
+        self._deferred_finishes: list = []
+        if self.gather:
+            if not setup_sink:
+                raise ApertureWriteConfigError(
+                    f"{GATHER_ENV}=1 reads the SHARED q/k layer files, but this drain writes none: "
+                    f"per-request delivery (MIA_APERTURE_PER_REQUEST=1) demuxes every row into its "
+                    f"request's staging instead. "
+                    f"Unset one of the two (MIA_APERTURE_DELIVERY=hybrid sets them for you).")
+            if int(os.environ.get("MIA_DP_SIZE", "1") or "1") > 1:
+                raise ApertureWriteConfigError(
+                    f"{GATHER_ENV}=1 on a Q/K capture at "
+                    f"MIA_DP_SIZE={os.environ.get('MIA_DP_SIZE')}: the Q/K "
+                    f"hybrid is not collected across DP engines (DP>1 refused).")
+            self._flush_ms = flush_interval_ms()
+        if delivery_enabled():
+            if not self.gather:
+                raise ApertureWriteConfigError(
+                    f"{GATHER_DELIVER_ENV}=1 needs the run index ({GATHER_ENV}=1); set it, or "
+                    f"unset {GATHER_DELIVER_ENV}.")
+            if self._flush_ms <= 0:
+                raise ApertureWriteConfigError(
+                    f"{GATHER_DELIVER_ENV}=1 needs the index PUBLISHED while the run is going; "
+                    f"set {FLUSH_MS_ENV}.")
+        if trim_explicit():
+            armed = trim_enabled()
+            trim_chunk_bytes()
+            trim_lag_bytes()
+            if armed and not delivery_enabled():
+                raise ApertureWriteConfigError(
+                    f"{GATHER_TRIM_ENV}=1 frees the shared files behind the gather's cursor, but "
+                    f"{GATHER_DELIVER_ENV} is off: nothing would be trimmed. Unset "
+                    f"{GATHER_TRIM_ENV}.")
         self._run_lock = lock_run_dir(run_dir, "qk") if setup_sink else None
+        if setup_sink:
+            clear_chain(run_dir, layout=QK_LAYOUT)
         if not setup_sink:
-            self._perreq_write_mode = resolve_per_request_write_mode(
-                self.write_mode, self._write_mode_explicit)
+            resolve_per_request_write_mode(self.write_mode, self._write_mode_explicit)
             self._write_note = (
                 f"write mode={self.write_mode} does not apply to shared raw files: per-request "
                 f"delivery (MIA_APERTURE_PER_REQUEST=1) writes none. Its disk staging writes "
-                + ("zero-copy buffered, one fd per q/k file kept open for the request"
-                   if self._perreq_write_mode != "legacy"
-                   else "through the legacy per-step tobytes + open/append/close path"))
-        elif self.write_mode != "legacy":
-            if os.environ.get("MIA_APERTURE_MMAP", "0") != "0":
-                raise ApertureWriteConfigError(
-                    f"MIA_APERTURE_MMAP={os.environ.get('MIA_APERTURE_MMAP')!r} selects the legacy "
-                    f"mmap sink, but {WRITE_MODE_ENV}={self.write_mode} "
-                    f"({'set' if self._write_mode_explicit else 'the default'}). Unset "
-                    f"MIA_APERTURE_MMAP (the files now stay open for the run, which is what the "
-                    f"mmap sink was for), or set {WRITE_MODE_ENV}=legacy to use it.")
+                f"zero-copy buffered, one fd per q/k file kept open for the request")
+        else:
             files = {}
             for ln, q_buf, k_buf in self.layers:
                 files[("q", ln)] = (self.q_raw_paths[ln], "q",
@@ -224,33 +217,17 @@ class MultiLayerQKApertureDrain:
                 direct_refusal=self._DIRECT_REFUSAL, label=f"qk aperture drain ({run_dir})",
                 shape=self.shape)
             self._sidecar = QkSidecarLog()
-        else:
-            self._mmap_enabled = os.environ.get("MIA_APERTURE_MMAP", "0") != "0"
-            if self._mmap_enabled:
-                try:
-                    for ln, q_buf, k_buf in self.layers:
-                        q_cap = _resolve_qk_mmap_capacity_bytes(
-                            aperture.n_slots, q_buf.shape[1] * q_buf.element_size())
-                        k_cap = _resolve_qk_mmap_capacity_bytes(
-                            aperture.n_slots, k_buf.shape[1] * k_buf.element_size())
-                        self._q_writers[ln] = _MmapLayerWriter(self.q_raw_paths[ln], q_cap)
-                        self._k_writers[ln] = _MmapLayerWriter(self.k_raw_paths[ln], k_cap)
-                except OSError as e:
-                    logger.warning(
-                        "qk aperture mmap sink: failed to mmap raw file(s) under %s (%s); falling back to "
-                        "the plain append path for the whole run (unset MIA_APERTURE_MMAP to silence)",
-                        run_dir, e)
-                    for w in (*self._q_writers.values(), *self._k_writers.values()):
-                        try:
-                            w.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                    self._q_writers = {}
-                    self._k_writers = {}
-                    self._mmap_enabled = False
-            if not self._mmap_enabled:
-                for p in (*self.q_raw_paths.values(), *self.k_raw_paths.values()):
-                    open(p, "wb").close()
+            if self.gather:
+                self._run_index = QkRunIndex(self._sidecar)
+                if self._flush_ms > 0:
+                    self.gather_stamp = True
+                    self.run_id = new_run_id()
+                    self._run_flusher = RunIndexFlusher(
+                        self._run_index, run_dir, self.header, self._flush_ms,
+                        name=f"qk run index ({run_dir})", run_id=self.run_id)
+                    self._run_flusher.start()
+                    self._gather_proc = ApertureGatherProcess.from_env(
+                        run_dir, header=self.header, run_id=self.run_id, layout="qk")
         self._steps: List[StepMeta] = []
         self._pending_entries: List[QKStepEntry] = []
         self._closed = False
@@ -268,13 +245,12 @@ class MultiLayerQKApertureDrain:
     def write_path_summary(self) -> str:
         """Install-line summary: write mode per tensor kind, writer threads, O_DIRECT block."""
         if self._wp is not None:
-            return self._wp.summary()
-        if self._write_note:
-            return self._write_note
-        sink = ("pre-sized MAP_SHARED mmap (MIA_APERTURE_MMAP=1)" if self._mmap_enabled
-                else "tobytes + open/append/close per step")
-        return (f"write mode=legacy -> q=legacy, k=legacy ({sink}, on the drain thread) | for A/B "
-                f"validation only ({WRITE_MODE_ENV}=legacy)")
+            note = self._wp.summary()
+            if self.gather_stamp:
+                note += (f" | qk hybrid delivery ON: run index qk_run_index.seg.* every "
+                         f"{self._flush_ms} ms, run id {self.run_id}")
+            return note
+        return self._write_note
 
     def record_entries(self, entries: List) -> None:
         if self._sidecar is not None:
@@ -282,41 +258,13 @@ class MultiLayerQKApertureDrain:
             return
         self._pending_entries.extend(expand_qk_records(entries))
 
-    def _append(self, writers: dict, raw_paths: dict, ln: int, rows_cpu: torch.Tensor) -> None:
-        data = _raw_bytes(rows_cpu)
-        writer = writers.get(ln) if self._mmap_enabled else None
-        if writer is not None:
-            writer.append(data)
-        else:
-            with open(raw_paths[ln], "ab") as f:
-                f.write(data)
-
     def drain_once(self) -> int:
         """Copy pending aperture rows out of every q/k buffer, queue sidecar entries, advance the cursor."""
-        if self._wp is not None:
-            return self._drain_once_fast()
-        moved = self.aperture.pending_rows()
-        if moved == 0:
-            return 0
-        segments = self.aperture.drained_segments()
-        for ln, q_buf, k_buf in self.layers:
-            qp = [q_buf[s:e].detach().to("cpu") for s, e in segments]
-            kp = [k_buf[s:e].detach().to("cpu") for s, e in segments]
-            self._append(self._q_writers, self.q_raw_paths, ln,
-                         qp[0] if len(qp) == 1 else torch.cat(qp, dim=0))
-            self._append(self._k_writers, self.k_raw_paths, ln,
-                         kp[0] if len(kp) == 1 else torch.cat(kp, dim=0))
-        if self._pending_entries:
-            self._steps.append(StepMeta(list(self._pending_entries)))
-            self._pending_entries = []
-        self.aperture.advance_drain(moved)
-        return moved
-
-    def _drain_once_fast(self) -> int:
         moved = self.aperture.pending_rows()
         if moved == 0:
             return 0
         t0 = time.perf_counter()
+        start = self.aperture._drain
         segments = self.aperture.drained_segments()
         wp = self._wp
         by_mode: Dict[str, int] = {}
@@ -339,6 +287,9 @@ class MultiLayerQKApertureDrain:
             block = self._sidecar.prepare(self._pending_records)
             self._pending_records = []
             self._sidecar.commit(block)
+            if self._run_index is not None:
+                self._run_index.note_step(start, moved, block)
+                self._release_deferred_finishes()
             t_b = time.perf_counter() - tb
         self.aperture.advance_drain(moved)
         step_s = time.perf_counter() - t0
@@ -347,16 +298,39 @@ class MultiLayerQKApertureDrain:
                           busy_s=t_w, bookkeeping_s=t_b, bytes_by_mode=by_mode, wp=self._wp)
         return moved
 
+    def note_gather_finish(self, req_id, asked: bool = False, meta: Optional[dict] = None) -> None:
+        """Record a finished request for the gather's completion stamp; held until it is indexed."""
+        if self._run_index is None or not self.gather_stamp:
+            return
+        with self._io_lock:
+            if self._pending_records:
+                self._deferred_finishes.append((str(req_id), bool(asked), meta))
+            else:
+                self._run_index.note_finish(req_id, asked=asked, meta=meta)
+
+    def _release_deferred_finishes(self) -> None:
+        """Note the held finishes (caller holds ``_io_lock``)."""
+        if self._deferred_finishes:
+            held, self._deferred_finishes = self._deferred_finishes, []
+            for rid, asked, meta in held:
+                self._run_index.note_finish(rid, asked=asked, meta=meta)
+
+    def flush_run_index(self, *, up_to=None) -> Optional[str]:
+        """Publish the next index segment now; return its path or None."""
+        f = self._run_flusher
+        return None if f is None else f.flush_once(up_to=up_to)
+
     def close(self) -> None:
         """Flush, truncate and release every q/k writer, then write the shared QK sidecar (idempotent)."""
         if self._wp is not None:
             if not self._closed:
+                if self._deferred_finishes and self._run_index is not None:
+                    with self._io_lock:
+                        self._release_deferred_finishes()
                 _close_write_path(self, "qk")
             return
         if self._closed:
             return
-        for w in (*self._q_writers.values(), *self._k_writers.values()):
-            w.close()
         write_qk_sidecar(self.meta_path, self._steps, self.header)
         self._closed = True
         release_run_lock(self)
@@ -372,8 +346,7 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
                  per_request: bool = False, index: Optional[PerRequestIndex] = None,
                  offload=None, disk_base: Optional[str] = None,
                  shape: Optional[WriteShape] = None):
-        _threads = (resolve_write_threads()
-                    if not per_request and resolve_write_mode()[0] != "legacy" else 0)
+        _threads = resolve_write_threads() if not per_request else 0
         super().__init__(aperture, layers, run_dir, header, setup_sink=not per_request,
                          shape=shape)
         self.per_request = bool(per_request)
@@ -389,9 +362,6 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
         self._disk_aborted: set = set()
         self._host_aborted: set = set()
         self._qk_kmeta: Dict[str, Dict[int, list]] = {}
-        self._perreq_cap = int(os.environ.get(
-            "MIA_APERTURE_PERREQ_MMAP_BYTES", str(64 * 1024 * 1024)) or (64 * 1024 * 1024))
-        self._perreq_mmap = os.environ.get("MIA_APERTURE_MMAP", "0") != "0"
         self._index_lock = threading.Lock()
         self._q: queue.Queue = queue.Queue()
         dev = self.layers[0][1].device if self.layers else torch.device("cpu")
@@ -403,7 +373,10 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
         self._aperture_idx = 0
         self._q_pinned: dict = {ln: None for ln, _, _ in self.layers}
         self._k_pinned: dict = {ln: None for ln, _, _ in self.layers}
-        self._host: Dict[Tuple[str, int], torch.Tensor] = {}
+        self._host: Dict[Tuple[str, int, int], torch.Tensor] = {}   # (q|k, layer, parity)
+        self._parity = 0
+        self._inflight: Optional["_InFlight"] = None
+        self._held_finishes: list = []
         self._layer_events: list = []
         if self._wp is not None:
             if self._stream is not None:
@@ -441,6 +414,11 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
         if not self.per_request:
             return
         self._q.put(_Finish(str(req_id)))
+
+    def note_gather_finish(self, req_id, asked: bool = False, meta: Optional[dict] = None) -> None:
+        """Queue the gather's completion stamp behind this request's rows."""
+        if self.gather_stamp:
+            self._q.put(_Finish(str(req_id), bool(asked), meta))
 
     def route_to_disk(self, req_id, dest, offload=None) -> None:
         """Route ``req_id`` to per-request disk staging, offloaded to ``dest`` when it finishes."""
@@ -555,24 +533,54 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             if _aperture_debug():
                 _dbg(f"qk finish FAILED (isolated, consumer continues): req_id={req_id!r}")
 
+    _POLL_S = 0.001
+
+    def _next_item(self):
+        """The next queue item; polls while a step is in flight so it can complete."""
+        while True:
+            if self._inflight is None:
+                return self._q.get()
+            try:
+                return self._q.get(timeout=self._POLL_S)
+            except queue.Empty:
+                if all(f.done() for f in self._inflight.futs):
+                    self._complete_inflight()
+
     def _run(self) -> None:
         try:
             bind_thread_to_device(self._stream.device if self._stream is not None else None)
             while True:
-                item = self._q.get()
+                item = self._next_item()
                 if item is _STOP:
-                    self._q.task_done()
+                    try:
+                        self._complete_inflight()
+                    finally:
+                        self._q.task_done()
                     break
+                owns_done = False                    # True: in-flight bookkeeping calls task_done
                 try:
                     if isinstance(item, _Finish):
-                        self._finalize_finish_isolated(item.req_id)
+                        if self.gather_stamp:
+                            if self._inflight is not None:
+                                # stamp after the in-flight step is published
+                                self._held_finishes.append(item)
+                                owns_done = True
+                            else:
+                                self._run_index.note_finish(item.req_id, asked=item.asked,
+                                                            meta=item.meta)
+                        else:
+                            self._complete_inflight()
+                            self._finalize_finish_isolated(item.req_id)
                     else:
+                        owns_done = self._wp is not None
                         self._drain_item(item)
                     self._reclaim_settled_pending()
                 finally:
-                    self._q.task_done()
+                    if not owns_done:
+                        self._q.task_done()
         except BaseException as e:  # noqa: BLE001
             self._error = e
+            self._abandon_inflight()
             logger.exception("qk off-loop aperture drain consumer thread died")
 
     def _pinned_buf(self, cache: dict, ln: int, n_rows: int, width: int, dtype) -> torch.Tensor:
@@ -632,10 +640,11 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
         if self._wp is not None:
             self._drain_item_fast(item)
         else:
-            self._drain_item_legacy(item)
+            self._drain_item_per_request(item)
 
-    def _host_buf(self, tag: str, ln: int, n_rows: int, width: int, dtype) -> torch.Tensor:
-        key = (tag, ln)
+    def _host_buf(self, tag: str, ln: int, n_rows: int, width: int, dtype,
+                  parity: int = 0) -> torch.Tensor:
+        key = (tag, ln, parity)
         buf = self._host.get(key)
         if buf is None or buf.shape[0] < n_rows:
             buf = alloc_host_rows(n_rows, width, dtype, pinned=self._is_cuda,
@@ -643,7 +652,7 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             self._host[key] = buf
         return buf[:n_rows]
 
-    def _issue_d2h(self, segments: List[Tuple[int, int]], event) -> list:
+    def _issue_d2h(self, segments: List[Tuple[int, int]], event, parity: int = 0) -> list:
         total = sum(e - s for s, e in segments)
         jobs = []
         if self._stream is not None:
@@ -651,8 +660,8 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
                 self._stream.wait_event(event)
             with torch.cuda.stream(self._stream):
                 for i, (ln, q_buf, k_buf) in enumerate(self.layers):
-                    qh = self._host_buf("q", ln, total, q_buf.shape[1], q_buf.dtype)
-                    kh = self._host_buf("k", ln, total, k_buf.shape[1], k_buf.dtype)
+                    qh = self._host_buf("q", ln, total, q_buf.shape[1], q_buf.dtype, parity)
+                    kh = self._host_buf("k", ln, total, k_buf.shape[1], k_buf.dtype, parity)
                     off = 0
                     for s, e in segments:
                         n = e - s
@@ -672,8 +681,8 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             except Exception:  # noqa: BLE001
                 pass
         for ln, q_buf, k_buf in self.layers:
-            qh = self._host_buf("q", ln, total, q_buf.shape[1], q_buf.dtype)
-            kh = self._host_buf("k", ln, total, k_buf.shape[1], k_buf.dtype)
+            qh = self._host_buf("q", ln, total, q_buf.shape[1], q_buf.dtype, parity)
+            kh = self._host_buf("k", ln, total, k_buf.shape[1], k_buf.dtype, parity)
             off = 0
             for s, e in segments:
                 n = e - s
@@ -683,22 +692,55 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             jobs.append((ln, qh, kh, None))
         return jobs
 
+    @property
+    def _pipelined(self) -> bool:
+        """Only the hybrid-gather configuration pipelines."""
+        return self._run_index is not None and self.gather_stamp
+
     def _drain_item_fast(self, item: _DrainItem) -> None:
+        """Depth-1 pipeline: issue step N+1's d2h, complete step N, then submit N+1's writes."""
+        prev = self._inflight
+        try:
+            ctx = self._begin_step(item, prev)
+            if prev is not None:
+                # held finishes were queued before this step, so their last step is <= prev
+                self._inflight = None
+                held, self._held_finishes = self._held_finishes, []
+                self._finish_step(prev, held)
+            new = self._submit_step(item, ctx)
+        except BaseException:
+            self._q.task_done()                       # never registered: nothing else releases it
+            raise
+        self._inflight = new
+        if not self._pipelined:
+            self._complete_inflight()
+
+    def _begin_step(self, item: _DrainItem, prev: "Optional[_InFlight]"):
         t0 = time.perf_counter()
         aperture = self.aperture
-        assert item.start_logical == aperture._drain, (
+        expect = aperture._drain + (prev.item.n_rows if prev is not None else 0)
+        assert item.start_logical == expect, (
             f"FIFO drain violation: item.start_logical={item.start_logical} != "
-            f"aperture._drain={aperture._drain}")
+            f"aperture._drain + in-flight rows = {expect}")
+        parity = self._parity
+        assert prev is None or prev.parity != parity, \
+            "host buffer set still owned by an outstanding write"
         segments = aperture.segments_at(item.start_logical, item.n_rows)
-        wp = self._wp
         with self._io_lock:
-            if wp.closed:
+            if self._wp.closed:
                 raise ApertureWriteError(
                     f"qk aperture drain ({self.run_dir}): a step reached the consumer after close() "
                     f"closed the raw files -- flush_aperture (stop, then close) must follow the last "
                     f"step; this step's rows are NOT written and the aperture is not advanced")
             t1 = time.perf_counter()
-            jobs = self._issue_d2h(segments, item.event)
+            jobs = self._issue_d2h(segments, item.event, parity)
+        return jobs, parity, t0, t1, time.perf_counter()
+
+    def _submit_step(self, item: _DrainItem, ctx) -> "_InFlight":
+        jobs, parity, t0, t1, t_a = ctx
+        wp = self._wp
+        tb = time.perf_counter()
+        with self._io_lock:
             futs = []
             t_first = None
             try:
@@ -707,30 +749,71 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
                         ev.synchronize()
                     if t_first is None:
                         t_first = time.perf_counter()
-                    futs.append(wp.pool.submit(timed_write, wp.sinks[("q", ln)], qh))
-                    futs.append(wp.pool.submit(timed_write, wp.sinks[("k", ln)], kh))
+                    for tag, h in (("q", qh), ("k", kh)):
+                        sink = wp.sinks[(tag, ln)]
+                        # offset claimed at submit, in step order
+                        off = sink.claim(int(h.numel()) * int(h.element_size()))
+                        futs.append(wp.pool.submit(timed_write_at, sink, h, off))
                 t2 = time.perf_counter()
                 block = self._sidecar.prepare(item.entries)
             except BaseException:
                 join_writes_quietly(futs)
                 raise
             t3 = time.perf_counter()
-            results = join_writes(futs)
-            t4 = time.perf_counter()
-            self._sidecar.commit(block)
-        aperture.advance_drain(item.n_rows)
-        by_mode: Dict[str, int] = {}
-        busy = 0.0
-        for n, secs, mode in results:
-            by_mode[mode] = by_mode.get(mode, 0) + n
-            busy += secs
-        record_step_stats(
-            self._wstats, "qk", rows=item.n_rows, step_s=time.perf_counter() - t0,
-            d2h_s=t2 - t1, write_s=(t4 - t_first) if t_first is not None else 0.0,
-            write_tail_s=t4 - t3, busy_s=busy, bookkeeping_s=(t1 - t0) + (t3 - t2),
-            bytes_by_mode=by_mode, wp=self._wp)
+        self._parity ^= 1
+        return _InFlight(item=item, futs=futs, block=block, parity=parity, t_first=t_first,
+                         d2h_s=(t_a - t1) + (t2 - tb), bookkeeping_s=(t1 - t0) + (t3 - t2),
+                         issue_s=(t_a - t0) + (time.perf_counter() - tb))
 
-    def _drain_item_legacy(self, item: _DrainItem) -> None:
+    def _complete_inflight(self) -> None:
+        """Join, commit, publish and release the in-flight step, then stamp held finishes."""
+        inf, self._inflight = self._inflight, None
+        if inf is None:
+            return
+        held, self._held_finishes = self._held_finishes, []
+        self._finish_step(inf, held)
+
+    def _finish_step(self, inf: "_InFlight", held: list) -> None:
+        try:
+            tj = time.perf_counter()
+            with self._io_lock:
+                results = join_writes(inf.futs)        # rows durable ...
+                t4 = time.perf_counter()
+                self._sidecar.commit(inf.block)
+                if self._run_index is not None:
+                    self._run_index.note_step(inf.item.start_logical, inf.item.n_rows,
+                                              inf.block)   # ... then published
+            self.aperture.advance_drain(inf.item.n_rows)   # ... then released
+            if held:
+                for fin in held:
+                    self._run_index.note_finish(fin.req_id, asked=fin.asked, meta=fin.meta)
+            t5 = time.perf_counter()
+            by_mode: Dict[str, int] = {}
+            busy = 0.0
+            for n, secs, mode in results:
+                by_mode[mode] = by_mode.get(mode, 0) + n
+                busy += secs
+            record_step_stats(
+                self._wstats, "qk", rows=inf.item.n_rows, step_s=inf.issue_s + (t5 - tj),
+                d2h_s=inf.d2h_s, write_s=(t4 - inf.t_first) if inf.t_first is not None else 0.0,
+                write_tail_s=t4 - tj, busy_s=busy, bookkeeping_s=inf.bookkeeping_s + (t5 - t4),
+                bytes_by_mode=by_mode, wp=self._wp)
+        finally:
+            for _ in range(1 + len(held)):
+                self._q.task_done()
+
+    def _abandon_inflight(self) -> None:
+        """Wait out the in-flight step's writes without publishing it; release its queue slot."""
+        inf, self._inflight = self._inflight, None
+        held, self._held_finishes = self._held_finishes, []
+        if inf is not None:
+            try:
+                join_writes_quietly(inf.futs)
+            finally:
+                for _ in range(1 + len(held)):
+                    self._q.task_done()
+
+    def _drain_item_per_request(self, item: _DrainItem) -> None:
         t0 = time.perf_counter()
         aperture = self.aperture
         assert item.start_logical == aperture._drain, (
@@ -742,25 +825,13 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             pieces = self._read_segments(segments, item.event)
         t2 = time.perf_counter()
         t3 = t2
-        nbytes = 0
-        if self.per_request:
-            self._demux_into_index(item, pieces)
-        else:
-            for ln, q_rows, k_rows in pieces:
-                self._append(self._q_writers, self.q_raw_paths, ln, q_rows)
-                self._append(self._k_writers, self.k_raw_paths, ln, k_rows)
-                nbytes += (int(q_rows.numel()) * int(q_rows.element_size())
-                           + int(k_rows.numel()) * int(k_rows.element_size()))
-            t3 = time.perf_counter()
-            entries = expand_qk_records(item.entries)
-            if entries:
-                self._steps.append(StepMeta(entries))
+        self._demux_into_index(item, pieces)
         aperture.advance_drain(item.n_rows)
         t4 = time.perf_counter()
         record_step_stats(
             self._wstats, "qk", rows=item.n_rows, step_s=t4 - t0, d2h_s=t2 - t1,
             write_s=t3 - t2, write_tail_s=t3 - t2, busy_s=t3 - t2,
-            bookkeeping_s=(t1 - t0) + (t4 - t3), bytes_by_mode={"legacy": nbytes} if nbytes else {})
+            bookkeeping_s=(t1 - t0) + (t4 - t3), bytes_by_mode={})
 
     def _demux_into_index(self, item: _DrainItem, pieces) -> None:
         by_layer = {ln: (q, k) for ln, q, k in pieces}
@@ -836,8 +907,7 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             if stg is None:
                 stg = _PerRequestQKDiskStaging(
                     req_id, os.path.join(self._disk_base, _sanitize_req_id(req_id)),
-                    self.header, self._perreq_cap, self._perreq_mmap,
-                    write_mode=self._perreq_write_mode)
+                    self.header)
                 self._disk_staging[req_id] = stg
         stg.append(layer, q_slice, k_slice, prefix_end, num_computed)
 
@@ -861,6 +931,11 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
                 ext = _match_disk_route(req_id, tuple(self._disk_routed))
                 disk_dest = self._disk_routed.pop(ext, None) if ext is not None else None
                 stg = self._disk_staging.pop(ext, None) if disk_dest is not None else None
+                if disk_dest is not None and stg is None:
+                    # a routed request that captured no rows: deliver an empty sidecar (zero rows)
+                    stg = _PerRequestQKDiskStaging(
+                        req_id, os.path.join(self._disk_base, _sanitize_req_id(req_id)),
+                        self.header)
                 if stg is not None and self._offload is not None:
                     self._disk_delivered_src[ext] = stg.run_dir
         if aborted_ext is not None:
@@ -929,7 +1004,7 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
 
     def close(self) -> None:
         """Stop a live consumer, then close the files and write the sidecar; re-raise consumer errors."""
-        if self._wp is None or self._closed:
+        if self._closed:
             return super().close()
         err: Optional[BaseException] = None
         if self._started:
@@ -937,6 +1012,12 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
                 self.stop()
             except BaseException as e:  # noqa: BLE001
                 err = e
+        inf = self._inflight
+        if inf is not None:
+            # wait out the in-flight pwrites before the files close
+            join_writes_quietly(inf.futs)
+            if not self._thread.is_alive():
+                self._abandon_inflight()
         try:
             super().close()
         except BaseException:

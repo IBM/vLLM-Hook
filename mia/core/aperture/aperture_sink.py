@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 WRITE_MODE_ENV = "MIA_APERTURE_WRITE_MODE"
 WRITE_THREADS_ENV = "MIA_APERTURE_WRITE_THREADS"
 DIRECT_MIN_BYTES_ENV = "MIA_APERTURE_DIRECT_MIN_BYTES"
-WRITE_MODES = ("auto", "direct", "buffered", "legacy")
+WRITE_MODES = ("auto", "direct", "buffered")
+_REMOVED_KNOBS = ("MIA_APERTURE_MMAP", "MIA_APERTURE_MMAP_BYTES", "MIA_APERTURE_PERREQ_MMAP_BYTES")
 DEFAULT_WRITE_THREADS = 2
 _MAX_WRITE_THREADS = 64
 
@@ -117,8 +118,22 @@ def releases_run_lock_on_failure(init):
     return wrapper
 
 
+def refuse_removed_write_knobs(env) -> None:
+    """Refuse the removed legacy write mode and mmap sink knobs; ``MIA_APERTURE_MMAP=0`` passes."""
+    raw = env.get(WRITE_MODE_ENV)
+    removed = [(WRITE_MODE_ENV, raw)] if raw is not None and raw.strip().lower() == "legacy" else []
+    removed += [(k, env[k]) for k in _REMOVED_KNOBS
+                if env.get(k) is not None and not (k == "MIA_APERTURE_MMAP" and env[k] == "0")]
+    if removed:
+        knob, value = removed[0]
+        raise ApertureWriteConfigError(
+            f"{knob}={value} was removed: MIA writes capture files through "
+            f"{WRITE_MODE_ENV}=auto|direct|buffered only; unset {knob}.")
+
+
 def resolve_write_mode() -> Tuple[str, bool]:
     """``(mode, explicit)`` from ``MIA_APERTURE_WRITE_MODE``."""
+    refuse_removed_write_knobs(os.environ)
     raw = os.environ.get(WRITE_MODE_ENV)
     if raw is None or not raw.strip():
         return "auto", False
@@ -126,8 +141,7 @@ def resolve_write_mode() -> Tuple[str, bool]:
     if mode not in WRITE_MODES:
         raise ApertureWriteConfigError(
             f"{WRITE_MODE_ENV}={raw!r} is not one of {'|'.join(WRITE_MODES)} "
-            f"(auto = O_DIRECT where aligned else buffered; legacy = the old tobytes + "
-            f"open/append/close path, for A/B validation only)")
+            f"(auto = O_DIRECT where aligned else buffered)")
     return mode, True
 
 
@@ -146,8 +160,8 @@ def resolve_write_threads() -> int:
     return n
 
 
-def resolve_per_request_write_mode(mode: str, explicit: bool) -> str:
-    """Write path for per-request disk staging: legacy if the drain is legacy, else buffered."""
+def resolve_per_request_write_mode(mode: str, explicit: bool) -> None:
+    """Refuse an explicit ``direct`` for per-request disk staging, which always writes buffered."""
     if mode == "direct" and explicit:
         raise ApertureWriteConfigError(
             f"{WRITE_MODE_ENV}=direct refused: per-request delivery (MIA_APERTURE_PER_REQUEST=1) "
@@ -155,16 +169,6 @@ def resolve_per_request_write_mode(mode: str, explicit: bool) -> str:
             f"(its writes are one layer's rows for one request, 8-16 KiB, written inline on the "
             f"drain thread, where O_DIRECT measures 1.65-1.74x slower per write). Use auto (the "
             f"default) or buffered.")
-    if mode == "legacy":
-        return "legacy"
-    if os.environ.get("MIA_APERTURE_MMAP", "0") != "0":
-        raise ApertureWriteConfigError(
-            f"MIA_APERTURE_MMAP={os.environ.get('MIA_APERTURE_MMAP')!r} selects the legacy mmap "
-            f"sink, but {WRITE_MODE_ENV}={mode} ({'set' if explicit else 'the default'}). The "
-            f"per-request disk staging now keeps one fd per layer open for the request, which is "
-            f"what the mmap sink was for. Unset MIA_APERTURE_MMAP, or set {WRITE_MODE_ENV}=legacy "
-            f"to use it.")
-    return "buffered"
 
 
 def resolve_direct_min_bytes() -> int:
@@ -407,6 +411,18 @@ class RawFileSink:
 
     def write(self, t: torch.Tensor) -> int:
         """Append ``t``'s bytes; returns the byte count."""
+        n = self.write_at(t, self.offset)
+        self.offset += n
+        return n
+
+    def claim(self, nbytes: int) -> int:
+        """Reserve the next ``nbytes`` and return their offset, for a later ``write_at``."""
+        off = self.offset
+        self.offset = off + int(nbytes)
+        return off
+
+    def write_at(self, t: torch.Tensor, off: int) -> int:
+        """Write ``t``'s bytes at ``off`` without moving ``self.offset``; returns the byte count."""
         fd = self.fd
         if fd is None:
             raise ApertureWriteError(f"write to {self.path} after its sink was closed")
@@ -414,7 +430,6 @@ class RawFileSink:
         n = len(mv)
         if n == 0:
             return 0
-        off = self.offset
         if self.direct:
             bs, ma = self.block_size, self.mem_align
             ptr = t.data_ptr()
@@ -431,7 +446,6 @@ class RawFileSink:
                 raise ApertureWriteError(
                     f"pwrite to {self.path} wrote {w} of {n - done} bytes at offset {off + done}")
             done += w
-        self.offset = off + n
         return n
 
     def close(self) -> None:
@@ -547,13 +561,12 @@ class WriteStats:
     bookkeeping_s: float = 0.0
     bytes_direct: int = 0
     bytes_buffered: int = 0
-    bytes_legacy: int = 0
     last: Dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         d = {k: getattr(self, k) for k in (
             "steps", "rows", "step_s", "d2h_s", "write_s", "write_tail_s", "write_busy_s",
-            "bookkeeping_s", "bytes_direct", "bytes_buffered", "bytes_legacy")}
+            "bookkeeping_s", "bytes_direct", "bytes_buffered")}
         d["last"] = dict(self.last)
         return d
 
@@ -755,6 +768,13 @@ def timed_write(sink: RawFileSink, t: torch.Tensor) -> Tuple[int, float, str]:
     return n, time.perf_counter() - t0, sink.mode
 
 
+def timed_write_at(sink: RawFileSink, t: torch.Tensor, off: int) -> Tuple[int, float, str]:
+    """``timed_write`` at a claimed offset."""
+    t0 = time.perf_counter()
+    n = sink.write_at(t, off)
+    return n, time.perf_counter() - t0, sink.mode
+
+
 def record_step_stats(stats: WriteStats, kind: str, *, rows: int, step_s: float, d2h_s: float,
                       write_s: float, write_tail_s: float, busy_s: float, bookkeeping_s: float,
                       bytes_by_mode: Dict[str, int],
@@ -793,10 +813,12 @@ __all__ = [
     "WRITE_MODE_ENV", "WRITE_THREADS_ENV", "DIRECT_MIN_BYTES_ENV", "WRITE_MODES",
     "DEFAULT_WRITE_THREADS", "DIRECT_MIN_BYTES",
     "ApertureWriteConfigError", "ApertureWriteError", "resolve_write_mode",
-    "resolve_write_threads", "resolve_direct_min_bytes", "resolve_per_request_write_mode",
+    "refuse_removed_write_knobs", "resolve_write_threads", "resolve_direct_min_bytes",
+    "resolve_per_request_write_mode",
     "WriteShape", "predict_rows_per_write",
     "DirectIOInfo", "probe_direct_io", "alloc_host_rows",
     "tensor_bytes_view", "RawFileSink", "PerRequestSinks", "WriterPool", "join_writes",
-    "WriteStats", "ApertureWritePath", "timed_write", "record_step_stats", "join_writes_quietly",
+    "WriteStats", "ApertureWritePath", "timed_write", "timed_write_at", "record_step_stats",
+    "join_writes_quietly",
 ]
 

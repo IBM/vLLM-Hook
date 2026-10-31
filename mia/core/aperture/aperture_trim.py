@@ -6,9 +6,10 @@ import errno
 import glob
 import json
 import os
-import re
 import tempfile
 from typing import Dict, List, Optional, Tuple
+
+from .aperture_layout import HS_LAYOUT, layout as _layout
 
 TRIM_ENV = "MIA_APERTURE_GATHER_TRIM"
 CHUNK_ENV = "MIA_APERTURE_GATHER_TRIM_CHUNK_BYTES"
@@ -219,22 +220,23 @@ def first_hole(path: str) -> Optional[int]:
         os.close(fd)
 
 
-def marker_path(run_dir: str, worker: int, n_workers: int) -> str:
-    return os.path.join(run_dir, MARKER_FMT % (int(worker), int(n_workers)))
+def marker_path(run_dir: str, worker: int, n_workers: int, layout=HS_LAYOUT) -> str:
+    return os.path.join(run_dir, _layout(layout).trim_marker_fmt % (int(worker), int(n_workers)))
 
 
-def marker_paths(run_dir: str) -> List[str]:
-    return sorted(glob.glob(os.path.join(run_dir, MARKER_GLOB)))
+def marker_paths(run_dir: str, layout=HS_LAYOUT) -> List[str]:
+    return sorted(glob.glob(os.path.join(run_dir, _layout(layout).trim_marker_glob)))
 
 
 class TrimLog:
     """One gather worker's trim marker: the rows it has punched, or is about to."""
 
-    def __init__(self, run_dir: str, worker: int, n_workers: int):
+    def __init__(self, run_dir: str, worker: int, n_workers: int, layout=HS_LAYOUT):
         self.run_dir = str(run_dir)
         self.worker = int(worker)
         self.n_workers = int(n_workers)
-        self.path = marker_path(self.run_dir, self.worker, self.n_workers)
+        self.layout = _layout(layout)
+        self.path = marker_path(self.run_dir, self.worker, self.n_workers, layout=self.layout)
         self._floor: Dict[int, int] = {}
         self._at_row = 0
 
@@ -247,7 +249,7 @@ class TrimLog:
         return self._at_row
 
     def publish(self, floor_rows: Dict[int, int], *, row_bytes: int,
-                at_row: Optional[int] = None) -> Dict[int, int]:
+                at_row: Optional[int] = None, extra: Optional[dict] = None) -> Dict[int, int]:
         """Record each layer's floor and this worker's consumed watermark; return the merged floor."""
         changed = False
         for layer, row in floor_rows.items():
@@ -260,14 +262,24 @@ class TrimLog:
             changed = True
         if not changed:
             return dict(self._floor)
-        body = {"format": MARKER_FORMAT, "worker": self.worker, "n_workers": self.n_workers,
+        if self.layout.kind == "hs":
+            why = (f"these rows of the shared hs_layer_*.raw files were freed with "
+                   f"fallocate(PUNCH_HOLE) after the gather delivered them ({TRIM_ENV}=1). "
+                   f"The files are still their full LENGTH and the region reads back as "
+                   f"ZEROS, so the shared files are no longer a readable artifact for these "
+                   f"rows -- the per-request delivery under 'delivered/' is.")
+        else:
+            why = (f"these rows of the shared qk_{{q,k}}_layer_*.raw files were freed with "
+                   f"fallocate(PUNCH_HOLE) after the gather delivered them ({TRIM_ENV}=1). The "
+                   f"files are still their full LENGTH and the region reads back as ZEROS, so the "
+                   f"shared files are no longer a readable artifact for these rows -- the "
+                   f"per-request delivery under 'delivered/' is.")
+        body = {"format": self.layout.trim_marker_format, "worker": self.worker,
+                "n_workers": self.n_workers,
                 "row_bytes": int(row_bytes), "at_row": int(self._at_row),
                 "floor_rows": {str(k): int(v) for k, v in sorted(self._floor.items())},
-                "why": (f"these rows of the shared hs_layer_*.raw files were freed with "
-                        f"fallocate(PUNCH_HOLE) after the gather delivered them ({TRIM_ENV}=1). "
-                        f"The files are still their full LENGTH and the region reads back as "
-                        f"ZEROS, so the shared files are no longer a readable artifact for these "
-                        f"rows -- the per-request delivery under 'delivered/' is.")}
+                "why": why}
+        body.update(extra or {})
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(body, sort_keys=True))
@@ -277,10 +289,10 @@ class TrimLog:
         return dict(self._floor)
 
 
-def published_cursors(run_dir: str, n_workers: int) -> Dict[int, int]:
+def published_cursors(run_dir: str, n_workers: int, layout=HS_LAYOUT) -> Dict[int, int]:
     """``{worker: consumed row watermark}`` from this partition's markers."""
     out: Dict[int, int] = {}
-    for p in marker_paths(run_dir):
+    for p in marker_paths(run_dir, layout):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 body = json.loads(f.read())
@@ -295,10 +307,10 @@ def published_cursors(run_dir: str, n_workers: int) -> Dict[int, int]:
     return out
 
 
-def trimmed_floor_rows(run_dir: str) -> Dict[int, int]:
+def trimmed_floor_rows(run_dir: str, layout=HS_LAYOUT) -> Dict[int, int]:
     """``{layer: first row no longer readable}`` over every worker's marker in ``run_dir``."""
     out: Dict[int, int] = {}
-    for p in marker_paths(run_dir):
+    for p in marker_paths(run_dir, layout):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 body = json.loads(f.read())
@@ -325,9 +337,9 @@ def is_reclaimed(layer: int, first_row: int, floors: Dict[int, int]) -> bool:
 
 
 def refuse_trimmed_rows(run_dir: str, layer: int, first_row: int,
-                        floors: Optional[Dict[int, int]] = None) -> None:
+                        floors: Optional[Dict[int, int]] = None, layout=HS_LAYOUT) -> None:
     """Raise :class:`TrimmedRegionError` if row ``first_row`` of ``layer`` was reclaimed."""
-    f = trimmed_floor_rows(run_dir) if floors is None else floors
+    f = trimmed_floor_rows(run_dir, layout) if floors is None else floors
     if not is_reclaimed(layer, first_row, f):
         return
     floor = int(f.get(int(layer), 0))
@@ -343,24 +355,31 @@ def refuse_trimmed_rows(run_dir: str, layer: int, first_row: int,
         run_dir=str(run_dir), layer=int(layer), first_row=int(first_row), floor_row=floor)
 
 
-def trim_status(run_dir: str) -> Dict[str, object]:
-    """What a trim took from ``run_dir``, as plain data."""
-    floors = trimmed_floor_rows(run_dir)
+def trim_status(run_dir: str, layout=HS_LAYOUT) -> Dict[str, object]:
+    """What a trim took from ``run_dir``, as plain data (Q/K adds ``holes_by_file``)."""
+    lay = _layout(layout)
+    floors = trimmed_floor_rows(run_dir, lay)
     row_bytes = 0
-    for p in marker_paths(run_dir):
+    for p in marker_paths(run_dir, lay):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 row_bytes = max(row_bytes, int(json.loads(f.read()).get("row_bytes") or 0))
         except Exception:  # noqa: BLE001
             pass
-    holes = {}
-    for p in sorted(glob.glob(os.path.join(run_dir, "hs_layer_*.raw"))):
-        m = re.search(r"hs_layer_(\d+)\.raw$", p)
-        if m:
-            holes[int(m.group(1))] = first_hole(p)
-    return {"trimmed": bool(floors), "floor_rows": dict(floors), "row_bytes": row_bytes,
-            "floor_bytes": {L: r * row_bytes for L, r in floors.items()} if row_bytes else {},
-            "markers": [os.path.basename(p) for p in marker_paths(run_dir)], "holes": holes}
+    by_file: Dict[str, Dict[int, Optional[int]]] = {}
+    for prefix in lay.prefixes:
+        rx = lay.layer_re(prefix)
+        by_file[prefix] = {int(m.group(1)): first_hole(p)
+                           for p in sorted(glob.glob(os.path.join(run_dir, f"{prefix}_*.raw")))
+                           for m in [rx.match(os.path.basename(p))] if m}
+    out: Dict[str, object] = {
+        "trimmed": bool(floors), "floor_rows": dict(floors), "row_bytes": row_bytes,
+        "floor_bytes": {L: r * row_bytes for L, r in floors.items()} if row_bytes else {},
+        "markers": [os.path.basename(p) for p in marker_paths(run_dir, lay)],
+        "holes": by_file[lay.anchor]}
+    if lay.kind != "hs":
+        out["holes_by_file"] = by_file
+    return out
 
 
 __all__ = ["ALIGN_ENV", "CHUNK_ENV", "DEFAULT_CHUNK_BYTES", "DEFAULT_LAG_BYTES",

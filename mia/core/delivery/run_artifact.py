@@ -22,7 +22,7 @@ from mia.errors import MiaDeliveryError
 from mia.core.delivery.artifact_writer import write_artifact
 from mia.core.delivery.delivered_probes import merge_disk
 from mia.core.runtime.tp_shard import rank_dir_name
-from mia.artifacts import QK_REFUSED_FILE, load_and_merge_hs_cache
+from mia.artifacts import QK_REFUSED_FILE, load_and_merge_hs_cache, note_refused_qk
 
 RUN_FORMAT = "mia-run-v1"
 RUN_MANIFEST = "mia_run.json"
@@ -245,6 +245,33 @@ def append(hook_dir: str, run_id: str, *, kind: str, items: Iterable[Tuple[str, 
                 return keys
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def note_refused(hook_dir: str, run_id: str, *, kind: str, refused: Dict[str, str], unit=None,
+                 stamp=None, nonce=None, start=None) -> None:
+    """Record requests whose artifact will not be written: qk_refused.json, then the manifest."""
+    keys = list(refused)
+    d = run_dir(hook_dir, run_id)
+    os.makedirs(d, exist_ok=True)
+
+    def _note() -> None:
+        with _proc_lock(os.path.realpath(d)):
+            with open(os.path.join(d, LOCK_NAME), "a+") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    note_refused_qk(d, refused)
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    _note()
+    try:
+        append(hook_dir, run_id, kind=kind, items=[(k, None) for k in keys], unit=unit, stamp=stamp,
+               nonce=nonce, start=start)
+    except RunArtifactError as e:
+        logger.warning("run %r under %s: refused %s not listed in %s (%s)", run_id, hook_dir, keys,
+                       RUN_MANIFEST, e)
+    # append() of a reused run id deletes the old files, qk_refused.json included: re-assert it
+    _note()
 
 
 @contextlib.contextmanager
