@@ -1,4 +1,4 @@
-"""Run-encoded per-request row index into the shared HS layer files (``MIA_APERTURE_GATHER``)."""
+"""Per-request row index into a hybrid's shared layer files (HS ``runs-v1``, QK ``qk-rows-v1``)."""
 from __future__ import annotations
 
 import glob
@@ -16,7 +16,7 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .aperture_trim import MARKER_GLOB
+from .aperture_layout import HS_LAYOUT, QK_LAYOUT, layout as _layout
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ RUN_ID_KEY = "run_id"
 INDEX_NAME = "hs_run_index.jsonl"
 SEGMENT_FMT = "hs_run_index.seg.%06d.jsonl"
 SEGMENT_RE = re.compile(r"hs_run_index\.seg\.(\d{6})\.jsonl$")
+INDEX_HEADER_KEYS = ("index", "since", "up_to", "seq", "final", RUN_ID_KEY)
 
 
 class RunIndexError(RuntimeError):
@@ -66,14 +67,16 @@ def flush_interval_ms() -> int:
     return ms
 
 
-def segment_name(seq: int) -> str:
-    return SEGMENT_FMT % int(seq)
+def segment_name(seq: int, layout=HS_LAYOUT) -> str:
+    return _layout(layout).segment_fmt % int(seq)
 
 
-def clear_chain(run_dir: str) -> None:
-    """Remove a previous launch's index chain and trim markers from ``run_dir``."""
-    stale = glob.glob(os.path.join(run_dir, "hs_run_index.seg.*.jsonl"))
-    stale += glob.glob(os.path.join(run_dir, MARKER_GLOB)) + [os.path.join(run_dir, INDEX_NAME)]
+def clear_chain(run_dir: str, layout=HS_LAYOUT) -> None:
+    """Remove a previous launch's index chain and trim markers OF THIS LAYOUT from ``run_dir``."""
+    lay = _layout(layout)
+    stale = glob.glob(os.path.join(run_dir, lay.segment_glob))
+    stale += glob.glob(os.path.join(run_dir, lay.trim_marker_glob)) + [
+        os.path.join(run_dir, lay.index_name)]
     for p in stale:
         try:
             os.remove(p)
@@ -81,11 +84,12 @@ def clear_chain(run_dir: str) -> None:
             pass
 
 
-def segment_paths(run_dir: str) -> List[str]:
-    """Every index segment in ``run_dir``, in ``seq`` order."""
-    out = [p for p in glob.glob(os.path.join(run_dir, "hs_run_index.seg.*.jsonl"))
-           if SEGMENT_RE.search(os.path.basename(p))]
-    return sorted(out, key=lambda p: int(SEGMENT_RE.search(os.path.basename(p)).group(1)))
+def segment_paths(run_dir: str, layout=HS_LAYOUT) -> List[str]:
+    """Every index segment of ``layout`` in ``run_dir``, in ``seq`` order."""
+    lay = _layout(layout)
+    out = [p for p in glob.glob(os.path.join(run_dir, lay.segment_glob))
+           if lay.segment_re.search(os.path.basename(p))]
+    return sorted(out, key=lambda p: int(lay.segment_re.search(os.path.basename(p)).group(1)))
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,9 @@ class ReqRuns:
 
 class RunIndex:
     """Run index of one shared-file HS capture, derived from its sidecar's per-step arrays."""
+
+    layout = HS_LAYOUT
+    index_name = INDEX_NAME
 
     def __init__(self, sidecar_log):
         self._log = sidecar_log
@@ -171,6 +178,10 @@ class RunIndex:
         """Whether a recorded finish could be stamped by a segment published at ``up_to``."""
         q = self._finished
         return bool(q) and q[0][1] <= int(up_to)
+
+    def stamp(self, rid: str, wm: int, n_total: int) -> tuple:
+        """The completion stamp the flusher writes for ``rid`` (HS: the bare triple)."""
+        return (rid, int(wm), int(n_total))
 
     def snapshot(self, block_lo: int = 0) -> Tuple[int, list]:
         """``(watermark, blocks[block_lo:])``, taken in the one order that is safe."""
@@ -303,6 +314,9 @@ def write_segment(path: str, header: dict, reqs: Dict[str, ReqRuns], *, since: i
     os.replace(tmp, path)
 
 
+RunIndex.write_segment = staticmethod(write_segment)
+
+
 def read_run_index(path: str, *, with_stamps: bool = False):
     """Read one segment as ``(header, {req_id: ReqRuns})``, plus stamps with ``with_stamps``."""
     header: Optional[dict] = None
@@ -329,6 +343,206 @@ def read_run_index(path: str, *, with_stamps: bool = False):
     if header is None:
         raise ValueError(f"{path}: no index header")
     return (header, out, stamps) if with_stamps else (header, out)
+
+
+@dataclass(frozen=True)
+class QkReqRows:
+    """One request's Q/K step records in a window: int64 [N, 6] (ks, kn, qs, qn, pe, nc)."""
+    req_id: str
+    layers: Tuple[int, ...]
+    rows: "np.ndarray"
+    n_rows: int
+    n_steps: int
+    q_rows: int
+
+    @property
+    def own_last(self) -> int:
+        return int((self.rows[:, 0] + self.rows[:, 1]).max()) if self.n_steps else 0
+
+
+def write_qk_segment(path: str, header: dict, reqs: Dict[str, QkReqRows], *, since: int, up_to: int,
+                     seq: Optional[int] = None, final: Optional[bool] = None, stamps=None) -> None:
+    """Serialize one ``qk-rows-v1`` segment atomically: header, a line per request, then stamps."""
+    hdr = dict(header)
+    hdr["index"] = QK_LAYOUT.index_codec
+    hdr["since"] = int(since)
+    hdr["up_to"] = int(up_to)
+    if seq is not None:
+        hdr["seq"] = int(seq)
+    if final is not None:
+        hdr["final"] = bool(final)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"__header__": hdr}) + "\n")
+        for rid in sorted(reqs):
+            r = reqs[rid]
+            f.write(json.dumps({"r": r.req_id, "l": list(r.layers), "n": r.n_rows,
+                                "rows": r.rows.tolist()}) + "\n")
+        for st in sorted(stamps or (), key=lambda s: s[0]):
+            extra = st[3] if len(st) > 3 else {}
+            f.write(json.dumps({"r": st[0], "c": 1, "w": int(st[1]), "n_total": int(st[2]),
+                                **extra}) + "\n")
+    os.replace(tmp, path)
+
+
+def read_qk_run_index(path: str, *, with_stamps: bool = False):
+    """Read one ``qk-rows-v1`` segment as ``(header, {req_id: QkReqRows})`` (+ stamps)."""
+    header: Optional[dict] = None
+    out: Dict[str, QkReqRows] = {}
+    stamps: Dict[str, dict] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if i == 0:
+                header = obj["__header__"]
+                continue
+            if "rows" in obj:
+                rows = np.asarray(obj["rows"], dtype=np.int64).reshape(-1, 6)
+                out[obj["r"]] = QkReqRows(req_id=obj["r"],
+                                          layers=tuple(int(x) for x in obj["l"]), rows=rows,
+                                          n_rows=int(rows[:, 1].sum()), n_steps=int(rows.shape[0]),
+                                          q_rows=int(rows[:, 3].sum()))
+                if int(obj["n"]) != out[obj["r"]].n_rows:
+                    raise RunIndexError(f"{path} line {i}: n={obj['n']} but its rows hold "
+                                        f"{out[obj['r']].n_rows}")
+            elif obj.get("c"):
+                stamps[obj["r"]] = {"w": int(obj["w"]), "n_total": int(obj["n_total"]),
+                                    "n_steps": int(obj.get("n_steps", -1)),
+                                    "q_total": int(obj.get("q_total", -1)),
+                                    "m": obj.get("m"), "h": obj.get("h")}
+            else:
+                raise RunIndexError(f"{path} line {i}: not a row record and not a completion "
+                                    f"stamp ({sorted(obj)})")
+    if header is None:
+        raise ValueError(f"{path}: no index header")
+    if header.get("index") != QK_LAYOUT.index_codec:
+        raise RunIndexError(f"{path}: index {header.get('index')!r} is not "
+                            f"{QK_LAYOUT.index_codec!r}")
+    return (header, out, stamps) if with_stamps else (header, out)
+
+
+def read_segment(path: str, *, layout=HS_LAYOUT, with_stamps: bool = False):
+    """One segment of ``layout``'s codec."""
+    lay = _layout(layout)
+    if lay.index_codec == "runs-v1":
+        return read_run_index(path, with_stamps=with_stamps)
+    return read_qk_run_index(path, with_stamps=with_stamps)
+
+
+def _merge_reqs(prev, r):
+    if isinstance(prev, QkReqRows):
+        rows = np.concatenate([prev.rows, r.rows])
+        return QkReqRows(req_id=prev.req_id, layers=prev.layers, rows=rows,
+                         n_rows=prev.n_rows + r.n_rows, n_steps=prev.n_steps + r.n_steps,
+                         q_rows=prev.q_rows + r.q_rows)
+    return ReqRuns(req_id=prev.req_id, layers=prev.layers, runs=list(prev.runs) + list(r.runs),
+                   n_rows=prev.n_rows + r.n_rows)
+
+
+class QkRunIndex:
+    """Run index of one shared-file QK capture: a record per (step, request), ``qk-rows-v1``."""
+
+    layout = QK_LAYOUT
+    index_name = QK_LAYOUT.index_name
+
+    def __init__(self, sidecar_log):
+        self._log = sidecar_log
+        self.blocks: list = []                    # ("rows", step_start, arr[N, 8]) per step
+        self.rows_total = 0
+        self.n_steps = 0
+        self._finished: Deque[Tuple[str, int]] = deque()
+        self._asked: set = set()
+        self._meta: Dict[str, dict] = {}
+        self._tot: Dict[str, List[int]] = {}      # rid -> [n_steps, q_total]
+
+    def note_step(self, step_start: int, n_rows: int, block=None) -> None:
+        if int(step_start) != int(self.rows_total):
+            raise RunIndexError(
+                f"the QK index's watermark is {self.rows_total} but the step reaching it starts "
+                f"at {step_start}: a step was dropped, re-ordered, or indexed twice (the drain's "
+                f"FIFO makes file row == logical row)")
+        if block is not None:
+            if block[0] != "rows":
+                raise RunIndexError(f"the QK sidecar kept the step at {step_start} as entry "
+                                    f"objects rather than arrays; the run index derives from the "
+                                    f"arrays and will not guess")
+            self.blocks.append(("rows", int(step_start), block[1]))
+        elif int(n_rows) > 0:
+            raise RunIndexError(f"a QK step of {n_rows} rows at {step_start} carries no records: "
+                                f"rows no request owns")
+        self.rows_total = int(step_start) + int(n_rows)
+        self.n_steps += 1
+
+    def note_finish(self, req_id, asked: bool = False, meta: Optional[dict] = None) -> None:
+        rid = str(req_id)
+        if asked:
+            self._asked.add(rid)
+            self._meta[rid] = dict(meta or {})
+        self._finished.append((rid, int(self.rows_total)))
+
+    pop_asked = RunIndex.pop_asked
+    take_finished = RunIndex.take_finished
+    has_finished = RunIndex.has_finished
+
+    def snapshot(self, block_lo: int = 0) -> Tuple[int, list]:
+        wm = self.rows_total                      # watermark before the blocks
+        return int(wm), self.blocks[int(block_lo):]
+
+    def encode(self, *, up_to: Optional[int] = None, since: int = 0,
+               blocks: Optional[list] = None) -> Dict[str, QkReqRows]:
+        if blocks is not None and up_to is None:
+            raise RunIndexError("encode(blocks=...) needs the up_to the snapshot was taken with")
+        if blocks is None:
+            snap_wm, blocks = self.snapshot()
+        else:
+            snap_wm = int(up_to)
+        wm = snap_wm if up_to is None else int(up_to)       # an explicit up_to caps the window
+        lo = int(since)
+        if not blocks or wm <= lo:
+            return {}
+        rid_vals, lay_lists = self._log.req_ids(), self._log.layer_lists()
+        big = np.concatenate([b[2] for b in blocks]) if len(blocks) > 1 else blocks[0][2]
+        big = big[(big[:, 1] >= lo) & (big[:, 1] < wm)]
+        if big.size == 0:
+            return {}
+        if int((big[:, 1] + big[:, 2]).max()) > wm:
+            raise RunIndexError("a QK record runs past the published watermark: a step was split "
+                                "across segments")
+        big = big[np.lexsort((big[:, 1], big[:, 0]))]             # by request, then step order
+        out: Dict[str, QkReqRows] = {}
+        for part in np.split(big, np.flatnonzero(np.diff(big[:, 0])) + 1):
+            r, li = int(part[0, 0]), int(part[0, 7])
+            for other in np.unique(part[:, 7]).tolist():
+                if sorted(lay_lists[int(other)]) != sorted(lay_lists[li]):
+                    raise RunIndexError(f"request {rid_vals[r]!r} was recorded with two different "
+                                        f"layer SETS")
+            rows = np.ascontiguousarray(part[:, 1:7], dtype=np.int64)
+            out[rid_vals[r]] = QkReqRows(req_id=rid_vals[r], layers=tuple(lay_lists[li]), rows=rows,
+                                         n_rows=int(rows[:, 1].sum()), n_steps=int(rows.shape[0]),
+                                         q_rows=int(rows[:, 3].sum()))
+        return out
+
+    def accumulate(self, rid: str, r: QkReqRows) -> None:
+        t = self._tot.setdefault(rid, [0, 0])
+        t[0] += r.n_steps
+        t[1] += r.q_rows
+
+    def stamp(self, rid: str, wm: int, n_total: int) -> tuple:
+        n_steps, q_total = self._tot.pop(rid, [0, 0])
+        meta = self._meta.pop(rid, {})
+        return (rid, int(wm), int(n_total), {"n_steps": int(n_steps), "q_total": int(q_total),
+                                              "m": meta.get("m"), "h": meta.get("h")})
+
+    write_segment = staticmethod(write_qk_segment)
+
+    def write(self, path: str, header: dict, *, up_to: Optional[int] = None,
+              since: int = 0) -> None:
+        wm, blocks = self.snapshot() if up_to is None else (int(up_to), None)
+        write_qk_segment(path, header, self.encode(up_to=wm, since=since, blocks=blocks),
+                         since=int(since), up_to=wm)
 
 
 class ChainCursor:
@@ -411,35 +625,31 @@ class ChainCursor:
         return out
 
 
-def read_run_segments(run_dir: str, *, expect_run_id: Optional[str] = None
-                      ) -> Tuple[dict, Dict[str, ReqRuns], Dict[str, dict]]:
-    """Read the whole segment chain as ``(header, {req_id: ReqRuns}, {req_id: stamp})``."""
-    paths = segment_paths(run_dir)
+def read_run_segments(run_dir: str, *, expect_run_id: Optional[str] = None, layout=HS_LAYOUT
+                      ) -> Tuple[dict, dict, Dict[str, dict]]:
+    """Read ``layout``'s segment chain as ``(header, {req_id: rows}, {req_id: stamp})``."""
+    lay = _layout(layout)
+    paths = segment_paths(run_dir, layout=lay)
     if not paths:
         raise RunIndexError(
-            f"{run_dir}: no index segments ({SEGMENT_FMT % 0}...). Either the run was not captured "
-            f"with {FLUSH_MS_ENV} set, or it wrote only the close-time {INDEX_NAME}.")
+            f"{run_dir}: no index segments ({lay.segment_fmt % 0}...). Either the run was not "
+            f"captured with {FLUSH_MS_ENV} set, or it wrote only the close-time {lay.index_name}.")
     header: Optional[dict] = None
-    reqs: Dict[str, ReqRuns] = {}
+    reqs: dict = {}
     cur = ChainCursor(expect_run_id=expect_run_id)
     for p in paths:
-        hdr, seg, stamps = read_run_index(p, with_stamps=True)
+        hdr, seg, stamps = read_segment(p, layout=lay, with_stamps=True)
         cur.feed(p, hdr, seg, stamps)
         if header is None:
             header = hdr
         for rid, r in seg.items():
             prev = reqs.get(rid)
-            if prev is None:
-                reqs[rid] = r
-            else:
-                reqs[rid] = ReqRuns(req_id=rid, layers=prev.layers,
-                                    runs=list(prev.runs) + list(r.runs),
-                                    n_rows=prev.n_rows + r.n_rows)
+            reqs[rid] = r if prev is None else _merge_reqs(prev, r)
     return header, reqs, cur.complete
 
 
 class RunIndexFlusher:
-    """Publishes a :class:`RunIndex` mid-run as a chain of atomically replaced segments."""
+    """Publishes a :class:`RunIndex` (or :class:`QkRunIndex`) mid-run as replaced segments."""
 
     def __init__(self, index: RunIndex, run_dir: str, header: dict, interval_ms: int,
                  *, name: str = "hs run index", run_id: Optional[str] = None):
@@ -512,9 +722,12 @@ class RunIndexFlusher:
             cpu0 = time.thread_time()
             reqs = self._index.encode(up_to=wm, since=self._since, blocks=blocks)
             enc_ms = (time.perf_counter() - t0) * 1e3
+            acc = getattr(self._index, "accumulate", None)
             for rid, r in reqs.items():
                 self._rows[rid] = self._rows.get(rid, 0) + r.n_rows
-            stamps: List[Tuple[str, int, int]] = []
+                if acc is not None:
+                    acc(rid, r)
+            stamps: List[tuple] = []
             for rid, wm_r in self._index.take_finished(wm):
                 n_total = self._rows.pop(rid, None)
                 if self._index.pop_asked(rid) and n_total is None:
@@ -522,13 +735,13 @@ class RunIndexFlusher:
                 if n_total is None:
                     self.skipped_stamps += 1
                     continue
-                stamps.append((rid, wm_r, n_total))
+                stamps.append(self._index.stamp(rid, wm_r, n_total))
             if wm == self._since and not final and not stamps:
                 return None
-            path = os.path.join(self._run_dir, segment_name(self._seq))
+            path = os.path.join(self._run_dir, self._index.layout.segment_fmt % self._seq)
             tw = time.perf_counter()
-            write_segment(path, self._header, reqs, since=self._since, up_to=wm, seq=self._seq,
-                          final=bool(final), stamps=stamps)
+            self._index.write_segment(path, self._header, reqs, since=self._since, up_to=wm,
+                                      seq=self._seq, final=bool(final), stamps=stamps)
             write_ms = (time.perf_counter() - tw) * 1e3
             j = 0
             while j + 1 < len(blocks) and int(blocks[j + 1][1]) <= wm:

@@ -313,7 +313,8 @@ def qk_pass_rows(n_q: int, prefix_ends: List[int], mode: str) -> List[int]:
 
 
 def qk_probes(payload: dict, *, n_prompt: int, n_gen: int, hookq_mode: Optional[str] = None,
-              hooks_on: Optional[str] = None, layout: str = "rpc") -> Optional[dict]:
+              hooks_on: Optional[str] = None, layout: str = "rpc",
+              share_storage: bool = False) -> Optional[dict]:
     """One request's delivered Q/K in an eager shape, or None when it captured nothing."""
     if layout not in ("rpc", "disk"):
         raise ValueError(f"layout must be 'rpc' or 'disk', not {layout!r}")
@@ -346,8 +347,17 @@ def qk_probes(payload: dict, *, n_prompt: int, n_gen: int, hookq_mode: Optional[
         passes = [q[i] for i in range(q.shape[0])] if mode == "last_token" else list(
             torch.split(q, sizes))
         if layout == "disk":
-            cache[name] = {"q": [p.clone() for p in passes], "layer_num": layer,
-                           "hookq_mode": mode, "k_full": [full.clone()], "k_prefix_ends": [ends]}
+            if share_storage:
+                # passes share one storage, so torch.save writes it once
+                qc = q.contiguous()
+                passes = ([qc[i] for i in range(qc.shape[0])] if mode == "last_token"
+                          else list(torch.split(qc, sizes)))
+                cache[name] = {"q": passes, "layer_num": layer, "hookq_mode": mode,
+                               "k_full": [full.contiguous()], "k_prefix_ends": [ends]}
+            else:
+                cache[name] = {"q": [p.clone() for p in passes], "layer_num": layer,
+                               "hookq_mode": mode, "k_full": [full.clone()],
+                               "k_prefix_ends": [ends]}
             continue
         q_st = (pad_sequence(passes, batch_first=True) if mode == "all_tokens"
                 else torch.stack(passes))

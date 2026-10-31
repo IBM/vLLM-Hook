@@ -93,8 +93,9 @@ def save_qk_cache_safetensors(cpu_cache: dict, run_dir: str,
         meta["compact_all_tokens"] = True
         meta["k_full_lens"] = k_full_lens
         meta["k_prefix_ends"] = k_prefix_ends
-    if isinstance(cpu_cache.get("tp_shard"), dict):
-        meta["tp_shard"] = dict(cpu_cache["tp_shard"])
+    for key in ("tp_shard", "tp_shards"):
+        if isinstance(cpu_cache.get(key), dict):
+            meta[key] = dict(cpu_cache[key])
     save_safetensors_atomic(flat_dict, meta, run_dir, "qk")
 
 

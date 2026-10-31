@@ -274,12 +274,14 @@ def _worker_tp_rank(worker) -> int:
     return resolve_tp_coords(worker)[0]
 
 
-def _attach_tp_shard(payload: dict, worker) -> dict:
-    shard = getattr(worker, "_qk_shard", None)
-    if shard is not None and shard.tp_size > 1:
+def _attach_tp_shard(payload: dict, shards) -> dict:
+    if shards and shards[0].tp_size > 1:
         # lazy: keep mia.core.runtime out of import mia
-        from mia.core.runtime.tp_shard import TP_SHARD_KEY
-        payload[TP_SHARD_KEY] = shard.as_header()
+        from mia.core.runtime.tp_shard import TP_SHARD_KEY, TP_SHARDS_KEY, qk_layer_shard_map
+        payload[TP_SHARD_KEY] = shards[0].as_header()
+        per_layer = qk_layer_shard_map(shards)
+        if per_layer:
+            payload[TP_SHARDS_KEY] = per_layer
     return payload
 
 
@@ -287,7 +289,7 @@ def _marshal_qk_error(msg: str) -> bytes:
     return _ZSTD_COMPRESSOR.compress(pickle.dumps({"mia_error": str(msg)}))
 
 
-def _marshal_perreq_qk(per_layer: dict, conf: dict, hookq_mode: str, shard=None,
+def _marshal_perreq_qk(per_layer: dict, conf: dict, hookq_mode: str, shards=None,
                        module_names=None) -> bytes:
     qk_cache = {}
     for layer, rec in per_layer.items():
@@ -303,10 +305,7 @@ def _marshal_perreq_qk(per_layer: dict, conf: dict, hookq_mode: str, shard=None,
     payload = {"qk_cache": qk_cache, "config": conf}
     if module_names:
         payload["module_names"] = {int(L): str(n) for L, n in module_names.items()}
-    if shard is not None and shard.tp_size > 1:
-        # lazy: keep mia.core.runtime out of import mia
-        from mia.core.runtime.tp_shard import TP_SHARD_KEY
-        payload[TP_SHARD_KEY] = shard.as_header()
+    _attach_tp_shard(payload, shards)
     return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
 
 
@@ -379,6 +378,7 @@ class QKCaptureWorker:
         tp_rank, tp_size = resolve_tp_coords(self)
         self._tp_rank = tp_rank
         shards = qk_layer_shards(text_layer_geometry(text_cfg), tp_rank, tp_size)
+        self._qk_shards = shards
         self._qk_shard = shards[0]
         self._should_capture = True
         if tp_size > 1 and self._score_mode_default:
@@ -660,7 +660,7 @@ class QKCaptureWorker:
                 stash[str(req_id)] = _marshal_qk_error(str(per_layer))
                 continue
             stash[str(req_id)] = _marshal_perreq_qk(per_layer, conf, mode,
-                                                    getattr(self, "_qk_shard", None), names)
+                                                    getattr(self, "_qk_shards", None), names)
         return stash
 
     def clear_aperture_request(self, external_req_id: str) -> None:
@@ -719,10 +719,12 @@ class QKCaptureWorker:
         """collective_rpc-callable: module names, config and whether the per-request drain is on."""
         drain = getattr(self, "_qk_drain", None)
         names = getattr(self, "_qk_module_names", None) or {}
+        gp = getattr(drain, "_gather_proc", None)
         return {"names": [[int(L), str(n)] for L, n in sorted(names.items())],
                 "config": dict(getattr(self, "_conf", {}) or {}),
                 "per_request": bool(drain is not None and getattr(drain, "per_request", False)),
-                "delivery_dir": None}
+                "delivery_dir": os.path.abspath(gp.out_dir) if gp is not None else None,
+                "run_id": gp.run_id if gp is not None else None, "kind": "qk"}
 
     def aperture_residency(self):
         """Read-only (host_live_count, disk_residency) query for the off-loop QK per-request path."""
@@ -831,7 +833,7 @@ class QKCaptureWorker:
                 census_emit(census_record(worker="qk", sink="rpc", req_id=req_id,
                                            bucket=_census_bucket, acc=_census_acc))
             payload = {"qk_cache": cpu_dict, "config": self._conf}
-            _attach_tp_shard(payload, self)
+            _attach_tp_shard(payload, getattr(self, "_qk_shards", None))
             with PROF.timed("worker.compress.qk"):
                 with PROF.timed("compress.qk.pickle"):
                     raw = pickle.dumps(payload)
@@ -1019,7 +1021,7 @@ class QKCaptureWorker:
         os.makedirs(run_dir, exist_ok=True)
         # A reused run_id: no barrier or reader may take the previous artifact for this one.
         clear_rank_artifact(run_dir, "qk")
-        _attach_tp_shard(cpu_cache, self)
+        _attach_tp_shard(cpu_cache, getattr(self, "_qk_shards", None))
 
         has_scores = any("scores" in e for e in cpu_cache["qk_cache"].values())
         quant_on = any("q_qmeta" in e for e in cpu_cache["qk_cache"].values())

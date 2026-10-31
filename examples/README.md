@@ -91,7 +91,7 @@ Three things to know before you try it:
   [`docs/configs.md`](../docs/configs.md#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)
   for the constraint.
 - **Q/K `score` capture requires TP = 1.** Raw Q/K shards fine; the rebuilt per-head scores do
-  not. Q/K capture on per-layer-geometry models (Gemma 4) also requires TP = 1.
+  not.
 - **Pipeline parallelism is refused**, not merely untested — under PP each rank holds only its
   own stage's layers and the rest are identity placeholders that the layer matcher would hook
   anyway, so capture would return zero-filled rows for every off-stage layer.

@@ -7,12 +7,14 @@ import os
 import numpy as np
 import torch
 
+from .aperture_layout import QK_LAYOUT
 from .aperture_metadata import read_qk_sidecar, read_sidecar
 from .aperture_run_index import INDEX_NAME, read_run_index, read_run_segments, run_slices
 from .aperture_trim import is_reclaimed, refuse_trimmed_rows, trimmed_floor_rows
 from .aperture_trim import TrimmedRegionError, trim_status  # noqa: F401  (re-exported)
 from mia.core.runtime.tp_shard import (
     TPShardError,
+    _layer_shard,
     check_complete_shard_set,
     check_hs_shard_set,
     discover_rank_dirs,
@@ -23,6 +25,7 @@ from mia.core.runtime.tp_shard import (
     merge_hs_layer_maps,
     parse_rank_dir,
     qk_shard_from_header,
+    qk_shards_from_header,
 )
 
 
@@ -90,8 +93,10 @@ def _np_dtype_for(dtype_name: str):
         raise ValueError(f"unsupported dtype {dtype_name!r} in aperture header")
 
 
-def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = None) -> dict:
-    """Reconstruct per-request, per-layer QK tensors from a QK aperture dump and its sidecar."""
+def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = None, *,
+                                         skip_trimmed: bool = False,
+                                         reclaimed_out: dict | None = None) -> dict:
+    """Rebuild per-request, per-layer QK tensors; trimmed requests are refused or skipped."""
     if meta_path is None:
         meta_path = os.path.join(run_dir, "qk_aperture_meta.jsonl")
     header, entries = read_qk_sidecar(meta_path)
@@ -118,6 +123,7 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
     for e in entries:
         grouped.setdefault((e.req_id, e.layer), []).append(e)
 
+    floors = trimmed_floor_rows(run_dir, layout=QK_LAYOUT)
     out: dict = {}
     for (req_id, layer), es in grouped.items():
         es.sort(key=lambda e: e.k_start)
@@ -128,6 +134,12 @@ def load_multilayer_qk_aperture_artifact(run_dir: str, meta_path: str | None = N
                 f"(prefix caching). k_full would be short by the cached prefix; refusing to "
                 f"return a wrong k_all. Capture with prefix caching off (the graph default) or "
                 f"eager.")
+        # the lowest k row is the request's lowest row
+        if floors and es and is_reclaimed(layer, es[0].k_start, floors):
+            if not skip_trimmed:
+                refuse_trimmed_rows(run_dir, layer, es[0].k_start, floors, layout=QK_LAYOUT)
+            _note_reclaimed(reclaimed_out, req_id, layer)
+            continue
 
         kmm = _mm(k_mmaps, f"qk_k_layer_{layer}.raw", layer, k_dtype, _row_shape("k", layer))
 
@@ -331,6 +343,7 @@ def merge_qk_aperture_ranks(rank_dirs, meta_paths=None, *, check_replicas: bool 
     order = check_complete_shard_set(shards)
     arts = [load_multilayer_qk_aperture_artifact(rank_dirs[i], meta_paths[i]) for i in order]
     ranked = [shards[i] for i in order]
+    layer_shards = [qk_shards_from_header(headers[i]) for i in order]
 
     keys0 = {(r, L) for r, per in arts[0].items() for L in per}
     for s, art in zip(ranked[1:], arts[1:]):
@@ -354,9 +367,10 @@ def merge_qk_aperture_ranks(rank_dirs, meta_paths=None, *, check_replicas: bool 
         if len(per_rank) == 1:  # one TP=1 rank: nothing to merge, widths may vary per layer
             q, k_full = per_rank[0]["q"], per_rank[0]["k_full"]
         else:
-            q = merge_head_tensors("q", [(s, e["q"]) for s, e in zip(ranked, per_rank)],
+            shards_l = [_layer_shard(sh, layer) for sh in layer_shards]
+            q = merge_head_tensors("q", [(s, e["q"]) for s, e in zip(shards_l, per_rank)],
                                    check_replicas)
-            k_full = merge_head_tensors("k", [(s, e["k_full"]) for s, e in zip(ranked, per_rank)],
+            k_full = merge_head_tensors("k", [(s, e["k_full"]) for s, e in zip(shards_l, per_rank)],
                                         check_replicas)
         out.setdefault(req_id, {})[layer] = {
             "q": q,

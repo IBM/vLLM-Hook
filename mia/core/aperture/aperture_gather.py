@@ -7,7 +7,6 @@ import logging
 import multiprocessing
 import os
 import queue as _queue
-import re
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -16,15 +15,18 @@ from urllib.parse import quote
 import numpy as np
 import torch
 
-from .aperture_run_index import (RUN_ID_KEY, ChainCursor, RunIndexError, read_run_index,
-                                 segment_name, segment_paths)
+from .aperture_layout import HS_LAYOUT, QK_LAYOUT, QK_SIDECAR_NAME, layout as _layout
+from .aperture_run_index import (INDEX_HEADER_KEYS, RUN_ID_KEY, ChainCursor, RunIndexError,
+                                 read_run_index, read_segment, segment_name, segment_paths)
 from .aperture_trim import (TRIM_ENV as GATHER_TRIM_ENV, TrimError, TrimLog, align_down,
                             floor_row_for_bytes, is_reclaimed, published_cursors, punch_hole,
                             punch_supported, trim_align, trim_chunk_bytes, trim_enabled,
                             trim_explicit, trim_lag_bytes, trimmed_floor_rows)
 from mia.core.runtime.cpu_budget import allocated_cpus
 from mia.core.runtime.tp_shard import (
+    QK_SHARD_FIELDS,
     RANK_DIR_PREFIX,
+    TP_SHARDS_KEY,
     HSShard,
     TPShardError,
     check_hs_shard_set,
@@ -38,7 +40,7 @@ from mia.core.runtime.tp_shard import (
     parse_rank_dir,
     rank_dir_name,
 )
-from mia.errors import MiaRefusal
+from mia.errors import MiaDeliveryError, MiaRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,8 @@ DELIVERY_FORMAT = "hs-layer-runs-v1"
 
 RANK_MARKER_NAME = "delivery.rank.json"
 RANK_MARKER_FORMAT = "hs-delivery-rank-v1"
+
+QK_DELIVERY_FORMAT = QK_LAYOUT.delivery_format
 
 DEFAULT_BATCH_BYTES = 256 << 20
 
@@ -93,6 +97,10 @@ class DeliveryTimeoutError(GatherError):
         super().__init__(msg)
         self.missing = dict(missing or {})
         self.roots = list(roots or [])
+
+
+class QKRankTimeoutError(DeliveryTimeoutError, MiaDeliveryError):
+    """A TP rank's Q/K slice never landed: a timeout, so callers raise it, not a refusal."""
 
 
 def delivery_enabled() -> bool:
@@ -279,14 +287,15 @@ def _no_punch_warning(run_dir: str, why: str) -> str:
 
 
 class _ReqState:
-    __slots__ = ("layers", "mine", "written", "written_all", "touched")
+    __slots__ = ("layers", "mine", "written", "written_all", "touched", "rows")
 
     def __init__(self, layers: Tuple[int, ...], mine: List[int]):
         self.layers = layers
         self.mine = mine
-        self.written = 0
-        self.written_all = 0
+        self.written: Dict[str, int] = {}        # per prefix: rows written to the first owned layer
+        self.written_all: Dict[str, int] = {}    # per prefix: rows written over every owned layer
         self.touched = False
+        self.rows: List[List[int]] = []          # QK: (ks, kn, qs, qn, pe, nc) records
 
 
 class GatherPass:
@@ -297,7 +306,8 @@ class GatherPass:
                  trim: Optional[bool] = None, trim_chunk: Optional[int] = None,
                  trim_lag: Optional[int] = None, tp_rank: Optional[int] = None,
                  tp_size: int = 1, num_layers: Optional[int] = None,
-                 run_id: Optional[str] = None):
+                 run_id: Optional[str] = None, layout: str = "hs"):
+        self.layout = _layout(layout)
         if not (0 <= int(worker) < int(n_workers)):
             raise GatherError(f"worker {worker} is not in range(0, {n_workers})")
         self.run_dir = str(run_dir)
@@ -305,7 +315,7 @@ class GatherPass:
         self.tp_size = int(tp_size)
         self.num_layers = None if num_layers is None else int(num_layers)
         self.shard = None
-        if self.tp_rank is not None:
+        if self.tp_rank is not None and self.layout.kind == "hs":
             if self.num_layers is None:
                 raise GatherError(
                     "a layer-sharded gather needs num_layers: the shard rule (and so which layers "
@@ -318,7 +328,7 @@ class GatherPass:
             if named is None or int(named) != self.tp_rank:
                 raise GatherError(
                     f"{self.out_dir} is not tp_rank {self.tp_rank}'s delivery root (its last path "
-                    f"component must be tp_rank_{self.tp_rank}). Under the HS layer shard the rank "
+                    f"component must be tp_rank_{self.tp_rank}). Under a TP shard the rank "
                     f"is part of the PATH: without it every rank writes the same manifest name "
                     f"into the same request directory and a reader hands back whichever wrote "
                     f"last as the whole artifact.")
@@ -330,14 +340,17 @@ class GatherPass:
         self.run_id = None if run_id is None else str(run_id)
         self._cursor = ChainCursor(expect_run_id=self.run_id)
         self._reqs: Dict[str, _ReqState] = {}
+        self._finalized: set = set()             # Q/K ids whose completion stamp was consumed
         self._header: Optional[dict] = None
         self._row_bytes = 0
-        self._fds: Dict[int, int] = {}
+        self._rb: Dict[str, int] = {}
+        self._max_rb = 0
+        self._fds: Dict[Tuple[str, int], int] = {}
         self.trim = trim_enabled() if trim is None else bool(trim)
         self.trim_chunk = int(trim_chunk) if trim_chunk is not None else trim_chunk_bytes()
         self.trim_lag = int(trim_lag) if trim_lag is not None else trim_lag_bytes()
         self._trim_align = 0
-        self._trimmed: Dict[int, int] = {}
+        self._trimmed: Dict[Tuple[str, int], int] = {}   # (prefix, layer) -> bytes punched
         self._trimlog: Optional[TrimLog] = None
         self._trim_layers: Optional[List[int]] = None
         self._trim_reported = -1.0
@@ -361,7 +374,46 @@ class GatherPass:
             f.write(json.dumps(man, sort_keys=True))
         os.replace(tmp, path)
 
+    def _geometry(self, hdr: dict) -> None:
+        self._rb = ({self.layout.anchor: _row_bytes(hdr)} if self.layout.kind == "hs"
+                    else self.layout.row_bytes(hdr))
+        self._row_bytes = self._rb[self.layout.anchor]
+        self._geom_hdr = dict(hdr)
+        self._rbl: Dict[Tuple[str, int], int] = {}
+        n = int(hdr.get("num_layers") or 0) if self.layout.kind == "qk" else 0
+        self._max_rb = max([*self._rb.values(),
+                            *(self._rb_of(p, L) for p in self._rb for L in range(n))])
+
+    def _rb_of(self, prefix: str, layer: int) -> int:
+        """Bytes per row of ``prefix``'s file for ``layer`` (Q/K widths may differ per layer)."""
+        if self.layout.kind == "hs":
+            return self._rb[prefix]
+        key = (prefix, int(layer))
+        if key not in self._rbl:
+            self._rbl[key] = self.layout.row_bytes(self._geom_hdr, int(layer))[prefix]
+        return self._rbl[key]
+
+    def _file_runs(self, payload: list) -> Dict[str, list]:
+        """Per shared file, the runs of rows to cut: HS's run list; QK's k/q spans per record."""
+        if self.layout.kind == "hs":
+            return {self.layout.anchor: payload}
+        return {"qk_k_layer": [(ks, 1, kn) for ks, kn, _qs, _qn, _pe, _nc in payload if kn > 0],
+                "qk_q_layer": [(qs, 1, qn) for _ks, _kn, qs, qn, _pe, _nc in payload if qn > 0]}
+
     def _check_shard_header(self, hdr: dict) -> None:
+        if self.layout.kind == "qk":
+            if hdr.get("index") != self.layout.index_codec:
+                raise GatherError(f"{self.run_dir}: the index chain is {hdr.get('index')!r}, not "
+                                  f"{self.layout.index_codec!r} -- this Q/K gather would "
+                                  f"misread it")
+            size = int(hdr.get("tp_size", 1) or 1)
+            got = (int(hdr.get("tp_rank", 0) or 0) if size > 1 else None, size)
+            if got != (self.tp_rank, self.tp_size):
+                raise GatherError(f"{self.run_dir}: the index header is (tp_rank, tp_size) {got} "
+                                  f"but this Q/K gather is armed for "
+                                  f"{(self.tp_rank, self.tp_size)}, so its delivery would land in "
+                                  f"another rank's dir. Refusing.")
+            return
         try:
             got = hs_shard_from_header(hdr)
         except TPShardError as e:
@@ -394,10 +446,15 @@ class GatherPass:
                   "tp_rank": self.tp_rank, "tp_size": self.tp_size,
                   "final_seen": self.final_seen, "at_row": self._cursor.lo,
                   "live": len(self._reqs), "trim": self.trim,
-                  "trim_floor_rows": (floor_row_for_bytes(min(self._trimmed.values()),
-                                                          self._row_bytes)
-                                      if self._trimmed and self._row_bytes else 0)})
+                  "trim_floor_rows": self._trim_floor_rows()})
         return d
+
+    def _trim_floor_rows(self) -> int:
+        """The floor the anchor file's punches imply."""
+        anchored = [v for (p, _L), v in self._trimmed.items() if p == self.layout.anchor]
+        if not anchored or not self._row_bytes:
+            return 0
+        return floor_row_for_bytes(min(anchored), self._row_bytes)
 
     def close(self) -> None:
         for fd in self._fds.values():
@@ -422,23 +479,24 @@ class GatherPass:
         out: List[tuple] = []
         rows = 0
         while True:
-            path = os.path.join(self.run_dir, segment_name(self._cursor.seq + len(out)))
+            path = os.path.join(self.run_dir,
+                                self.layout.segment_fmt % (self._cursor.seq + len(out)))
             if not os.path.exists(path):
                 if not out:
                     self._refuse_a_hole()
                 break
-            hdr, reqs, stamps = read_run_index(path, with_stamps=True)
+            hdr, reqs, stamps = read_segment(path, layout=self.layout, with_stamps=True)
             out.append((path, hdr, reqs, stamps))
             if self._row_bytes == 0:
-                self._row_bytes = _row_bytes(hdr)
+                self._geometry(hdr)
             rows += int(hdr["up_to"]) - int(hdr["since"])
-            if bool(hdr.get("final")) or rows >= max(1, self.batch_bytes // self._row_bytes):
+            if bool(hdr.get("final")) or rows >= max(1, self.batch_bytes // self._max_rb):
                 break
         return out
 
     def _refuse_a_hole(self) -> None:
         want = self._cursor.seq
-        later = [p for p in segment_paths(self.run_dir)
+        later = [p for p in segment_paths(self.run_dir, layout=self.layout)
                  if int(os.path.basename(p).split(".")[2]) > want]
         if later:
             raise RunIndexError(
@@ -451,30 +509,43 @@ class GatherPass:
         merged: Dict[str, Tuple[Tuple[int, ...], list]] = {}
         lo = hi = self._cursor.lo
         final = False
+        closed: set = set()                      # stamped by an earlier segment of this batch
         for path, hdr, reqs, stamps in batch:
-            ready.extend(self._cursor.feed(path, hdr, reqs, stamps))
+            new = self._cursor.feed(path, hdr, reqs, stamps)
+            ready.extend(new)
             if self._header is None:
                 self._check_shard_header(hdr)
                 self._header = dict(hdr)
-                self._row_bytes = _row_bytes(hdr)
+                self._geometry(hdr)
             hi = int(hdr["up_to"])
             final = final or bool(hdr.get("final"))
+            for rid in reqs:
+                if self.layout.kind == "qk" and (rid in self._finalized or rid in closed):
+                    raise GatherError(
+                        f"{rid!r}: rows for this request arrive in {os.path.basename(path)} after "
+                        f"its completion stamp was consumed -- the stamp did not close the "
+                        f"request. Re-opening it would truncate or grow a delivered artifact "
+                        f"under its manifest; refusing before any file is touched.")
             for rid, r in reqs.items():
                 layers = tuple(int(x) for x in r.layers)
                 if rid not in self._reqs:
                     self._reqs[rid] = _ReqState(
                         layers, layers_for_worker(list(layers), self.worker, self.n_workers))
+                payload = list(r.runs) if self.layout.kind == "hs" else r.rows.tolist()
+                if self.layout.kind == "qk":
+                    self._reqs[rid].rows.extend(payload)
                 prev = merged.get(rid)
-                merged[rid] = (layers, (list(prev[1]) if prev else []) + list(r.runs))
+                merged[rid] = (layers, (list(prev[1]) if prev else []) + payload)
+            closed.update(rid for rid, _st in new)
             self._stats["segments"] += 1
             self._stats["windows"] += 1
         self._stats["batches"] += 1
-        self._floors = trimmed_floor_rows(self.run_dir)
+        self._floors = trimmed_floor_rows(self.run_dir, layout=self.layout)
         if hi > lo:
             self._scatter_window(lo, hi, merged)
         # Manifests only after the window's rows are written: a reader trusts a manifest.
         for rid, stamp in ready:
-            self._finalize(rid, int(stamp["n_total"]))
+            self._finalize(rid, stamp)
         if final:
             self.final_seen = True
             self.close()
@@ -484,33 +555,34 @@ class GatherPass:
 
     def _scatter_window(self, lo: int, hi: int,
                         merged: Dict[str, Tuple[Tuple[int, ...], list]]) -> None:
-        plan: Dict[int, List[Tuple[str, list]]] = {}
-        for rid, (_layers, runs) in merged.items():
+        plan: Dict[Tuple[str, int], List[Tuple[str, list]]] = {}
+        for rid, (_layers, payload) in merged.items():
             st = self._reqs[rid]
             if not st.mine:
                 continue
             self._touch(rid, st)
-            if not runs:
-                continue
-            for L in st.mine:
-                plan.setdefault(L, []).append((rid, list(runs)))
+            for prefix, runs in self._file_runs(payload).items():
+                if not runs:
+                    continue
+                for L in st.mine:
+                    plan.setdefault((prefix, L), []).append((rid, list(runs)))
         if not plan:
             return
-        chunk_rows = max(1, self.batch_bytes // max(1, self._row_bytes))
+        chunk_rows = max(1, self.batch_bytes // max(1, self._max_rb))
         for c0 in range(lo, hi, chunk_rows):
             c1 = min(c0 + chunk_rows, hi)
             self._stats["chunks"] += 1
-            for L, owners in plan.items():
+            for (prefix, L), owners in plan.items():
                 clipped = [(rid, [c for c in (clip_run(run, c0, c1) for run in runs)
                                   if c is not None]) for rid, runs in owners]
                 clipped = [(rid, cs) for rid, cs in clipped if cs]
                 if not clipped:
                     continue
-                buf = self._read_rows(L, c0, c1 - c0)
+                buf = self._read_rows(prefix, L, c0, c1 - c0)
                 for rid, cs in clipped:
                     parts = [buf[b - c0: b - c0 + st * n: st] for b, st, n in cs]
                     block = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
-                    self._append(rid, L, block)
+                    self._append(rid, prefix, L, block)
 
     def _resolve_trim(self) -> bool:
         if self._trim_align:
@@ -519,14 +591,16 @@ class GatherPass:
         if not ok:
             raise GatherError(_no_punch_message(self.run_dir, why))
         self._trim_align = trim_align(self.run_dir)
-        self._trimlog = TrimLog(self.run_dir, self.worker, self.n_workers)
+        self._trimlog = TrimLog(self.run_dir, self.worker, self.n_workers, layout=self.layout)
         return True
 
     def _trim_layer_files(self) -> List[int]:
+        """The layers this worker punches: the anchor file's layers, by ``L % n_workers``."""
         if self._trim_layers is None:
             found = []
-            for path in glob.glob(os.path.join(self.run_dir, "hs_layer_*.raw")):
-                m = re.search(r"hs_layer_(\d+)\.raw$", os.path.basename(path))
+            rx = self.layout.layer_re(self.layout.anchor)
+            for path in glob.glob(os.path.join(self.run_dir, f"{self.layout.anchor}_*.raw")):
+                m = rx.match(os.path.basename(path))
                 if m:
                     found.append(int(m.group(1)))
             if not found:
@@ -535,63 +609,78 @@ class GatherPass:
                                        if L % int(self.n_workers) == int(self.worker))
         return self._trim_layers
 
+    def _trim_extra(self) -> Optional[dict]:
+        return None if self.layout.kind == "hs" else {"row_bytes_by_file": dict(self._rb)}
+
     def _maybe_trim(self) -> None:
         if not self.trim or self._row_bytes <= 0:
             return
         self._resolve_trim()
         now = time.monotonic()
         if self.final_seen or self._trim_reported < 0 or (now - self._trim_reported) >= _TRIM_REPORT_S:
-            self._trimlog.publish({}, row_bytes=self._row_bytes, at_row=int(self._cursor.lo))
+            self._trimlog.publish({}, row_bytes=self._row_bytes, at_row=int(self._cursor.lo),
+                                  extra=self._trim_extra())
             self._trim_reported = now
         layers = self._trim_layer_files()
         if not layers:
             return
-        cursors = published_cursors(self.run_dir, self.n_workers)
+        cursors = published_cursors(self.run_dir, self.n_workers, layout=self.layout)
         cursors[int(self.worker)] = int(self._cursor.lo)
         if len(cursors) < int(self.n_workers):
             return
         # Bound by the slowest worker: workers read the same layer files for other requests.
         slowest = min(cursors.values())
-        lag, chunk = self.trim_lag, self.trim_chunk
-        safe = int(slowest) * int(self._row_bytes) - int(lag)
-        if safe <= 0:
-            return
-        target = align_down(safe, self._trim_align)
-        due = [L for L in layers if target - self._trimmed.get(L, 0) >= chunk]
+        # one punch target per file; the floor is the highest row any of them makes unreadable
+        targets: Dict[int, Dict[str, int]] = {}
+        for L in layers:
+            for prefix in self._rb:
+                safe = int(slowest) * self._rb_of(prefix, L) - int(self.trim_lag)
+                if safe > 0:
+                    targets.setdefault(L, {})[prefix] = align_down(safe, self._trim_align)
+        due = [L for L, ts in targets.items()
+               if any(t - self._trimmed.get((p, L), 0) >= self.trim_chunk for p, t in ts.items())]
         if not due:
             return
-        floor_row = floor_row_for_bytes(target, self._row_bytes)
-        self._trimlog.publish({L: floor_row for L in due}, row_bytes=self._row_bytes,
-                              at_row=int(self._cursor.lo))
+        floors = {L: max(floor_row_for_bytes(t, self._rb_of(p, L)) for p, t in targets[L].items())
+                  for L in due}
+        self._trimlog.publish(floors, row_bytes=self._row_bytes,
+                              at_row=int(self._cursor.lo), extra=self._trim_extra())
         self._stats["trim_rounds"] += 1
         for L in due:
-            frm = self._trimmed.get(L, 0)
-            path = os.path.join(self.run_dir, f"hs_layer_{L}.raw")
-            try:
-                fd = os.open(path, os.O_WRONLY)
-            except OSError as e:
-                raise GatherError(
-                    f"{path}: {GATHER_TRIM_ENV} is ON but this pass cannot open the layer file for "
-                    f"writing to free it ({e}). Refusing rather than growing an unbounded second "
-                    f"copy silently; set {GATHER_TRIM_ENV}=0 to run without the trim.") from None
-            try:
-                punch_hole(fd, frm, target - frm)
-            except (OSError, TrimError) as e:
-                raise GatherError(
-                    f"{path}: fallocate(PUNCH_HOLE) of [{frm}, {target}) failed ({e}). The marker "
-                    f"already names these rows as reclaimed, which is the SAFE direction -- a "
-                    f"reader refuses rows that are in fact still there -- but the space was not "
-                    f"freed, so this is a failure, not a warning.") from None
-            finally:
-                os.close(fd)
-            self._trimmed[L] = target
-            self._stats["trim_punches"] += 1
-            self._stats["trim_bytes"] += target - frm
+            for prefix, target in targets[L].items():
+                frm = self._trimmed.get((prefix, L), 0)
+                if target <= frm:
+                    continue
+                path = os.path.join(self.run_dir, self.layout.layer_file(prefix, L))
+                try:
+                    fd = os.open(path, os.O_WRONLY)
+                except OSError as e:
+                    raise GatherError(
+                        f"{path}: {GATHER_TRIM_ENV} is ON but this pass cannot open the layer file "
+                        f"for writing to free it ({e}). Refusing rather than growing an unbounded "
+                        f"second copy silently; set {GATHER_TRIM_ENV}=0 to run without the trim."
+                    ) from None
+                try:
+                    punch_hole(fd, frm, target - frm)
+                except (OSError, TrimError) as e:
+                    raise GatherError(
+                        f"{path}: fallocate(PUNCH_HOLE) of [{frm}, {target}) failed ({e}). The "
+                        f"marker already names these rows as reclaimed, which is the SAFE "
+                        f"direction -- a reader refuses rows that are in fact still there -- but "
+                        f"the space was not freed, so this is a failure, not a warning."
+                    ) from None
+                finally:
+                    os.close(fd)
+                self._trimmed[(prefix, L)] = target
+                self._stats["trim_punches"] += 1
+                self._stats["trim_bytes"] += target - frm
 
-    def _read_rows(self, layer: int, start: int, n: int) -> np.ndarray:
-        fd = self._fds.get(layer)
+    def _read_rows(self, prefix: str, layer: int, start: int, n: int) -> np.ndarray:
+        fname = self.layout.layer_file(prefix, layer)
+        rb = self._rb_of(prefix, layer)
+        fd = self._fds.get((prefix, layer))
         if fd is None:
-            p = os.path.join(self.run_dir, f"hs_layer_{layer}.raw")
+            p = os.path.join(self.run_dir, fname)
             try:
                 fd = os.open(p, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
             except FileNotFoundError:
@@ -599,39 +688,39 @@ class GatherPass:
                     f"{p}: the index names layer {layer} but the capture wrote no such layer file. "
                     f"The gather reads the SHARED layer files; a request cannot name a layer that "
                     f"was never installed.") from None
-            self._fds[layer] = fd
+            self._fds[(prefix, layer)] = fd
         if self._floors and is_reclaimed(layer, int(start), self._floors):
             raise GatherError(
-                f"hs_layer_{layer}.raw: rows [{start}, {start + n}) are below the TRIM FLOOR "
+                f"{fname}: rows [{start}, {start + n}) are below the TRIM FLOOR "
                 f"{self._floors.get(int(layer))} -- those blocks were already freed with "
                 f"fallocate(PUNCH_HOLE) ({GATHER_TRIM_ENV} is ON by default) and the region reads "
                 f"back as ZEROS, not short, so delivering it would write a plausible, wrong "
                 f"artifact. A gather cannot be re-run over a chain it has already trimmed; re-run "
                 f"the capture, or set {GATHER_TRIM_ENV}=0 to keep the shared files whole.")
-        want = int(n) * self._row_bytes
-        got = os.pread(fd, want, int(start) * self._row_bytes)
+        want = int(n) * rb
+        got = os.pread(fd, want, int(start) * rb)
         if len(got) != want:
             raise GatherError(
-                f"hs_layer_{layer}.raw is SHORTER than the index says: rows "
+                f"{fname} is SHORTER than the index says: rows "
                 f"[{start}, {start + n}) are {want} B but only {len(got)} B could be read. A "
                 f"published segment promises every row below its watermark is already written in "
                 f"every layer file (invariant G1); refusing rather than delivering a short or "
                 f"zero-padded artifact.")
         self._stats["rows_read"] += int(n)
         self._stats["bytes_read"] += want
-        return np.frombuffer(got, dtype=np.uint8).reshape(int(n), self._row_bytes)
+        return np.frombuffer(got, dtype=np.uint8).reshape(int(n), rb)
 
-    def _append(self, rid: str, layer: int, block: np.ndarray) -> None:
-        path = os.path.join(self.out_dir, req_dir_name(rid), f"hs_layer_{layer}.raw")
+    def _append(self, rid: str, prefix: str, layer: int, block: np.ndarray) -> None:
+        path = os.path.join(self.out_dir, req_dir_name(rid), self.layout.layer_file(prefix, layer))
         with open(path, "ab") as f:
             f.write(block.tobytes())
         n = int(block.shape[0])
         st = self._reqs[rid]
-        st.written_all += n
+        st.written_all[prefix] = st.written_all.get(prefix, 0) + n
         if int(layer) == int(st.mine[0]):
-            st.written += n
+            st.written[prefix] = st.written.get(prefix, 0) + n
         self._stats["rows_delivered"] += n
-        self._stats["bytes_delivered"] += n * self._row_bytes
+        self._stats["bytes_delivered"] += n * self._rb_of(prefix, layer)
 
     def _touch(self, rid: str, st: "_ReqState") -> None:
         if st.touched:
@@ -639,65 +728,132 @@ class GatherPass:
         d = os.path.join(self.out_dir, req_dir_name(rid))
         os.makedirs(d, exist_ok=True)
         for L in st.mine:
-            with open(os.path.join(d, f"hs_layer_{L}.raw"), "wb"):
+            with open(os.path.join(d, self.layout.layer_file(self.layout.anchor, L)), "wb"):
                 pass
+            for prefix in self.layout.prefixes[1:]:    # drop a stale file from an earlier pass
+                try:
+                    os.remove(os.path.join(d, self.layout.layer_file(prefix, L)))
+                except FileNotFoundError:
+                    pass
         st.touched = True
 
     def _stamp_run(self, man: dict) -> None:
         if self._cursor.run_id is not None:
             man[RUN_ID_KEY] = self._cursor.run_id
 
-    def _write_empty(self, rid: str) -> None:
-        d = os.path.join(self.out_dir, req_dir_name(rid))
-        os.makedirs(d, exist_ok=True)
+    def _manifest(self, rid: str, layers, layers_all, n_rows: int, worker: int,
+                  stamp: dict) -> dict:
         hdr = self._header or {}
-        man = {"format": DELIVERY_FORMAT, "req_id": rid, "n_rows": 0, "layers": [],
-               "layers_all": [], "worker": 0, "n_workers": self.n_workers,
-               "dtype": hdr.get("dtype"), "row_shape": [int(x) for x in hdr.get("row_shape", [])],
-               "row_bytes": int(self._row_bytes), "complete": True}
+        if self.layout.kind == "hs":
+            man = {"format": DELIVERY_FORMAT, "req_id": rid, "n_rows": int(n_rows),
+                   "layers": [int(L) for L in layers], "layers_all": [int(L) for L in layers_all],
+                   "worker": int(worker), "n_workers": self.n_workers, "dtype": hdr.get("dtype"),
+                   "row_shape": [int(x) for x in hdr.get("row_shape", [])],
+                   "row_bytes": int(self._row_bytes), "complete": True}
+        else:
+            man = {"format": self.layout.delivery_format, "req_id": rid, "n_rows": int(n_rows),
+                   "q_rows": int(stamp.get("q_total", 0)), "n_steps": int(stamp.get("n_steps", 0)),
+                   "layers": [int(L) for L in layers], "layers_all": [int(L) for L in layers_all],
+                   "worker": int(worker), "n_workers": self.n_workers, "dtype": hdr.get("dtype"),
+                   "q_row_shape": [int(x) for x in hdr.get("q_row_shape", [])],
+                   "k_row_shape": [int(x) for x in hdr.get("k_row_shape", [])],
+                   "q_row_bytes": int(self._rb.get("qk_q_layer", 0)),
+                   "k_row_bytes": int(self._rb.get("qk_k_layer", 0)),
+                   "hookq_mode": stamp.get("m"), "hooks_on": stamp.get("h"), "complete": True}
+            if hdr.get("q_row_shapes") or hdr.get("k_row_shapes"):
+                man["row_bytes_by_layer"] = {
+                    str(L): {"q": self._rb_of("qk_q_layer", L), "k": self._rb_of("qk_k_layer", L)}
+                    for L in layers_all}
+            if self.tp_size > 1:                 # which rank's head slice this is
+                man.update({k: hdr[k] for k in (*QK_SHARD_FIELDS, TP_SHARDS_KEY) if k in hdr})
         self._stamp_run(man)
         if self.shard is not None:
             man.update(self.shard.as_header())
+        return man
+
+    def _write_qk_sidecar(self, rid: str, st: "_ReqState") -> None:
+        """Write the request's ``qk_aperture_meta.jsonl`` (file-local offsets, per step/layer)."""
+        hdr = {k: v for k, v in (self._header or {}).items() if k not in INDEX_HEADER_KEYS}
+        lines = [json.dumps({"__header__": hdr}) + "\n"]
+        k_off = q_off = 0
+        for ks, kn, qs, qn, pe, nc in st.rows:
+            for L in st.layers:
+                lines.append(json.dumps({"s": 0, "r": rid, "l": int(L), "ks": int(k_off),
+                                         "kn": int(kn), "qs": int(q_off) if qn > 0 else -1,
+                                         "qn": int(qn), "pe": int(pe),
+                                         "nc": int(nc)}) + "\n")
+            k_off += int(kn)
+            q_off += int(qn)
+        path = os.path.join(self.out_dir, req_dir_name(rid), QK_SIDECAR_NAME)
+        with open(f"{path}.tmp", "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+        os.replace(f"{path}.tmp", path)
+
+    def _check_qk_stamp(self, rid: str, st: "_ReqState", stamp: dict) -> None:
+        """Check the reconstructed records against the completion stamp (rows, watermark, steps)."""
+        n_total, w = int(stamp["n_total"]), int(stamp["w"])
+        k_sum = sum(int(r[1]) for r in st.rows)
+        own_last = max((int(r[0]) + int(r[1]) for r in st.rows), default=0)
+        if k_sum != n_total:
+            raise GatherError(f"{rid!r}: the chain stamps {n_total} k rows but the records this "
+                              f"pass reconstructed hold {k_sum}. The artifact would not be the "
+                              f"request's; refusing.")
+        if own_last > w:
+            raise GatherError(f"{rid!r}: its records run to row {own_last} but its completion "
+                              f"stamp's watermark is {w} -- the request was stamped complete "
+                              f"before its last step was indexed, so the stamp does not close "
+                              f"these rows. "
+                              f"Refusing.")
+        if st.written.get("qk_q_layer", 0) != int(stamp.get("q_total", -1)) or \
+                len(st.rows) != int(stamp.get("n_steps", -1)):
+            raise GatherError(f"{rid!r}: wrote {st.written.get('qk_q_layer', 0)} q rows over "
+                              f"{len(st.rows)} steps, but the stamp says {stamp.get('q_total')} q "
+                              f"rows over {stamp.get('n_steps')} steps. Refusing.")
+
+    def _write_empty(self, rid: str, stamp: dict) -> None:
+        d = os.path.join(self.out_dir, req_dir_name(rid))
+        os.makedirs(d, exist_ok=True)
+        man = self._manifest(rid, [], [], 0, 0, stamp)
         path = os.path.join(d, manifest_name(0, self.n_workers))
         with open(f"{path}.tmp", "w", encoding="utf-8") as f:
             f.write(json.dumps(man, sort_keys=True))
         os.replace(f"{path}.tmp", path)
         self._stats["finalized"] += 1
 
-    def _finalize(self, rid: str, n_total: int) -> None:
+    def _finalize(self, rid: str, stamp: dict) -> None:
+        n_total = int(stamp["n_total"])
+        if self.layout.kind == "qk":
+            self._finalized.add(rid)
         st = self._reqs.pop(rid, None)
         if st is None:
-            if int(n_total) == 0:
+            if n_total == 0:
                 if self.worker == 0:
-                    self._write_empty(rid)
+                    self._write_empty(rid, stamp)
                 return
             self._stats["skipped_stamps"] += 1
             return
         if not st.mine:
             self._stats["skipped_stamps"] += 1
             return
-        if st.written != int(n_total):
+        a = self.layout.anchor
+        if st.written.get(a, 0) != n_total:
             raise GatherError(
-                f"{rid!r}: the chain stamps {n_total} rows but this pass WROTE {st.written} of them "
-                f"to layer {st.mine[0]}. The artifact would be SHORT; refusing to write a manifest "
-                f"over it.")
-        if st.written_all != st.written * len(st.mine):
-            raise GatherError(
-                f"{rid!r}: wrote {st.written_all} rows over {len(st.mine)} layers, which is not "
-                f"{st.written} per layer -- the layers of one request have diverged, so at least one "
-                f"of its layer files is short. Refusing.")
+                f"{rid!r}: the chain stamps {n_total} rows but this pass WROTE "
+                f"{st.written.get(a, 0)} of them to layer {st.mine[0]}. The artifact would be "
+                f"SHORT; refusing to write a manifest over it.")
+        for prefix, n_all in st.written_all.items():
+            if n_all != st.written.get(prefix, 0) * len(st.mine):
+                raise GatherError(
+                    f"{rid!r}: wrote {n_all} rows over {len(st.mine)} layers, which is not "
+                    f"{st.written.get(prefix, 0)} per layer -- the layers of one request have "
+                    f"diverged, so at least one of its layer files is short. Refusing.")
+        if self.layout.kind == "qk":
+            self._check_qk_stamp(rid, st, stamp)
         self._touch(rid, st)
+        if self.layout.kind == "qk" and self.worker == 0:
+            self._write_qk_sidecar(rid, st)      # before the manifest
         d = os.path.join(self.out_dir, req_dir_name(rid))
-        hdr = self._header or {}
-        man = {"format": DELIVERY_FORMAT, "req_id": rid, "n_rows": int(n_total),
-               "layers": [int(L) for L in st.mine],
-               "layers_all": [int(L) for L in st.layers],
-               "worker": self.worker, "n_workers": self.n_workers,
-               "dtype": hdr.get("dtype"), "row_shape": [int(x) for x in hdr.get("row_shape", [])],
-               "row_bytes": int(self._row_bytes), "complete": True}
-        self._stamp_run(man)
-        if self.shard is not None:
-            man.update(self.shard.as_header())
+        man = self._manifest(rid, st.mine, st.layers, n_total, self.worker, stamp)
         path = os.path.join(d, manifest_name(self.worker, self.n_workers))
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -788,6 +944,10 @@ def load_delivery(req_dir: str, *, allow_shard: bool = False, run_ids=None, into
             f"so what is here is a PREFIX of its capture, not its artifact. Not delivered."
             + _foreign_note(req_dir, run_ids))
     first = mans[0]
+    fmt = first.get("format")
+    if fmt not in (None, DELIVERY_FORMAT):
+        raise GatherError(f"{req_dir}: a {fmt!r} delivery, not {DELIVERY_FORMAT!r} -- read it "
+                          f"with load_qk_delivery")
     n_workers = int(first.get("n_workers", 1))
     n_rows = int(first["n_rows"])
     layers_all = [int(x) for x in first["layers_all"]]
@@ -895,7 +1055,7 @@ def _load_delivered_one_rank(out_dir: str, *, allow_shard: bool = False, req_ids
         if not os.path.isdir(d):
             continue
         mans = read_manifests(d, run_ids)
-        if not mans:
+        if not mans or mans[0].get("format") not in (None, DELIVERY_FORMAT):   # a Q/K delivery
             continue
         rid = str(mans[0]["req_id"])
         if req_ids is not None and rid not in req_ids:
@@ -1326,7 +1486,7 @@ def _gather_child(ctl_q, run_dir: str, out_dir: str, worker: int, n_workers: int
                   batch_bytes: int, poll_s: float, trim: bool = True,
                   trim_chunk: int = 0, trim_lag: int = 0, tp_rank: Optional[int] = None,
                   tp_size: int = 1, num_layers: Optional[int] = None,
-                  run_id: Optional[str] = None, progress=None) -> None:
+                  run_id: Optional[str] = None, progress=None, layout: str = "hs") -> None:
     for k, v in _CHILD_THREAD_ENV.items():
         os.environ.setdefault(k, v)
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -1335,7 +1495,7 @@ def _gather_child(ctl_q, run_dir: str, out_dir: str, worker: int, n_workers: int
     p = GatherPass(run_dir, out_dir, worker=worker, n_workers=n_workers, batch_bytes=batch_bytes,
                    trim=trim, trim_chunk=trim_chunk or None, trim_lag=trim_lag if trim_lag >= 0
                    else None, tp_rank=tp_rank, tp_size=tp_size, num_layers=num_layers,
-                   run_id=run_id)
+                   run_id=run_id, layout=layout)
     if progress is not None:
         def _bump():
             progress.value += 1
@@ -1374,12 +1534,18 @@ class ApertureGatherProcess:
                  n_workers: Optional[int] = None,
                  batch_bytes: Optional[int] = None, poll_s: Optional[float] = None,
                  trim: Optional[bool] = None, header: Optional[dict] = None,
-                 run_id: Optional[str] = None):
+                 run_id: Optional[str] = None, layout: str = "hs"):
         self.run_dir = str(run_dir)
         self.run_id = None if run_id is None else str(run_id)
-        self.shard = _manifest_shard(header or {}, f"{self.run_dir} index header")
-        self.tp_rank = None if self.shard is None else int(self.shard.tp_rank)
-        self.tp_size = 1 if self.shard is None else int(self.shard.tp_size)
+        self.layout = _layout(layout).kind
+        if self.layout == "qk":
+            self.shard = None                    # Q/K shards by heads: each rank delivers its slice
+            self.tp_size = int((header or {}).get("tp_size", 1) or 1)
+            self.tp_rank = int((header or {}).get("tp_rank", 0) or 0) if self.tp_size > 1 else None
+        else:
+            self.shard = _manifest_shard(header or {}, f"{self.run_dir} index header")
+            self.tp_rank = None if self.shard is None else int(self.shard.tp_rank)
+            self.tp_size = 1 if self.shard is None else int(self.shard.tp_size)
         self.num_layers = None if self.shard is None else int(self.shard.num_layers)
         _dp = (header or {}).get("dp_rank")
         self.dp_rank = None if _dp is None else int(_dp)
@@ -1407,11 +1573,11 @@ class ApertureGatherProcess:
 
     @classmethod
     def from_env(cls, run_dir: str, out_dir: Optional[str] = None,
-                 header: Optional[dict] = None, run_id: Optional[str] = None):
+                 header: Optional[dict] = None, run_id: Optional[str] = None, layout: str = "hs"):
         """A started gather, or None when ``MIA_APERTURE_GATHER_DELIVER`` is not ``1``."""
         if not delivery_enabled():
             return None
-        gp = cls(run_dir, out_dir, header=header, run_id=run_id)
+        gp = cls(run_dir, out_dir, header=header, run_id=run_id, layout=layout)
         gp.start()
         return gp
 
@@ -1431,11 +1597,13 @@ class ApertureGatherProcess:
                 self.trim, self.no_punch = False, why
                 trim_note = _no_punch_warning(self.run_dir, why)
         if self.trim:
+            lay = _layout(self.layout)
+            shared = "hs_layer_*.raw" if lay.kind == "hs" else "qk_{q,k}_layer_*.raw"
             trim_note = (f"trim ON by default ({GATHER_TRIM_ENV}=0 turns it off): the shared "
-                         f"hs_layer_*.raw will be fallocate(PUNCH_HOLE)d behind the SLOWEST "
+                         f"{shared} will be fallocate(PUNCH_HOLE)d behind the SLOWEST "
                          f"worker's cursor in {self.trim_chunk} B chunks, {self.trim_lag} B lag, "
                          f"{trim_align(self.run_dir)} B aligned. The files keep their LENGTH; rows "
-                         f"below the published floor in hs_trim.w*of*.json are RECLAIMED and "
+                         f"below the published floor in {lay.trim_marker_glob} are RECLAIMED and "
                          f"aperture_reader names them instead of returning zeros. The delivered "
                          f"artifacts under {self.out_dir} are this run's product")
         ctx = multiprocessing.get_context("spawn")
@@ -1451,7 +1619,8 @@ class ApertureGatherProcess:
                                    args=(q, self.run_dir, self.out_dir, w, self.n_workers,
                                          self.batch_bytes, self.poll_s, self.trim,
                                          self.trim_chunk, self.trim_lag, self.tp_rank,
-                                         self.tp_size, self.num_layers, self.run_id, done),
+                                         self.tp_size, self.num_layers, self.run_id, done,
+                                         self.layout),
                                    daemon=True, name=f"mia-gather-{w}")
                 self.parent_daemonic = start_child(proc)
                 self._qs.append(q)
@@ -1522,9 +1691,150 @@ class ApertureGatherProcess:
                     pass
 
 
+def check_qk_delivery(req_dir: str, *, run_ids=None) -> dict:
+    """Validate one Q/K request's delivery; return its first manifest, raise on a bad one."""
+    mans = read_manifests(req_dir, run_ids)
+    if not mans:
+        raise NoDeliveryError(f"{req_dir}: no manifest yet" + _foreign_note(req_dir, run_ids),
+                              "not delivered")
+    first = mans[0]
+    for m in mans:
+        if m.get("format") != QK_DELIVERY_FORMAT:
+            raise GatherError(f"{req_dir}: manifest format {m.get('format')!r}, "
+                              f"not {QK_DELIVERY_FORMAT!r}")
+        if m.get("complete") is not True:
+            raise GatherError(f"{req_dir}: worker {m.get('worker')}'s manifest is not marked "
+                              f"complete")
+        for k in ("n_workers", "n_rows", "q_rows", "n_steps", "layers_all", "q_row_bytes",
+                  "k_row_bytes"):
+            if m.get(k) != first.get(k):
+                raise GatherError(f"{req_dir}: manifests disagree on {k}: {first.get(k)!r} "
+                                  f"vs {m.get(k)!r}")
+    n_workers, layers_all = int(first["n_workers"]), [int(x) for x in first["layers_all"]]
+    expected = ({w for w in range(n_workers) if layers_for_worker(layers_all, w, n_workers)}
+                if layers_all else {0})
+    present = {int(m["worker"]) for m in mans}
+    if present - expected:
+        raise GatherError(f"{req_dir}: manifests from workers {sorted(present - expected)} "
+                          f"that own no layer")
+    if present != expected:
+        raise NoDeliveryError(f"{req_dir}: manifests from workers {sorted(present)} of "
+                              f"{sorted(expected)}", "a worker's layers are not finished")
+    covered = [int(x) for m in mans for x in m["layers"]]
+    if sorted(covered) != sorted(layers_all) or len(set(covered)) != len(covered):
+        raise GatherError(f"{req_dir}: the manifests cover {sorted(covered)}, "
+                          f"not {sorted(layers_all)} once each")
+    n_rows, q_rows = int(first["n_rows"]), int(first["q_rows"])
+    for L in layers_all:
+        by = (first.get("row_bytes_by_layer") or {}).get(
+            str(L), {"q": first["q_row_bytes"], "k": first["k_row_bytes"]})
+        for prefix, rows, rb in (("qk_k_layer", n_rows, int(by["k"])),
+                                 ("qk_q_layer", q_rows, int(by["q"]))):
+            p = os.path.join(req_dir, f"{prefix}_{L}.raw")
+            size = os.path.getsize(p) if os.path.exists(p) else (0 if rows == 0 else None)
+            if size != rows * rb:
+                raise GatherError(f"{p}: the manifest claims {rows} rows ({rows * rb} B) but the "
+                                  f"file is {'missing' if size is None else f'{size} B'}. "
+                                  f"Refusing.")
+    if layers_all and not os.path.exists(os.path.join(req_dir, QK_SIDECAR_NAME)):
+        raise GatherError(f"{req_dir}: complete manifests but no {QK_SIDECAR_NAME} "
+                          f"(worker 0 writes it first)")
+    return first
+
+
+def load_qk_delivery(req_dir: str, *, run_ids=None) -> dict:
+    """``{req_id: {layer: {...}}}`` of one complete Q/K delivery (``{}`` for a zero-row request)."""
+    # lazy: aperture_reader imports torch-heavy readers this module does not otherwise need
+    from .aperture_reader import load_qk_aperture_tp
+    first = check_qk_delivery(req_dir, run_ids=run_ids)
+    if int(first["n_rows"]) == 0:
+        return {}
+    out = load_qk_aperture_tp(req_dir)
+    if set(out) != {str(first["req_id"])}:
+        raise GatherError(f"{req_dir}: its manifests are request {first['req_id']!r} but its "
+                          f"sidecar names {sorted(out)}. Refusing.")
+    return out
+
+
+def poll_qk_delivered(root: str, req_ids, run_ids=None, tp_size: int = 1):
+    """Per id: delivered dirs (or None), what it lacks, a progress mark; a WRONG delivery raises."""
+    bases = [str(root)] if int(tp_size) <= 1 else [os.path.join(str(root), rank_dir_name(r))
+                                                   for r in range(int(tp_size))]
+    dirs, missing, mark = [], {}, []
+    for rid in req_ids:
+        for base in bases:
+            d = os.path.join(base, req_dir_name(rid))
+            try:
+                check_qk_delivery(d, run_ids=run_ids)
+                dirs.append(d)
+            except NoDeliveryError as e:
+                what = e.what if len(bases) == 1 else f"{d}: {e.what}"
+                missing[str(rid)] = f"{missing[str(rid)]}; {what}" if str(rid) in missing else what
+                try:
+                    mark.append(sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d)))
+                except OSError:
+                    mark.append(-1)
+    return (dirs if not missing else None), missing, (len(dirs), tuple(mark))
+
+
+def wait_qk_delivered(root: str, req_ids, *, timeout_s: Optional[float] = None, run_ids=None,
+                      tp_size: int = 1) -> List[str]:
+    """Block until every id is delivered under ``root`` by every TP rank (idle-bounded)."""
+    ids = [str(x) for x in req_ids]
+    idle = delivery_timeout_s() if timeout_s is None else float(timeout_s)
+    start = last = time.monotonic()
+    seen = None
+    while True:
+        got, missing, mark = poll_qk_delivered(root, ids, run_ids, tp_size)
+        if got is not None:
+            return got
+        now = time.monotonic()
+        if mark != seen:
+            seen, last = mark, now
+        if now - last >= idle or now - start >= DELIVERY_HARD_CAP_S:
+            raise DeliveryTimeoutError(f"Q/K delivery under {root}: {len(missing)} of {len(ids)} "
+                                       f"not delivered after {now - start:.1f} s",
+                                       missing=missing, roots=[str(root)])
+        time.sleep(_WAIT_POLL_S)
+
+
+def load_qk_delivery_merged(run_dir: str, req_id: str, tp_size: int, *, timeout_s: float,
+                            run_ids=None) -> Optional[dict]:
+    """One Q/K request's delivery, TP rank slices merged per layer; None if it has zero rows."""
+    tp = int(tp_size)
+    if tp <= 1:
+        src = wait_qk_delivered(run_dir, [req_id], timeout_s=timeout_s, run_ids=run_ids)[0]
+        return load_qk_delivery(src, run_ids=run_ids) or None
+    try:
+        dirs = wait_qk_delivered(run_dir, [req_id], timeout_s=timeout_s, run_ids=run_ids,
+                                 tp_size=tp)
+    except DeliveryTimeoutError as e:
+        raise QKRankTimeoutError(f"Q/K delivery of {req_id!r} under {run_dir} lacks a TP rank's "
+                                 f"slice after {float(timeout_s):g} s without progress: "
+                                 f"{e.missing.get(str(req_id))}",
+                                 missing=e.missing, roots=e.roots) from None
+    rows = [int(check_qk_delivery(d, run_ids=run_ids)["n_rows"]) for d in dirs]
+    zero = [r for r, n in enumerate(rows) if n == 0]
+    if len(zero) == tp:
+        return None
+    if zero:
+        raise MiaDeliveryError(f"Q/K delivery of {req_id!r} under {run_dir}: tp_rank(s) {zero} "
+                               f"delivered zero rows but tp_rank(s) "
+                               f"{[r for r, n in enumerate(rows) if n]} delivered rows. Every TP "
+                               f"rank captures the same token rows, so this is a delivery fault; "
+                               f"refusing.")
+    # lazy: aperture_reader imports torch-heavy readers this module does not otherwise need
+    from .aperture_reader import merge_qk_aperture_ranks
+    out = merge_qk_aperture_ranks(dirs)
+    if set(out) != {str(req_id)}:
+        raise GatherError(f"{run_dir}: the TP slices of {req_id!r} name {sorted(out)}. Refusing.")
+    return out
+
+
 __all__ = ["ApertureGatherProcess", "BATCH_BYTES_ENV", "DELIVER_ENV", "DELIVERY_FORMAT",
            "DEFAULT_WORKERS", "DIR_ENV", "GATHER_TRIM_ENV", "GatherError", "GatherPass",
-           "DELIVERY_TIMEOUT_ENV", "DeliveryTimeoutError", "NoDeliveryError", "TrimRefusedError",
+           "DELIVERY_TIMEOUT_ENV", "DeliveryTimeoutError", "NoDeliveryError", "QKRankTimeoutError",
+           "TrimRefusedError",
            "delivery_root",
            "delivery_backlog", "delivery_timeout_s",
            "wait_delivered",
@@ -1533,4 +1843,7 @@ __all__ = ["ApertureGatherProcess", "BATCH_BYTES_ENV", "DELIVER_ENV", "DELIVERY_
            "clip_run", "delivery_dir", "delivery_enabled", "discover_delivery_ranks",
            "gather_batch_bytes", "gather_poll_s",
            "gather_workers", "layers_for_worker", "load_delivered", "load_delivery",
-           "manifest_name", "read_manifests", "req_dir_name"]
+           "manifest_name", "read_manifests", "req_dir_name",
+           "QK_DELIVERY_FORMAT", "check_qk_delivery", "load_qk_delivery", "load_qk_delivery_merged",
+           "poll_qk_delivered",
+           "wait_qk_delivered"]

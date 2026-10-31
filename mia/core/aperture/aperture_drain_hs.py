@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import bisect
 import logging
-import mmap
 import os
 import queue
 import re
@@ -30,7 +29,7 @@ from .aperture_run_index import (FLUSH_MS_ENV, GATHER_ENV, INDEX_NAME, RunIndex,
                                  new_run_id)
 from .aperture_sink import (
     ApertureWriteConfigError, ApertureWriteError, ApertureWritePath, PerRequestSinks,
-    WRITE_MODE_ENV, WriteShape, WriteStats, alloc_host_rows, join_writes, join_writes_quietly,
+    WriteShape, WriteStats, alloc_host_rows, join_writes, join_writes_quietly,
     lock_run_dir, record_step_stats, release_run_lock, releases_run_lock_on_failure,
     resolve_per_request_write_mode, resolve_write_mode, resolve_write_threads, timed_write)
 from mia.core.runtime.thread_device import bind_thread_to_device
@@ -39,84 +38,8 @@ from mia.core.delivery.offload_process import OffloadProcess
 
 logger = logging.getLogger(__name__)
 
-_GIB = 1024 ** 3
-
-
 def _torch_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).rsplit(".", 1)[-1]
-
-
-def _raw_bytes(t: torch.Tensor) -> bytes:
-    t = t.contiguous()
-    if t.dtype == torch.bfloat16:
-        return t.view(torch.uint16).numpy().tobytes()
-    return t.numpy().tobytes()
-
-
-def _resolve_mmap_capacity_bytes(aperture: CaptureAperture) -> int:
-    override = os.environ.get("MIA_APERTURE_MMAP_BYTES")
-    if override:
-        return int(override)
-    return max(2 * _GIB, int(aperture.n_slots) * int(aperture.row_bytes))
-
-
-class _MmapLayerWriter:
-    """Pre-sized MAP_SHARED write handle for one layer's raw file (MIA_APERTURE_MMAP=1)."""
-
-    def __init__(self, path: str, capacity_bytes: int):
-        self.path = path
-        self.capacity = int(capacity_bytes)
-        self.offset = 0
-        self._overflowed = False
-        self._warned = False
-        self._fh = open(path, "w+b")
-        self._fh.truncate(self.capacity)
-        self._mm = mmap.mmap(self._fh.fileno(), self.capacity, access=mmap.ACCESS_WRITE)
-
-    def append(self, data: bytes) -> None:
-        n = len(data)
-        if n == 0:
-            return
-        if not self._overflowed:
-            room = self.capacity - self.offset
-            if n <= room:
-                self._mm[self.offset:self.offset + n] = data
-                self.offset += n
-                return
-            if room > 0:
-                self._mm[self.offset:self.offset + room] = data[:room]
-                self.offset += room
-                data = data[room:]
-            self._overflowed = True
-            if not self._warned:
-                logger.warning(
-                    "hs aperture mmap sink: %s exceeded its pre-sized mmap capacity (%d bytes); "
-                    "falling back to plain append for the overflow (raise "
-                    "MIA_APERTURE_MMAP_BYTES to size the mapping for this workload)",
-                    self.path, self.capacity)
-                self._warned = True
-            self._mm.flush()
-            self._mm.close()
-            self._fh.truncate(self.offset)
-            self._fh.close()
-            self._mm = None
-            self._fh = None
-        if data:
-            with open(self.path, "ab") as f:
-                f.write(data)
-            self.offset += len(data)
-
-    def close(self) -> None:
-        if self._mm is not None:
-            self._mm.flush()
-            self._mm.close()
-            self._mm = None
-        if self._fh is not None:
-            self._fh.truncate(self.offset)
-            self._fh.close()
-            self._fh = None
-
-
 
 
 def _aperture_debug() -> bool:
@@ -312,20 +235,13 @@ def _sanitize_req_id(req_id: str) -> str:
 class _PerRequestDiskStaging:
     """Disk-route staging: streams one request's rows to its own run dir, laid out like a shared run."""
 
-    def __init__(self, req_id: str, run_dir: str, header: dict, capacity_bytes: int,
-                 use_mmap: bool, write_mode: str = "legacy"):
+    def __init__(self, req_id: str, run_dir: str, header: dict):
         self.req_id = str(req_id)
         self.run_dir = run_dir
         os.makedirs(run_dir, exist_ok=True)
         self.header = dict(header)
         self.meta_path = os.path.join(run_dir, "hs_aperture_meta.jsonl")
-        self._capacity = int(capacity_bytes)
-        self.write_mode = str(write_mode)
-        self._legacy = self.write_mode == "legacy"
-        self._use_mmap = bool(use_mmap) and self._legacy
-        self._writers: Dict[int, _MmapLayerWriter] = {}
-        self._plain: Dict[int, str] = {}
-        self._sinks = None if self._legacy else PerRequestSinks(f"hs staging req {req_id}")
+        self._sinks = PerRequestSinks(f"hs staging req {req_id}")
         self._rows: Dict[int, int] = {}
         self._entries: List[LayerEntry] = []
         self._closed = False
@@ -336,39 +252,16 @@ class _PerRequestDiskStaging:
     def append(self, layer: int, rows_cpu: torch.Tensor, n_rows: int, mode: str) -> None:
         """Append one layer's host rows to this request's raw file and record the matching LayerEntry."""
         start = self._rows.get(layer, 0)
-        if self._sinks is not None:
-            self._sinks.append(layer, self._raw_path(layer), rows_cpu)
-        elif self._use_mmap:
-            w = self._writers.get(layer)
-            if w is None:
-                w = _MmapLayerWriter(self._raw_path(layer), self._capacity)
-                self._writers[layer] = w
-            w.append(_raw_bytes(rows_cpu))
-        else:
-            p = self._plain.get(layer)
-            if p is None:
-                p = self._raw_path(layer)
-                open(p, "wb").close()
-                self._plain[layer] = p
-            with open(p, "ab") as f:
-                f.write(_raw_bytes(rows_cpu))
+        self._sinks.append(layer, self._raw_path(layer), rows_cpu)
         self._entries.append(LayerEntry(self.req_id, int(layer), int(start), int(n_rows), mode))
         self._rows[layer] = start + int(n_rows)
 
     def close(self) -> None:
-        """Finalize on finish: sync and truncate every layer writer, then write this request's sidecar."""
+        """Finalize on finish: close every layer sink, then write this request's sidecar."""
         if self._closed:
             return
         self._closed = True
-        if self._sinks is not None:
-            self._sinks.close()
-        for w in self._writers.values():
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "hs per-request staging: writer close failed for req %r (partial staging); "
-                    "continuing", self.req_id)
+        self._sinks.close()
         try:
             if os.path.isdir(self.run_dir):
                 write_sidecar(self.meta_path, [StepMeta(list(self._entries))], self.header)
@@ -378,15 +271,8 @@ class _PerRequestDiskStaging:
                 "staging); delivery skipped", self.req_id, self.run_dir)
 
     def discard(self) -> None:
-        """Abort cleanup: release open writers without a sidecar and remove the staging dir."""
-        if self._sinks is not None:
-            self._sinks.close()
-        for w in self._writers.values():
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._writers = {}
+        """Abort cleanup: release open sinks without a sidecar and remove the staging dir."""
+        self._sinks.close()
         self._closed = True
         shutil.rmtree(self.run_dir, ignore_errors=True)
 
@@ -425,21 +311,6 @@ class MultiLayerApertureDrain:
                     f"{GATHER_ENV}=1 reads the SHARED per-layer raw files, but this drain writes "
                     f"none: per-request delivery (MIA_APERTURE_PER_REQUEST=1) demuxes every row "
                     f"into its own request's artifact instead. Unset one of the two.")
-            if os.environ.get("MIA_APERTURE_MMAP", "0") != "0":
-                raise ApertureWriteConfigError(
-                    f"MIA_APERTURE_MMAP={os.environ.get('MIA_APERTURE_MMAP')!r} selects the legacy "
-                    f"mmap sink, which PRE-SIZES each layer file and truncates it at close, but "
-                    f"{GATHER_ENV}=1 reads those files WHILE they are being written: every row past "
-                    f"the write cursor would be read back as ZEROS and delivered as data. Unset "
-                    f"MIA_APERTURE_MMAP (the default write path keeps every raw file open for the "
-                    f"run, which is what the mmap sink was for), or unset {GATHER_ENV}.")
-            if self.write_mode == "legacy":
-                raise ApertureWriteConfigError(
-                    f"{WRITE_MODE_ENV}=legacy "
-                    f"({'set' if self._write_mode_explicit else 'the default'}) keeps the sidecar as "
-                    f"LayerEntry objects, but {GATHER_ENV}=1 derives its run index from the "
-                    f"per-step arrays the other write modes keep. Use auto (the default), direct or "
-                    f"buffered, or unset {GATHER_ENV}.")
             self._flush_ms = flush_interval_ms()
         if delivery_enabled():
             if not self.gather:
@@ -474,26 +345,13 @@ class MultiLayerApertureDrain:
         self._io_lock = threading.Lock()
         self._wstats = WriteStats()
         self._write_note = ""
-        self._mmap_writers: Dict[int, _MmapLayerWriter] = {}
-        self._mmap_enabled = False
-        self._perreq_write_mode = "legacy"
         if not setup_sink:
-            self._perreq_write_mode = resolve_per_request_write_mode(
-                self.write_mode, self._write_mode_explicit)
+            resolve_per_request_write_mode(self.write_mode, self._write_mode_explicit)
             self._write_note = (
                 f"write mode={self.write_mode} does not apply to shared raw files: per-request "
                 f"delivery (MIA_APERTURE_PER_REQUEST=1) writes none. Its disk staging writes "
-                + ("zero-copy buffered, one fd per layer kept open for the request"
-                   if self._perreq_write_mode != "legacy"
-                   else "through the legacy per-step tobytes + open/append/close path"))
-        elif self.write_mode != "legacy":
-            if os.environ.get("MIA_APERTURE_MMAP", "0") != "0":
-                raise ApertureWriteConfigError(
-                    f"MIA_APERTURE_MMAP={os.environ.get('MIA_APERTURE_MMAP')!r} selects the legacy "
-                    f"mmap sink, but {WRITE_MODE_ENV}={self.write_mode} "
-                    f"({'set' if self._write_mode_explicit else 'the default'}). Unset "
-                    f"MIA_APERTURE_MMAP (the files now stay open for the run, which is what the "
-                    f"mmap sink was for), or set {WRITE_MODE_ENV}=legacy to use it.")
+                f"zero-copy buffered, one fd per layer kept open for the request")
+        else:
             files = {ln: (self.raw_paths[ln], "hs", int(buf.shape[1]) * int(buf.element_size()))
                      for ln, buf in self.layers}
             self._wp = ApertureWritePath(
@@ -512,28 +370,6 @@ class MultiLayerApertureDrain:
                     self._run_flusher.start()
                     self._gather_proc = ApertureGatherProcess.from_env(
                         run_dir, header=self.header, run_id=self.run_id)
-        else:
-            self._mmap_enabled = os.environ.get("MIA_APERTURE_MMAP", "0") != "0"
-            if self._mmap_enabled:
-                cap = _resolve_mmap_capacity_bytes(aperture)
-                try:
-                    for ln, path in self.raw_paths.items():
-                        self._mmap_writers[ln] = _MmapLayerWriter(path, cap)
-                except OSError as e:
-                    logger.warning(
-                        "hs aperture mmap sink: failed to mmap raw file(s) under %s (%s); falling back "
-                        "to the plain append path for the whole run (unset MIA_APERTURE_MMAP to "
-                        "silence)", run_dir, e)
-                    for w in self._mmap_writers.values():
-                        try:
-                            w.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                    self._mmap_writers = {}
-                    self._mmap_enabled = False
-            if not self._mmap_enabled:
-                for p in self.raw_paths.values():
-                    open(p, "wb").close()
         self._steps: List[StepMeta] = []
         self._pending_entries: List[LayerEntry] = []
         self._closed = False
@@ -544,7 +380,6 @@ class MultiLayerApertureDrain:
         self._degenerate_steps = 0
         self._layer_nums: List[int] = [int(ln) for ln, _ in self.layers]
         self._layer_set = set(self._layer_nums)
-        self._file_rows: Dict[int, int] = {ln: 0 for ln, _ in self.layers}
         self._fr = np.zeros(len(self.layers), dtype=np.int64)
         self._fr_uniform = True
         self._pending_records: list = []
@@ -580,12 +415,7 @@ class MultiLayerApertureDrain:
         if self._wp is not None:
             return (self._wp.summary() + self._delivery_summary() + self._run_summary()
                     + self._trim_summary())
-        if self._write_note:
-            return self._write_note
-        sink = ("pre-sized MAP_SHARED mmap (MIA_APERTURE_MMAP=1)" if self._mmap_enabled
-                else "tobytes + open/append/close per step")
-        return (f"write mode=legacy -> hs=legacy ({sink}, on the drain thread) | for A/B "
-                f"validation only ({WRITE_MODE_ENV}=legacy)")
+        return self._write_note
 
     def _delivery_summary(self) -> str:
         if self._run_flusher is None:
@@ -644,40 +474,8 @@ class MultiLayerApertureDrain:
             return
         self._pending_entries.extend(expand_records(entries))
 
-    def _append_layer_rows(self, ln: int, rows_cpu: torch.Tensor) -> None:
-        data = _raw_bytes(rows_cpu)
-        writer = self._mmap_writers.get(ln) if self._mmap_enabled else None
-        if writer is not None:
-            writer.append(data)
-        else:
-            with open(self.raw_paths[ln], "ab") as f:
-                f.write(data)
-        self._file_rows[ln] = self._file_rows.get(ln, 0) + int(rows_cpu.shape[0])
-
     def drain_once(self) -> int:
         """Copy pending aperture rows out of every layer buffer, queue sidecar entries, advance the cursor."""
-        if self._wp is not None:
-            return self._drain_once_fast()
-        moved = self.aperture.pending_rows()
-        if moved == 0:
-            return 0
-        segments = self.aperture.drained_segments()
-        step_start_logical = self.aperture._drain
-        cursor_before: Dict[int, int] = {}
-        for ln, hs_buf in self.layers:
-            pieces = [hs_buf[s:e].detach().to("cpu") for s, e in segments]
-            rows_cpu = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
-            cursor_before[ln] = self._file_rows.get(ln, 0)
-            self._append_layer_rows(ln, rows_cpu)
-            self._rows_copied += int(rows_cpu.shape[0])
-        if self._pending_entries:
-            _stamp_file_row(self._pending_entries, cursor_before, step_start_logical)
-            self._steps.append(StepMeta(list(self._pending_entries)))
-            self._pending_entries = []
-        self.aperture.advance_drain(moved)
-        return moved
-
-    def _drain_once_fast(self) -> int:
         moved = self.aperture.pending_rows()
         if moved == 0:
             return 0
@@ -733,8 +531,6 @@ class MultiLayerApertureDrain:
             return
         if self._closed:
             return
-        for w in self._mmap_writers.values():
-            w.close()
         write_sidecar(self.meta_path, self._steps, self.header)
         self._closed = True
         release_run_lock(self)
@@ -774,7 +570,8 @@ def _close_write_path(drain, kind: str) -> None:
             gp.close()
         ri = getattr(drain, "_run_index", None)
         if ri is not None:
-            ri.write(os.path.join(drain.run_dir, INDEX_NAME), drain.header)
+            ri.write(os.path.join(drain.run_dir, getattr(ri, "index_name", INDEX_NAME)),
+                     drain.header)
         drain._closed = True
         release_run_lock(drain)
     finally:
@@ -801,6 +598,7 @@ class _Finish:
     """Per-request finish signal, queued after that request's row entries."""
     req_id: str
     asked: bool = False
+    meta: Optional[dict] = None       # QK only
 
 
 class OffLoopApertureDrain(MultiLayerApertureDrain):
@@ -813,8 +611,7 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
                  per_request: bool = False, index: Optional[PerRequestIndex] = None,
                  offload=None, disk_base: Optional[str] = None,
                  shape: Optional[WriteShape] = None):
-        _threads = (resolve_write_threads()
-                    if not per_request and resolve_write_mode()[0] != "legacy" else 0)
+        _threads = resolve_write_threads() if not per_request else 0
         super().__init__(aperture, layers, run_dir, header, setup_sink=not per_request,
                          shape=shape)
         self.per_request = bool(per_request)
@@ -834,9 +631,6 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
         self._host_aborted: set = set()
         self._note_unstaged_finish = False
         self._disk_unstaged: set = set()
-        self._perreq_cap = int(os.environ.get(
-            "MIA_APERTURE_PERREQ_MMAP_BYTES", str(64 * 1024 * 1024)) or (64 * 1024 * 1024))
-        self._perreq_mmap = os.environ.get("MIA_APERTURE_MMAP", "0") != "0"
         self._index_lock = threading.Lock()
         self._q: queue.Queue = queue.Queue()
         dev = self.layers[0][1].device if self.layers else torch.device("cpu")
@@ -1094,7 +888,7 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
         if self._wp is not None:
             self._drain_item_fast(item)
         else:
-            self._drain_item_legacy(item)
+            self._drain_item_per_request(item)
 
     def _host_buf(self, ln: int, n_rows: int, width: int, dtype) -> torch.Tensor:
         buf = self._host.get(ln)
@@ -1214,52 +1008,25 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
             write_tail_s=t4 - t3, busy_s=busy, bookkeeping_s=t_plans + (t3 - t2),
             bytes_by_mode=by_mode, wp=self._wp)
 
-    def _drain_item_legacy(self, item: _DrainItem) -> None:
+    def _drain_item_per_request(self, item: _DrainItem) -> None:
         t0 = time.perf_counter()
         aperture = self.aperture
         assert item.start_logical == aperture._drain, (
             f"FIFO drain violation: item.start_logical={item.start_logical} != "
             f"aperture._drain={aperture._drain}")
-        selective = self._selective_active()
-        compacting = selective and not is_degenerate_full_step(
-            item.entries, self._layer_set, item.start_logical, item.n_rows)
-        if selective and not compacting:
-            self._degenerate_steps += 1
-        plans = build_copy_plans(item.entries, self._layer_nums, aperture,
-                                 item.start_logical, item.n_rows, selective=compacting)
-        copied_before = self._rows_copied
+        plans = _whole_span_plans(self._layer_nums, aperture, item.start_logical, item.n_rows)
         t1 = time.perf_counter()
         with PROF.timed("bank.consumer.d2h"):
             pieces = self._read_segments(plans, item.event)
         t2 = time.perf_counter()
         t3 = t2
-        nbytes = 0
-        copied_here = self._rows_copied - copied_before
-        full_here = len(self.layers) * int(item.n_rows)
-        assert copied_here <= full_here, (
-            f"selective drain copied {copied_here} rows for a step that owns at most {full_here} "
-            f"({len(self.layers)} layers x {item.n_rows} rows) -- the copy list escaped the step")
-        self._rows_skipped += full_here - copied_here
-        if self.per_request:
-            self._demux_into_index(item, pieces)
-        else:
-            cursor_before: Dict[int, int] = {}
-            for ln, rows_cpu in pieces:
-                cursor_before[ln] = self._file_rows.get(ln, 0)
-                self._append_layer_rows(ln, rows_cpu)
-                nbytes += int(rows_cpu.numel()) * int(rows_cpu.element_size())
-            t3 = time.perf_counter()
-            entries = expand_records(item.entries)
-            if entries:
-                _stamp_file_row(entries, cursor_before, item.start_logical,
-                                plans=plans if compacting else None)
-                self._steps.append(StepMeta(entries))
+        self._demux_into_index(item, pieces)
         aperture.advance_drain(item.n_rows)
         t4 = time.perf_counter()
         record_step_stats(
             self._wstats, "hs", rows=item.n_rows, step_s=t4 - t0, d2h_s=t2 - t1,
             write_s=t3 - t2, write_tail_s=t3 - t2, busy_s=t3 - t2,
-            bookkeeping_s=(t1 - t0) + (t4 - t3), bytes_by_mode={"legacy": nbytes} if nbytes else {})
+            bookkeeping_s=(t1 - t0) + (t4 - t3), bytes_by_mode={})
 
     def _demux_into_index(self, item: _DrainItem, pieces: List[Tuple[int, torch.Tensor]]) -> None:
         by_layer = {ln: rows for ln, rows in pieces}
@@ -1319,8 +1086,7 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
             if stg is None:
                 stg = _PerRequestDiskStaging(
                     req_id, os.path.join(self._disk_base, _sanitize_req_id(req_id)),
-                    self.header, self._perreq_cap, self._perreq_mmap,
-                    write_mode=self._perreq_write_mode)
+                    self.header)
                 self._disk_staging[req_id] = stg
         stg.append(layer, rows_cpu, n_rows, mode)
 
@@ -1403,7 +1169,7 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
 
     def close(self) -> None:
         """Stop a live consumer, then close the raw files so every enqueued step is written."""
-        if self._wp is None or self._closed:
+        if self._closed:
             return super().close()
         err: Optional[BaseException] = None
         if self._started:

@@ -292,6 +292,8 @@ shrink the KV cache. Capture layers write into views of that reservation; nothin
 | `MIA_APERTURE_GPU_BYTES` | **4 GiB** | the aperture's exact byte budget, sentinel row included. **Per rank** at TP > 1, not per engine |
 | `MIA_APERTURE_MAX_BATCHED_TOKENS` | off | `auto` lowers `max_num_batched_tokens` (an integer sets the cap) so a max-token step and MIA's buffers fit on every rank; it never raises vLLM's value |
 | `MIA_APERTURE_BACKPRESSURE_TIMEOUT_S` | `10` (s) | how long a step waits for free capture space before `ApertureBackpressureError`. Capture blocks; it never silently drops rows |
+| `MIA_APERTURE_DELIVERY` | hybrid (graph mode) | graph-mode HS and Q/K capture deliver through the hybrid path (Q/K at any TP; Q/K at DP > 1: off); `drain` selects the in-drain writer, `off` the shared files only |
+| `MIA_APERTURE_WRITE_MODE` | `auto` | `auto` · `direct` · `buffered`. `legacy`, `MIA_APERTURE_MMAP`, `MIA_APERTURE_MMAP_BYTES` and `MIA_APERTURE_PERREQ_MMAP_BYTES` were removed and are refused at startup |
 
 ### The one rule: `gpu_memory_utilization` must leave room for MIA
 
