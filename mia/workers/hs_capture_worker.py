@@ -484,6 +484,8 @@ class HSCaptureWorker:
                                 stacked = pad_sequence(tensors, batch_first=True)
                         cpu_dict[mod_name] = {"hidden_states": stacked,
                                               "layer_num": entry["layer_num"], "hs_mode": mode}
+                        if mode != "last_token":
+                            cpu_dict[mod_name]["pass_lens"] = [int(t.shape[0]) for t in tensors]
                     else:
                         cpu_dict[mod_name] = {
                             "hidden_states": _cpu_list(entry["hidden_states"], _census_acc),
