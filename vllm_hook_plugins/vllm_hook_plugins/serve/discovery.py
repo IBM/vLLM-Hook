@@ -35,6 +35,8 @@ def register_discovery() -> None:
     modules = []
     for _api_module in (
         "vllm.entrypoints.openai.api_server",
+        "vllm.entrypoints.launchers.app",
+        "vllm.entrypoints.launchers.api_server.entry",
     ):
         try:
             import importlib as _il
