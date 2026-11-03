@@ -4,6 +4,8 @@ import os
 
 import torch
 
+from mia.errors import MiaConfigurationError
+
 
 _INT_BITS = {"int2": 2, "int4": 4, "int8": 8}
 _FLOAT_CAST = {
@@ -82,6 +84,31 @@ def resolve_dtype(artifact="qk"):
     if v is None:
         v = os.environ.get("MIA_ARTIFACT_DTYPE")
     return parse_artifact_dtype(v)
+
+
+# Worker kinds whose graph path ignores the dtype; drop one to narrow the refusal.
+_GRAPH_IGNORES_DTYPE = {"qk": "MIA_ARTIFACT_DTYPE_QK", "hidden_states": "MIA_ARTIFACT_DTYPE_HS"}
+
+
+def refuse_graph_artifact_dtype(worker_kind, graph, engine_eager=False):
+    """Refuse an artifact dtype on a CUDA-graph engine, whose captures stay at the model dtype."""
+    var = _GRAPH_IGNORES_DTYPE.get(worker_kind)
+    if not graph or var is None:
+        return
+    for name in (var, "MIA_ARTIFACT_DTYPE"):
+        value = os.environ.get(name)
+        if value is not None:
+            if parse_artifact_dtype(value) is not None:
+                if engine_eager:  # MIA_ALLOW_CUDAGRAPH=1 forced graph hooks onto an eager engine
+                    fix = ("captures go through MIA's CUDA-graph hooks, which store captures at "
+                           "the model dtype. Unset it, or unset MIA_ALLOW_CUDAGRAPH.")
+                else:
+                    fix = ("this engine runs CUDA graphs, which store captures at the model "
+                           "dtype. Unset it, or start with enforce_eager=True (vllm serve: "
+                           "--enforce-eager).")
+                raise MiaConfigurationError(
+                    f"{name}={value} quantizes captures in eager mode only; {fix}")
+            return
 
 
 def resolve_granularity():

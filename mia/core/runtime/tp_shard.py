@@ -4,8 +4,9 @@ from __future__ import annotations
 import math
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from vllm.distributed import parallel_state as ps
@@ -31,6 +32,7 @@ QK_SHARD_FIELDS = (
 )
 
 TP_SHARD_KEY = "tp_shard"
+TP_SHARDS_KEY = "tp_shards"
 
 HS_SHARD_ENV = "MIA_HS_TP_SHARD"
 HS_ALL_RANKS_ENV = "MIA_HS_CAPTURE_ALL_RANKS"
@@ -216,6 +218,42 @@ def qk_shard_from_header(header) -> Optional[QKShard]:
     return recorded
 
 
+def qk_layer_shard_map(shards: Sequence[QKShard]) -> Optional[dict]:
+    """``{"<L>": shard header}`` when the layers' shards differ, else None."""
+    if len(set(shards)) <= 1:
+        return None
+    return {str(L): s.as_header() for L, s in enumerate(shards)}
+
+
+def qk_shards_from_header(header) -> Optional[Dict[int, QKShard]]:
+    """Each layer's QK shard: ``tp_shards``, else ``tp_shard`` for every layer, else None."""
+    if not isinstance(header, dict):
+        return None
+    top = qk_shard_from_header(header.get(TP_SHARD_KEY, header))
+    per_layer = header.get(TP_SHARDS_KEY)
+    if per_layer is None:
+        # one shard for every layer: any layer key reads it
+        return None if top is None else defaultdict(lambda: top)
+    if top is None or not isinstance(per_layer, dict):
+        raise TPShardError(f"'{TP_SHARDS_KEY}' ({type(per_layer).__name__}) without a usable "
+                           f"'{TP_SHARD_KEY}'")
+    shards = {int(L): qk_shard_from_header(h) for L, h in per_layer.items()}
+    bad = sorted(L for L, s in shards.items()
+                 if s is None or (s.tp_rank, s.tp_size) != (top.tp_rank, top.tp_size))
+    if bad:
+        raise TPShardError(
+            f"'{TP_SHARDS_KEY}' layer(s) {bad} are not tp_rank {top.tp_rank}/{top.tp_size}, the "
+            f"rank its '{TP_SHARD_KEY}' records")
+    return shards
+
+
+def _layer_shard(shards: dict, layer) -> QKShard:
+    try:
+        return shards[layer]
+    except KeyError:
+        raise TPShardError(f"no QK TP shard recorded for layer {layer!r}") from None
+
+
 def qk_conf_head_dim(text_cfg) -> int:
     """Per-head width of Q/K: ``config.head_dim`` if declared, else hidden_size // num_heads."""
     num_h = int(getattr(text_cfg, "num_attention_heads"))
@@ -249,12 +287,7 @@ def text_layer_kv_sources(text_cfg) -> List[Optional[int]]:
 
 
 def qk_layer_shards(geometry, tp_rank: int, tp_size: int) -> List[QKShard]:
-    """Each layer's QK shard; per-layer geometry is refused at TP > 1 (unvalidated)."""
-    if int(tp_size) > 1 and len(set(geometry)) > 1:
-        raise MiaConfigurationError(
-            f"Q/K capture at tensor_parallel_size={tp_size} is not supported when the attention "
-            f"geometry varies per layer ((H_q, H_kv, head_dim) in {sorted(set(geometry))}); run "
-            f"Q/K capture at tensor_parallel_size=1.")
+    """Each layer's QK shard: vLLM shards every layer's heads by its own geometry."""
     return [qk_shard(tp_rank, tp_size, *g) for g in geometry]
 
 
@@ -491,9 +524,11 @@ def merge_qk_payloads(payloads: Sequence[dict], check_replicas: bool = False) ->
     if len(payloads) == 1 and shards[0].tp_size == 1:
         out = dict(payloads[0])
         out.pop(TP_SHARD_KEY, None)
+        out.pop(TP_SHARDS_KEY, None)
         return out
     order = check_complete_shard_set(shards)
     ranked = [(shards[i], payloads[i]) for i in order]
+    layer_shards = [qk_shards_from_header(p) for _, p in ranked]
     names: list = []
     for _, p in ranked:
         for n in (p.get("qk_cache") or {}):
@@ -502,15 +537,16 @@ def merge_qk_payloads(payloads: Sequence[dict], check_replicas: bool = False) ->
     merged_cache = {}
     for name in names:
         entries = []
-        for s, p in ranked:
+        for (s, p), per_layer in zip(ranked, layer_shards):
             e = (p.get("qk_cache") or {}).get(name)
             if e is None:
                 raise TPShardError(
                     f"layer entry {name!r} is present on some ranks but missing on tp_rank "
                     f"{s.tp_rank}")
-            entries.append((s, e))
+            entries.append((_layer_shard(per_layer, e.get("layer_num") if isinstance(e, dict)
+                                         else None), e))
         merged_cache[name] = merge_qk_entries(entries, check_replicas)
-    out = {k: v for k, v in ranked[0][1].items() if k != TP_SHARD_KEY}
+    out = {k: v for k, v in ranked[0][1].items() if k not in (TP_SHARD_KEY, TP_SHARDS_KEY)}
     out["qk_cache"] = merged_cache
     return out
 
@@ -811,7 +847,8 @@ def discover_rank_dirs(base_dir: str, sidecar_name: str) -> List[Tuple[int, str]
 
 
 __all__ = [
-    "QK_SHARD_FIELDS", "TP_SHARD_KEY", "RANK_DIR_PREFIX", "TPShardError", "QKShard",
+    "QK_SHARD_FIELDS", "TP_SHARD_KEY", "TP_SHARDS_KEY", "RANK_DIR_PREFIX", "TPShardError",
+    "QKShard",
     "HS_SHARD_ENV", "HS_ALL_RANKS_ENV", "HS_LAYER_SHARD_RULE", "HS_SHARD_KEY", "HS_SHARD_FIELDS",
     "HS_MODE_SINGLE", "HS_MODE_ROUND_ROBIN", "HS_MODE_RANK0", "HS_MODE_ALL_RANKS", "HSShard",
     "resolve_hs_shard_mode", "hs_layer_owner", "hs_owned_rows", "hs_owned_layers",
@@ -819,7 +856,8 @@ __all__ = [
     "hs_shard_from_header", "check_hs_shard_set", "merge_hs_layer_maps", "merge_hs_payloads",
     "rank_dir_name", "parse_rank_dir", "refuse_pipeline_parallel", "resolve_tp_coords",
     "DP_DIR_PREFIX", "dp_dir_name", "parse_dp_dir", "dp_layout", "dp_run_base",
-    "qk_shard", "qk_shard_from_header", "qk_conf_head_dim", "check_attn_modules_match_shard",
+    "qk_shard", "qk_shard_from_header", "qk_layer_shard_map", "qk_shards_from_header",
+    "qk_conf_head_dim", "check_attn_modules_match_shard",
     "text_layer_geometry", "text_layer_kv_sources", "qk_layer_shards", "module_layer_scale",
     "module_kv_source", "qk_kv_sources", "qk_conf", "layer_conf", "visible_keys",
     "check_complete_shard_set", "merge_head_tensors",

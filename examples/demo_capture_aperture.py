@@ -22,7 +22,6 @@ LEVER_NOTES = {
     "compact_kall": "Q/K capture only; it selects itself per request.",
     "storage_router": "served requests only; inert offline.",
     "artifact_dtype": "lossy quantization; left off so the checks above compare exact bytes.",
-    "aperture_mmap": "a disk-sink write path; the same bytes either way.",
     "aperture_max_batched_tokens": "guards heavy captures at high batch; this batch is small.",
 }
 

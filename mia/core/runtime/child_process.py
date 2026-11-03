@@ -10,6 +10,8 @@ import threading
 from multiprocessing import util
 
 SHUTDOWN_EXIT_PRIORITY = 100
+# The Q/K drain closes before the gather's own Finalize (higher priority runs first)
+DRAIN_EXIT_PRIORITY = SHUTDOWN_EXIT_PRIORITY + 10
 
 _DEFAULT_PARENT_POLL_S = 1.0
 
@@ -55,6 +57,11 @@ def register_shutdown(close) -> None:
     atexit.register(close)
 
 
+def register_drain_shutdown(close) -> None:
+    """Run a drain's idempotent ``close`` as a Finalizer ahead of every ``register_shutdown``."""
+    util.Finalize(None, close, exitpriority=DRAIN_EXIT_PRIORITY)
+
+
 def get_until_parent_exits(q, poll_s: float | None = None):
     """``q.get()`` for a helper child: next item, or None once the queue is empty and the parent exited."""
     parent = multiprocessing.parent_process()
@@ -69,6 +76,6 @@ def get_until_parent_exits(q, poll_s: float | None = None):
                 return None
 
 
-__all__ = ["PARENT_POLL_S", "SHUTDOWN_EXIT_PRIORITY", "get_until_parent_exits",
-           "register_shutdown", "start_child"]
+__all__ = ["DRAIN_EXIT_PRIORITY", "PARENT_POLL_S", "SHUTDOWN_EXIT_PRIORITY",
+           "get_until_parent_exits", "register_drain_shutdown", "register_shutdown", "start_child"]
 

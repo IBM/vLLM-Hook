@@ -7,10 +7,12 @@ import asyncio
 import contextlib
 import contextvars
 import copy
+import functools
 import glob
 import hashlib
 import importlib as _il
 import json as _json
+import logging
 import os
 import pickle
 import shutil
@@ -19,6 +21,7 @@ import threading
 import time
 import uuid
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import AsyncIterator, Callable
@@ -45,12 +48,12 @@ from mia.core.delivery import (
     disk_flush_probe as _dfp,
     run_artifact,
 )
-from mia.core.aperture.aperture_reader import load_qk_aperture_tp
 from mia.core.aperture.aperture_sizing import (
     CAPTURE_SUBSYSTEMS,
     apply_min_only,
     parse_autocap_setting,
 )
+from mia.core.delivery.artifact_quant import refuse_graph_artifact_dtype
 from mia.core.delivery.delivered_probes import (
     DeliveryReadTimeout,
     qk_probes,
@@ -59,8 +62,14 @@ from mia.core.delivery.delivered_probes import (
     trim_probes as _trim_probes,
 )
 from mia.core.delivery.delivery_route import (
+    _DROP_POOL,
+    _TASKS,
     _WRITE_POOL,
+    _done,
+    await_delivery,
+    await_qk_delivery,
     await_turn,
+    drop_delivered,
     end_turn,
     engine_info,
     merge_info,
@@ -70,6 +79,7 @@ from mia.core.delivery.delivery_route import (
 )
 from mia.core.delivery.delivery_router import RouteDecision, decide_route
 from mia.core.delivery.delivery_selector import DP_SIZE_ENV, STAMP_ENV
+from mia.core.aperture.aperture_reader import load_qk_aperture_tp
 from mia.core.delivery.run_artifact import artifact_wait_s
 from mia.core.hooks.run_mode import DEFAULT_MIA_WORKER, capture_mode_from_env, parse_mia_worker_env
 from mia.core.hooks.run_mode import MIA_WORKER_VALUES, UnknownMiaWorkerError  # noqa: F401  (re-exported)
@@ -104,7 +114,7 @@ from mia.core.delivery.sizing import (
     route_to_disk,
     rpc_disk_crossover_kb,
 )
-from mia.artifacts import read_refused_qk
+from mia.artifacts import clear_pending, note_pending, read_refused_qk
 from mia.core.runner import UnsupportedRunnerError
 from mia.workers._common import match_internal_ids
 from mia.workers.steer_worker import (
@@ -154,6 +164,7 @@ def _kind_from_extension(worker_ext):
 
 
 _DEFAULT_HOOK_DIR = "/dev/shm/mia"
+logger = logging.getLogger(__name__)
 
 
 def _graph_mode() -> bool:
@@ -357,28 +368,43 @@ def _drop_qk_staging(hook_dir: str, run_id, keys) -> None:
 
 
 def _write_qk_run(output, keys, info, hook_dir: str, run_id: str, mode: str, hooks: str,
-                  unit=None, stamp=None, nonce=None, start=None) -> None:
-    outs = _outputs_by_index(output)
-    n_prompt = len(getattr(output, "prompt_token_ids", None) or [])
+                  unit=None, stamp=None, nonce=None, start=None, *, srcs=None, tp_size: int = 1,
+                  n_prompt=None, n_gens=None, share_storage: bool = False) -> list:
+    outs = _outputs_by_index(output) if output is not None else []
+    n_prompt = (len(getattr(output, "prompt_token_ids", None) or []) if n_prompt is None
+                else int(n_prompt))
+    staged = srcs is None
+    srcs = [_qk_dest(hook_dir, run_id, k) for k in keys] if staged else list(srcs)
     try:
         items = []
-        for j, key in enumerate(keys):
+        for j, (key, src) in enumerate(zip(keys, srcs)):
             try:
-                got = load_qk_aperture_tp(_qk_dest(hook_dir, run_id, key))
+                if staged:
+                    got = load_qk_aperture_tp(src)
+                else:                        # a delivered src is (delivery root, engine key)
+                    got = ag.load_qk_delivery_merged(src[0], src[1], tp_size,
+                                                     timeout_s=ag.delivery_timeout_s(),
+                                                     run_ids=run_filter(info))
             except NotImplementedError as e:
                 raise MiaDeliveryError(
                     f"Q/K capture of request {key!r} cannot be delivered: {e}") from None
+            if not got:                      # a zero-row request: its manifest only, no probes
+                items.append((key, None))
+                continue
             if len(got) != 1:
                 raise MiaDeliveryError(f"Q/K delivery of {key!r} holds {len(got)} requests, not 1")
             payload = {"qk_cache": next(iter(got.values())), "config": info["config"],
                        "module_names": info["names"]}
-            n_gen = len(outs[j].token_ids or []) if j < len(outs) else 0
-            items.append((key, qk_probes(payload, n_prompt=n_prompt, n_gen=n_gen,
-                                         hookq_mode=mode, hooks_on=hooks, layout="disk")))
-        run_artifact.append(hook_dir, run_id, kind="qk", items=items, unit=unit, stamp=stamp,
-                            nonce=nonce, start=start)
+            n_gen = (int(n_gens[j]) if n_gens is not None
+                     else (len(outs[j].token_ids or []) if j < len(outs) else 0))
+            items.append((key, qk_probes(payload, n_prompt=n_prompt, n_gen=n_gen, hookq_mode=mode,
+                                         hooks_on=hooks, layout="disk",
+                                         share_storage=share_storage)))
+        return run_artifact.append(hook_dir, run_id, kind="qk", items=items, unit=unit,
+                                   stamp=stamp, nonce=nonce, start=start)
     finally:
-        _drop_qk_staging(hook_dir, run_id, keys)
+        if staged:
+            _drop_qk_staging(hook_dir, run_id, keys)
 
 
 async def _qk_serve_disk(engine, output, extra, keys, request_id, start=None) -> None:
@@ -402,6 +428,260 @@ async def _qk_serve_disk(engine, output, extra, keys, request_id, start=None) ->
                                        response_id(str(request_id)), stamp, nonce, start)
     finally:
         end_turn(hook_dir, run_id, str(request_id))
+
+
+_QK_SHARE_STORAGE = True  # one storage per layer in qk.pt
+_QK_SHUTDOWN_AT: list = [None]
+_QK_SHUTDOWN_HOOKED: list = [False]
+
+
+class _QkRefusalRecorded(MiaDeliveryError):
+    """A Q/K hybrid write failed and its refusal is already on disk."""
+
+
+def _note_qk_shutdown() -> None:
+    _QK_SHUTDOWN_AT[0] = time.monotonic()
+
+
+def _hook_qk_shutdown() -> None:
+    # exit hooks run in reverse order: this runs before the writer pool is joined
+    if not _QK_SHUTDOWN_HOOKED[0]:
+        threading._register_atexit(_note_qk_shutdown)
+        _QK_SHUTDOWN_HOOKED[0] = True
+
+
+def _hybrid_qk_serves(extra: dict, wants_hs: bool, wants_qk: bool, wants_steer: bool,
+                      engine=None) -> bool:
+    stamp = os.environ.get(STAMP_ENV) or ""
+    graph = _engine_graph(engine) if engine is not None else _graph_mode()
+    kind = _engine_worker_kind(engine) if engine is not None else os.environ.get("MIA_WORKER")
+    return (stamp.partition(":")[0] == "hybrid" and graph and kind == "qk"
+            and wants_qk and not wants_hs and not wants_steer
+            and _resolve_sink(extra) != "drop" and not _profile_mode())
+
+
+def _qk_hybrid_marker(output, extra: dict, gen_counts: dict, nonce, key) -> dict:
+    outs = list(getattr(output, "outputs", None) or [])
+    spec = extra.get("output_qk")
+    return {"delivery": "hybrid", "capture": "qk", "n": max(len(outs), 1),
+            "layers": (sorted(int(L) for L in spec)
+                       if isinstance(spec, (dict, list, tuple)) else None),
+            "hookq_mode": _qk_mode(extra), "hooks_on": _qk_hooks(extra),
+            "n_prompt": len(getattr(output, "prompt_token_ids", None) or []),
+            "n_gen": [int(gen_counts.get(getattr(o, "index", j), len(o.token_ids or [])))
+                      for j, o in enumerate(outs)] or [0],
+            "save_to_disk": True, "run_id": extra.get("run_id"), "hook_dir": extra.get("hook_dir"),
+            "nonce": nonce, "key": key}
+
+
+def _record_qk_refusal(req: dict, why: str) -> bool:
+    """Log and persist the refusal; True once it is on disk, False if it could not be persisted."""
+    print(f"[mia/delivery] Q/K save_to_disk REFUSED for {req['ext_keys']}: {why}", flush=True)
+    try:
+        run_artifact.note_refused(req["hook_dir"], req["run_id"], kind="qk",
+                                  refused={k: why for k in req["ext_keys"]}, unit=req["unit"],
+                                  stamp=req["stamp"], nonce=req["nonce"], start=req["start"])
+        return True
+    except Exception:  # noqa: BLE001 -- the log line above already names it
+        logger.exception("Q/K refusal for %s could not be recorded", req["ext_keys"])
+        return False
+
+
+# refusals are recorded off the event loop and off _WRITE_POOL (the run lock spans rewrites)
+_REFUSAL_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mia-refuse")
+# aborted requests' deliveries are awaited here, slowly, so they never queue a client's read
+_ABORT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mia-aborted")
+_ABORT_POLL_S = 1.0
+
+
+def _drop_later(fn, *args, **kw) -> None:
+    """Run a delivery removal on the drop pool so no caller waits; inline once it is shut down."""
+    try:
+        _DROP_POOL.submit(fn, *args, **kw)
+    except RuntimeError:              # interpreter exit: the pool takes no new work
+        fn(*args, **kw)
+
+
+def _drop_qk_keys(root: str, keys, run_ids, tp: int) -> None:
+    try:
+        dirs = ag.poll_qk_delivered(root, list(keys), run_ids, tp)[0] or []
+    except Exception as e:  # noqa: BLE001 -- a failed lookup keeps the data; nobody reads this
+        logger.warning("mia delivered data of %s kept on the server: %s", list(keys), e)
+        return
+    drop_delivered(dirs)
+
+
+def _refuse_and_unpend(req: dict, why: str) -> bool:
+    """Persist the refusal, then clear the pending markers (kept if it could not be persisted)."""
+    ok = _record_qk_refusal(req, why)
+    if ok:
+        for k in req["ext_keys"]:
+            clear_pending(req["hook_dir"], req["run_id"], k)
+    return ok
+
+
+async def _refuse_off_loop(req: dict, why: str) -> bool:
+    """Record a refusal off the event loop, shielded from a second cancel."""
+    fut = asyncio.get_running_loop().run_in_executor(_REFUSAL_POOL, _refuse_and_unpend, req, why)
+    return await asyncio.shield(fut)
+
+
+def _qk_hybrid_write_job(req: dict, srcs, info, tp_size: int = 1, dirs=()) -> None:
+    """qk.pt from the delivered dirs, or a recorded refusal; unrecorded, the marker stays."""
+    keep = False
+    try:
+        at = _QK_SHUTDOWN_AT[0]
+        if at is not None and time.monotonic() > at + ag.delivery_timeout_s():
+            raise MiaDeliveryError("the server shut down and its writer budget "
+                                   "(MIA_DELIVERY_TIMEOUT_S) passed before this request's qk.pt "
+                                   "was written; its delivery is kept")
+        with PROF.timed("aperture.qk_run_write"):
+            written = _write_qk_run(None, req["ext_keys"], info, req["hook_dir"], req["run_id"],
+                                    req["mode"], req["hooks"], req["unit"], req["stamp"],
+                                    req["nonce"], req["start"], srcs=srcs, tp_size=tp_size,
+                                    n_prompt=req["n_prompt"], n_gens=req["n_gens"],
+                                    share_storage=_QK_SHARE_STORAGE)
+    except Exception as e:  # noqa: BLE001
+        if not _record_qk_refusal(req, f"{type(e).__name__}: {e}"):
+            keep = True
+            raise MiaDeliveryError(f"Q/K write of {req['ext_keys']} failed and its refusal could "
+                                   f"not be persisted ({type(e).__name__}: {e}); its pending "
+                                   f"marker is kept") from e
+        raise _QkRefusalRecorded(str(e)) from e
+    finally:
+        if not keep:
+            for k in req["ext_keys"]:
+                clear_pending(req["hook_dir"], req["run_id"], k)
+    sent = {ag.req_dir_name(i) for i, e in zip(req["int_keys"], req["ext_keys"]) if e in written}
+    drop_delivered([d for d in dirs if os.path.basename(d) in sent])
+
+
+async def _qk_hybrid_write_task(engine, req: dict) -> None:
+    cf = None
+    submitted = False
+    try:
+        info = await engine_info(engine)
+        roots = info.get("roots") or []
+        if len(roots) != 1:
+            raise MiaDeliveryError(f"the engine reports {len(roots)} Q/K delivery roots, not 1")
+        tp = _engine_tp_size(engine)
+        dirs = await await_qk_delivery(roots[0], req["int_keys"], tp_size=tp,
+                                       run_ids=run_filter(info))
+        await await_turn(req["hook_dir"], req["run_id"], req["request_id"])
+        cf = _WRITE_POOL.submit(_qk_hybrid_write_job, req,
+                                [(roots[0], k) for k in req["int_keys"]], info, tp, dirs)
+        submitted = True
+        await asyncio.wrap_future(cf)
+    except asyncio.CancelledError:
+        # a still-queued job never runs, so record its refusal here; a started job records its own
+        if not submitted or cf.cancel():
+            await _refuse_off_loop(
+                req, "the server shut down before this request's delivery was written as qk.pt; "
+                     "the delivery is kept under the delivery dir")
+        raise
+    except _QkRefusalRecorded:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if not submitted:
+            await _refuse_off_loop(req, f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        end_turn(req["hook_dir"], req["run_id"], req["request_id"])
+
+
+def _spawn_qk_hybrid_writer(engine, request_id, mark: dict, extra: dict, internal,
+                            start=None) -> None:
+    _hook_qk_shutdown()
+    hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
+    run_id = str(extra.get("run_id") or request_id)
+    req = {"ext_keys": _sample_keys(str(request_id), mark["n"]),
+           "int_keys": _sample_keys(str(internal), mark["n"]),
+           "n_prompt": mark["n_prompt"], "n_gens": list(mark["n_gen"]), "hook_dir": hook_dir,
+           "run_id": run_id, "mode": mark["hookq_mode"], "hooks": mark["hooks_on"],
+           "unit": response_id(str(request_id)), "stamp": time.time_ns(), "nonce": mark["nonce"],
+           "start": start, "request_id": str(request_id)}
+    for k in req["ext_keys"]:
+        note_pending(hook_dir, run_id, k)   # before the response is yielded
+    task = asyncio.get_running_loop().create_task(_qk_hybrid_write_task(engine, req),
+                                                  name=f"mia-save-qk:{request_id}")
+    _TASKS.add(task)
+    task.add_done_callback(_done)
+
+
+async def _drop_aborted(engine, request_id, keys, qk: bool, layers) -> None:
+    """Remove an aborted request's delivery unread once it lands: no client will read it."""
+    loop = asyncio.get_running_loop()
+    bound = None
+    try:
+        info = await engine_info(engine)
+        if qk:
+            dirs = await await_qk_delivery(info["roots"][0], keys, tp_size=_engine_tp_size(engine),
+                                           run_ids=run_filter(info), pool=_ABORT_POOL,
+                                           poll_s=_ABORT_POLL_S)
+            await loop.run_in_executor(_ABORT_POOL, drop_delivered, dirs)
+        else:
+            # other requests' dirs reset the idle timer, so bound the whole wait
+            async with asyncio.timeout(ag.delivery_timeout_s()) as bound:
+                await await_delivery(str(request_id), len(keys), layers, keys=keys,
+                                     run_ids=run_filter(info), load=False, pool=_ABORT_POOL,
+                                     poll_s=_ABORT_POLL_S)
+            await loop.run_in_executor(_ABORT_POOL, lambda: drop_delivered(
+                roots=ag.delivery_base(), keys=keys))
+    except Exception as e:  # noqa: BLE001 -- nothing was captured, or it never landed
+        why = (f"none landed within {ag.delivery_timeout_s():g} s"
+               if bound is not None and bound.expired() else e)
+        logger.info("aborted request %s: no delivery removed (%s)", request_id, why)
+
+
+def _spawn_drop_aborted(engine, request_id, extra: dict, internal, n: int, qk: bool) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:              # finalized off the loop: nothing can wait, the delivery stays
+        return
+    if (_qk_ask_is_empty if qk else _hs_ask_is_empty)(extra, _hs_num_layers(engine)):
+        return
+    layers = extra.get("output_hidden_states")
+    task = loop.create_task(
+        _drop_aborted(engine, request_id, _sample_keys(str(internal), n), qk,
+                      list(layers) if isinstance(layers, (list, tuple)) else None),
+        name=f"mia-drop-aborted:{request_id}")
+    _TASKS.add(task)
+    task.add_done_callback(_done)
+
+
+async def _qk_serve_delivered(engine, output, internal_keys, mode: str, hooks: str, n_gens) -> list:
+    """Q/K hybrid without save_to_disk: hold the response, attach its probes; returns its dirs."""
+    info = await engine_info(engine)
+    roots = info.get("roots") or []
+    if len(roots) != 1:
+        raise MiaDeliveryError(f"the engine reports {len(roots)} Q/K delivery roots, not 1")
+    tp, run_ids = _engine_tp_size(engine), run_filter(info)
+    dirs = await await_qk_delivery(roots[0], internal_keys, tp_size=tp, run_ids=run_ids)
+    loop = asyncio.get_running_loop()
+    outs = _outputs_by_index(output)
+    n_prompt = len(getattr(output, "prompt_token_ids", None) or [])
+    probes = []
+    for j, key in enumerate(internal_keys):
+        try:
+            got = await loop.run_in_executor(None, lambda k=key: ag.load_qk_delivery_merged(
+                roots[0], k, tp, timeout_s=ag.delivery_timeout_s(), run_ids=run_ids))
+        except NotImplementedError as e:
+            raise MiaDeliveryError(f"Q/K capture of request {internal_keys[j]!r} cannot be "
+                                   f"delivered: {e}") from None
+        if not got:                          # a zero-row request: its manifest only, no probes
+            probes.append(None)
+            continue
+        payload = {"qk_cache": next(iter(got.values())), "config": info["config"],
+                   "module_names": info["names"]}
+        probes.append(qk_probes(payload, n_prompt=n_prompt, n_gen=int(n_gens[j]), hookq_mode=mode,
+                                hooks_on=hooks))
+    if probes and probes[0] is not None:
+        output.probes = probes[0]
+    if len(internal_keys) > 1:
+        for c, p in zip(outs, probes):
+            if p is not None:
+                c.probes = p
+    return dirs
 
 
 def _reconstruct_compact_qk(probes: dict) -> None:
@@ -700,7 +980,8 @@ def _revert_mia_writes() -> None:
         _MIA_DYNAMO_WRITE = None
 
 
-def _apply_engine_delivery(worker_kind: str, graph: bool):
+def _apply_engine_delivery(worker_kind: str, graph: bool, engine_eager: bool = False):
+    refuse_graph_artifact_dtype(worker_kind, graph, engine_eager)
     before = {k: os.environ.get(k) for k in ds.WRITES}
     sel = ds.apply(os.environ, worker_kind=worker_kind, graph=graph)
     for k in ds.WRITES:
@@ -1184,7 +1465,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
     if (graph_mode and not mode.engine_eager
             and str(_cc_mode_name(self.compilation_config)).upper() == "FULL"):
         print(_FULL_MODE_WARNING, flush=True)
-    _apply_engine_delivery(_wkind, graph_mode)
+    _apply_engine_delivery(_wkind, graph_mode, mode.engine_eager)
 
     if graph_mode:
         _max_cap = os.environ.get("MIA_CUDAGRAPH_MAX_CAPTURE")
@@ -1412,14 +1693,16 @@ _FLUSH_ANNOUNCED: set = set()
 
 
 async def _flush_disk_coalesced(engine, *, request_id, run_id, hook_dir, wants_hs, wants_qk,
-                                wants_steer, sink, per_request, durable_wait):
+                                wants_steer, sink, per_request, durable_wait,
+                                qk_hybrid: bool = False):
     cls = None
     if _dfp.skip_enabled():
         cls = _dfp.flush_class(graph=_engine_graph(engine), wants_hs=bool(wants_hs),
                                wants_qk=bool(wants_qk), wants_steer=bool(wants_steer),
                                sink=str(sink), per_request=bool(per_request),
                                durable_wait=bool(durable_wait),
-                               run_id=str(run_id), hook_dir=str(hook_dir))
+                               run_id=str(run_id), hook_dir=str(hook_dir),
+                               qk_hybrid=bool(qk_hybrid))
     if cls is None:
         with PROF.timed("rpc.flush_disk"):
             return await engine.collective_rpc("flush_disk", args=([request_id], run_id, hook_dir))
@@ -1862,6 +2145,7 @@ async def _patched_generate(
 
     assert _original_generate is not None
     _hybrid = _hybrid_serves(extra, wants_hs, wants_qk, wants_steer, self)
+    _hybrid_qk = _hybrid_qk_serves(extra, wants_hs, wants_qk, wants_steer, self)
     _gen_counts: dict = {}
     _cached_counts: dict = {}
     _delta = getattr(getattr(effective_params, "output_kind", None), "name", "") == "DELTA"
@@ -1872,15 +2156,17 @@ async def _patched_generate(
     _ADDED_IDS.set(_added)
     _nonce, _start = uuid.uuid4().hex, time.time_ns()
     _writer_ends_turn = False
+    _finished, _qk_sent, _hold_cancelled = False, None, False
     try:
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
             _ADDED_IDS.set(None)
+            _finished = output.finished
             if _steer_new:
                 _release_steer(self, _steer_new, admitted=True)
                 _steer_new = None
-            if _hybrid:
+            if _hybrid or _hybrid_qk:
                 for _o in (getattr(output, "outputs", None) or []):
                     _j, _k = getattr(_o, "index", 0), len(getattr(_o, "token_ids", None) or [])
                     _gen_counts[_j] = _gen_counts.get(_j, 0) + _k if _delta else _k
@@ -1909,8 +2195,10 @@ async def _patched_generate(
                         self, request_id=request_id, run_id=run_id, hook_dir=hook_dir,
                         wants_hs=wants_hs, wants_qk=wants_qk, wants_steer=wants_steer,
                         sink=sink, per_request=False,
-                        durable_wait=bool(extra.get("durable_wait")) and not _hybrid)
-                    if (extra.get("durable_wait") and not _hybrid
+                        durable_wait=bool(extra.get("durable_wait")) and not _hybrid
+                        and not _hybrid_qk,
+                        qk_hybrid=_hybrid_qk)
+                    if (extra.get("durable_wait") and not _hybrid and not _hybrid_qk
                             and not _all_refused(hook_dir, run_id, [request_id])):
                         with PROF.timed("disk.await_artifact"):
                             await _await_disk_artifact(
@@ -1948,6 +2236,8 @@ async def _patched_generate(
                                             _qk_hooks(extra))
                 elif _hybrid:
                     pass
+                elif _hybrid_qk:
+                    pass
                 else:
                     with PROF.timed("rpc.get_states"):
                         states = await self.collective_rpc(
@@ -1973,17 +2263,45 @@ async def _patched_generate(
                         _spawn_hybrid_writer(self, request_id, _mark, extra,
                                              _added[0] if _added else None, _start)
                         _writer_ends_turn = True
+                if _hybrid_qk and not _qk_ask_is_empty(extra, _hs_num_layers(self)):
+                    _internal = _added[0] if _added else None
+                    _n = max(len(getattr(output, "outputs", None) or []), 1)
+                    if _internal is None:
+                        raise MiaDeliveryError(f"Q/K hybrid request {request_id!r}: the engine's "
+                                               f"request id was not captured, so its delivery "
+                                               f"cannot be found")
+                    if _explicit_std:
+                        _mark = _qk_hybrid_marker(output, extra, _gen_counts, _nonce, _internal)
+                        if route_enabled():
+                            output.mia = _mark
+                        _spawn_qk_hybrid_writer(self, request_id, _mark, extra, _internal, _start)
+                        _writer_ends_turn = True
+                    else:
+                        _ng = [int(_gen_counts.get(getattr(o, "index", j), len(o.token_ids or [])))
+                               for j, o in enumerate(_outputs_by_index(output))] or [0]
+                        try:
+                            _qk_sent = await _qk_serve_delivered(
+                                self, output, _sample_keys(_internal, _n), _qk_mode(extra),
+                                _qk_hooks(extra), _ng)
+                        except asyncio.CancelledError:   # only a cancelled hold is dropped
+                            _hold_cancelled = True
+                            raise
             yield output
     finally:
         if needs_hooks and not _writer_ends_turn:
             _end_completion_turn(extra, request_id)    # frees the next prompt's run write
         _release_steer(self, _steer_new, admitted=False)
-        if needs_hooks and not wants_steer and not _hybrid:
+        if needs_hooks and not wants_steer and not _hybrid and not _hybrid_qk:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
             if _aperture_per_request_mode(self) and ((wants_hs and not wants_qk)
                                              or (wants_qk and not wants_hs)):
                 for _key in (_qk_keys if wants_qk else [request_id]):
                     await self.collective_rpc("clear_aperture_request", args=(_key,))
+        if _qk_sent:                      # the response holds the only copy now, sent or not
+            _DROP_POOL.submit(drop_delivered, _qk_sent)
+        elif (_hybrid or _hybrid_qk) and _added and (not _finished or _hold_cancelled):
+            _spawn_drop_aborted(self, request_id, extra, _added[0],
+                                max(int(getattr(effective_params, "n", 1) or 1), 1), _hybrid_qk)
 
 
 async def _patched_add_request(self, request_id, *args, **kwargs):
@@ -2136,24 +2454,44 @@ def _deliver_offline(llm, outputs, engine_ids: dict) -> set:
         lazy.extend(targets)
     if lazy:
         state = _defer_flush(llm, info, run_ids)
+        readers = state.setdefault("readers", {})
+        with _READERS_LOCK:
+            for _obj, k, _m in lazy:
+                readers.setdefault(k, [0, False])[0] += 1     # [live readers, read by one]
         for obj, k, m in lazy:
             _track(state, k, exp.get(k))
             _attach_delivered(obj, info, k, m, exp.get(k), run_ids, state)
     if disk:
-        _save_offline_runs(disk, "hs", "hybrid.offline_save")
+        written = set(_save_offline_runs(disk, "hs", "hybrid.offline_save"))
+        _drop_later(drop_delivered, roots=info["roots"], keys=[k for k in to_save if k in written])
     return done | {str(out.request_id) for out, _e, _k in plan}
+
+
+_READERS_LOCK = threading.RLock()     # reentrant: a GC'd reader's finalizer can run under it
+
+
+def _reader_gone(state: dict, key: str) -> None:
+    """The last lazy reader of ``key`` is gone: remove its delivery if one of them read it."""
+    with _READERS_LOCK:
+        rec = state["readers"][key]
+        rec[0] -= 1
+        if rec[0] > 0:
+            return
+        del state["readers"][key]
+    if rec[1]:
+        _drop_later(drop_delivered, roots=state["roots"], keys=[key])
 
 
 def _attach_delivered(obj, info: dict, key: str, meta: dict, layers, run_ids,
                       state=None) -> None:
     # lazy: padded_offline_probes looked up at call time so it can be patched
     from mia.core.delivery.delivered_probes import (attach_lazy, first_pass_probes, offline_probes,
-                                            padded_offline_probes, padded_reader)
+                                            padded_offline_probes, padded_reader, pass_sizes)
 
     roots, names = info["roots"], info["names"]
     ask = {key: layers} if layers else None
 
-    def rows(into=None):
+    def rows(into=None, whole=lambda got: True):
         try:
             n = ag.wait_delivered(roots, [key], expected_layers=ask, run_ids=run_ids,
                                   load=False)[key]
@@ -2162,6 +2500,7 @@ def _attach_delivered(obj, info: dict, key: str, meta: dict, layers, run_ids,
         if not n:
             if state is not None:
                 state["keys"].pop(key, None)
+                state["readers"][key][1] = True
             return None
         got = ag.load_delivered(roots, expected_layers=ask, req_ids=[key], run_ids=run_ids,
                                 into=into)
@@ -2169,7 +2508,12 @@ def _attach_delivered(obj, info: dict, key: str, meta: dict, layers, run_ids,
             raise MiaDeliveryError(f"the delivery of {key!r} is no longer under {roots}")
         if state is not None:
             state["keys"].pop(key, None)
+            if whole(got[key]):
+                state["readers"][key][1] = True
         return got[key]
+
+    if state is not None:     # the delivery goes once no output can read it again
+        weakref.finalize(rows, _reader_gone, state, key)
 
     def probes():
         into = padded_reader(meta)
@@ -2179,8 +2523,9 @@ def _attach_delivered(obj, info: dict, key: str, meta: dict, layers, run_ids,
         return offline_probes(r, meta, names) if into is None else padded_offline_probes(
             r, meta, names)
 
-    def first():
-        r = rows()
+    def first():          # a first-pass read counts as a read only when it is the whole delivery
+        r = rows(whole=lambda got: all(len(pass_sizes(t.shape[0], meta)) <= 1
+                                       for t in got.values()))
         return None if r is None else first_pass_probes(r, meta, names)
 
     try:
@@ -2312,11 +2657,15 @@ def _finish_bounded(engine, state: dict) -> None:
         print(f"[mia] finishing deliveries at engine teardown failed: {e!r}", flush=True)
 
 
-def _save_offline_runs(disk: dict, kind: str, timer: str) -> None:
+def _save_offline_runs(disk: dict, kind: str, timer: str) -> list:
+    """Write each run; returns the keys written (a newer write of a run skips its keys)."""
     unit, stamp = f"generate-{uuid.uuid4().hex}", time.time_ns()
+    written: list = []
     for (hook_dir, run_id), items in disk.items():
         with PROF.timed(timer):
-            run_artifact.append(hook_dir, run_id, kind=kind, items=items, unit=unit, stamp=stamp)
+            written += run_artifact.append(hook_dir, run_id, kind=kind, items=items, unit=unit,
+                                           stamp=stamp)
+    return written
 
 
 def _offline_qk_info(llm) -> dict:
@@ -2327,7 +2676,10 @@ def _offline_qk_info(llm) -> dict:
     info = {}
     if eng is not None and _engine_worker_kind(eng) == "qk":
         res = [r for r in (llm.collective_rpc("mia_delivery_info") or []) if isinstance(r, dict)]
-        info = {"per_request": bool(res) and all(r.get("per_request") for r in res)}
+        info = {**merge_info(res),
+                "per_request": bool(res) and all(r.get("per_request") for r in res)}
+        info["hybrid"] = (bool(info.get("roots"))
+                          and (os.environ.get(STAMP_ENV) or "").startswith("hybrid:"))
     llm._mia_qk_info = info
     return info
 
@@ -2337,7 +2689,7 @@ def _offline_qk_request(extra: dict) -> bool:
             and not extra.get("steer") and _resolve_sink(extra) != "drop" and not _profile_mode())
 
 
-def _deliver_offline_qk(llm, outputs, engine_ids: dict) -> set:
+def _deliver_offline_qk(llm, outputs, engine_ids: dict) -> tuple:
     reqs = []
     for out in outputs:
         rec = engine_ids.get(str(out.request_id))
@@ -2348,7 +2700,7 @@ def _deliver_offline_qk(llm, outputs, engine_ids: dict) -> set:
         if _offline_qk_request(extra):
             reqs.append((out, internal, extra))
     if not reqs or not _offline_qk_info(llm).get("per_request"):
-        return set()
+        return set(), {}
     _step_inproc_core(llm)
     n_layers = _hs_num_layers(llm.llm_engine)
     disk: dict = {}
@@ -2390,15 +2742,92 @@ def _deliver_offline_qk(llm, outputs, engine_ids: dict) -> set:
                     c.probes = p
     if disk:
         _save_offline_runs(disk, "qk", "qk.offline_save")
-    _raise_refused(refused)
-    return {str(out.request_id) for out, _i, _e in reqs}
+    return {str(out.request_id) for out, _i, _e in reqs} - set(refused), refused
 
 
-def _raise_refused(refused: dict) -> None:
+def _deliver_offline_qk_hybrid(llm, outputs, engine_ids: dict) -> tuple:
+    """Offline Q/K hybrid: write or attach each delivery; returns (delivered, refused, drop)."""
+    reqs = []
+    for out in outputs:
+        rec = engine_ids.get(str(out.request_id))
+        if rec is None:
+            continue
+        internal, params = rec
+        extra = getattr(params, "extra_args", None) or {}
+        if _offline_qk_request(extra):
+            reqs.append((out, internal, extra))
+    info = _offline_qk_info(llm) if reqs else {}
+    if not reqs or not info.get("hybrid"):
+        return set(), {}, None
+    if len(info["roots"]) != 1:
+        raise MiaDeliveryError(f"the engine reports {len(info['roots'])} Q/K delivery roots, not 1")
+    _step_inproc_core(llm)
+    root, run_ids, tp = info["roots"][0], run_filter(info), _engine_tp_size(llm)
+    names = ({int(L): n for L, n in info["names"].items()} if isinstance(info["names"], dict)
+             else dict(info["names"]))
+    n_layers = _hs_num_layers(llm.llm_engine)
+    disk: dict = {}
+    refused: dict = {}
+    sent: list = []
+    for out, internal, extra in reqs:
+        if _qk_ask_is_empty(extra, n_layers):
+            continue
+        outs = _outputs_by_index(out)
+        keys = _sample_keys(internal, len(outs))
+        layout = "disk" if extra.get("save_to_disk") else "rpc"
+        try:
+            probes = []
+            for k, c in zip(keys, outs):
+                try:
+                    with PROF.timed("qk.offline_wait"):
+                        got = ag.load_qk_delivery_merged(root, k, tp,
+                                                         timeout_s=ag.delivery_timeout_s(),
+                                                         run_ids=run_ids)
+                except NotImplementedError as e:
+                    raise MiaDeliveryError(f"Q/K capture of request {k!r} cannot be delivered: "
+                                           f"{e}") from None
+                if not got:                  # a zero-row request: its manifest only, no probes
+                    probes.append(None)
+                    continue
+                payload = {"qk_cache": next(iter(got.values())), "config": info["config"],
+                           "module_names": names}
+                probes.append(qk_probes(payload, n_prompt=len(out.prompt_token_ids or []),
+                                        n_gen=len(c.token_ids or []), hookq_mode=_qk_mode(extra),
+                                        hooks_on=_qk_hooks(extra), layout=layout))
+        except ag.DeliveryTimeoutError:      # a rank that never delivers would stall every request
+            raise
+        except MiaDeliveryError as e:
+            refused[str(out.request_id)] = str(e)
+            continue
+        if layout == "disk":
+            run_id = str(extra.get("run_id") or out.request_id)
+            hook_dir = extra.get("hook_dir") or _DEFAULT_HOOK_DIR
+            disk.setdefault((hook_dir, run_id), []).extend(zip(keys, probes))
+            continue
+        sent += keys
+        if probes and probes[0] is not None:
+            out.probes = probes[0]
+        if len(keys) > 1:
+            for c, p in zip(outs, probes):
+                if p is not None:
+                    c.probes = p
+    if disk:
+        _drop_later(_drop_qk_keys, root, _save_offline_runs(disk, "qk", "qk.offline_save"),
+                    run_ids, tp)
+    drop = functools.partial(_drop_qk_keys, root, sent, run_ids, tp)   # the caller runs it
+    return {str(out.request_id) for out, _i, _e in reqs} - set(refused), refused, drop
+
+
+def _raise_refused(refused: dict, outputs: list = ()) -> None:
     if refused:
-        raise MiaDeliveryError(
+        err = MiaDeliveryError(
             f"Q/K capture refused for {len(refused)} request(s): "
             + "; ".join(f"{r!r}: {why}" for r, why in refused.items()))
+        for o in outputs:
+            if str(o.request_id) in refused:
+                o.probes = None
+        err.outputs, err.refused = list(outputs), dict(refused)
+        raise err
 
 
 def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwargs) -> list:
@@ -2447,10 +2876,12 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
     if needs_hooks:
 
         _hybrid_done = _deliver_offline(self, outputs, _engine_ids)
-        _hybrid_done |= _deliver_offline_qk(self, outputs, _engine_ids)
+        _qk_done, refused, _qk_held = _deliver_offline_qk_hybrid(self, outputs, _engine_ids)
+        _done, _ref = _deliver_offline_qk(self, outputs, _engine_ids)
+        refused = {**refused, **_ref}
+        _hybrid_done |= _qk_done | _done | set(refused)
 
         disk_by_run: dict = {}
-        refused: dict = {}
 
         for idx, output in enumerate(outputs):
             req_id = output.request_id
@@ -2516,7 +2947,9 @@ def _patched_llm_generate(self, prompts: Any, sampling_params: Any = None, **kwa
                     hits = match_internal_ids(gone, str(r))
                     if hits:
                         refused[str(r)] = "; ".join(gone[h] for h in hits)
-        _raise_refused(refused)
+        if _qk_held:                    # the outputs hold their only copy, returned or on the error
+            _drop_later(_qk_held)
+        _raise_refused(refused, outputs)
 
     return outputs
 
@@ -2526,8 +2959,6 @@ def _warn_graph_save_unwritten(runs) -> None:
     names = ", ".join(repr(str(r)) for r in runs)
     for key, off in ((ds.MODE_ENV, lambda v: v.lower() in ("drain", "off")),
                      (ds.PROFILE_ENV, lambda v: v == "1"),
-                     (ds.MMAP_ENV, lambda v: v != "0"),
-                     (ds.WRITE_MODE_ENV, lambda v: v.lower() == "legacy"),
                      (ds.SINK_ENV, lambda v: v.lower() == "drop")):
         v = (os.environ.get(key) or "").strip()
         if v and off(v):

@@ -64,17 +64,35 @@ def pack_tensor_tree(obj):
     return buffer, {"__pack__": 1, "table": table, "tree": tree}
 
 
+def _dtypes(node, out: set) -> set:
+    if node["__t"] == "tensor":
+        out.add(node["dtype"])
+    elif node["__t"] in ("dict", "list", "tuple"):
+        for v in node["items"]:
+            _dtypes(v[1] if node["__t"] == "dict" else v, out)
+    return out
+
+
 def unpack_tensor_tree(buffer: torch.Tensor, manifest: dict):
-    """Inverse of pack_tensor_tree."""
+    """Inverse of pack_tensor_tree; with mixed dtypes each source storage gets its own copy."""
     table = manifest["table"]
     storage = buffer.untyped_storage()
+    # torch.save refuses views of one storage as different dtypes (int8 data + fp32 scales)
+    own = {} if len(_dtypes(manifest["tree"], set())) > 1 else None
 
     def view(desc):
         dt = getattr(torch, desc["dtype"])
         rec = table[desc["slot"]]
-        elems_off = rec["boff"] // dt.itemsize + desc["off"]
+        if own is None:
+            st, elems_off = storage, rec["boff"] // dt.itemsize + desc["off"]
+        else:
+            st = own.get(desc["slot"])
+            if st is None:
+                st = buffer[rec["boff"]:rec["boff"] + rec["nbytes"]].clone().untyped_storage()
+                own[desc["slot"]] = st
+            elems_off = desc["off"]
         t = torch.empty(0, dtype=dt)
-        t.set_(storage, storage_offset=elems_off,
+        t.set_(st, storage_offset=elems_off,
                size=tuple(desc["shape"]), stride=tuple(desc["stride"]))
         return t
 
