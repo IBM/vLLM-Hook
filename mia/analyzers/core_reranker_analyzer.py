@@ -12,7 +12,7 @@ class CorerAnalyzer:
     ACCEPTS = "qk"
 
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
-        """``hook_dir`` holds disk runs; ``layer_to_heads`` maps a layer to the heads to use."""
+        """``hook_dir`` holds disk runs; ``layer_to_heads`` maps a layer to its heads (empty: all)."""
         self.hook_dir = hook_dir
         self.layer_to_heads = layer_to_heads
 
@@ -145,22 +145,17 @@ class CorerAnalyzer:
 
         batch_doc_results = []
         for j in range(bs):
-            if self.layer_to_heads is not None:
-                attn_weights = []
-                for i in range(len(all_key_cache)):
-                    attn_weights.append((self.get_attn_all(all_key_cache[i][j], all_query_cache[i][j],
-                                                           all_layer_conf[i],
-                                                           query_start_tok_idx[j])).mean(-2))
-                attn_weights = torch.stack(attn_weights)
-                attn_weights = attn_weights.sum(0).sum(0)
-
-            else:
-                selected_key_cache = [inner[j] for inner in all_key_cache]
-                j_all_key_cache = torch.stack(selected_key_cache).squeeze(1)
-                selected_query_cache = [inner[j] for inner in all_query_cache]
-                j_all_query_cache = torch.stack(selected_query_cache).squeeze(1)
-                attn_weights = self.get_attn_head(all_layer, j_all_key_cache, j_all_query_cache)
-                attn_weights = attn_weights.mean(-2).sum(0)
+            attn_weights = []
+            for i, layer_num in enumerate(all_layer):
+                attn = self.get_attn_all(all_key_cache[i][j], all_query_cache[i][j],
+                                         all_layer_conf[i], query_start_tok_idx[j])
+                if self.layer_to_heads:
+                    if layer_num not in self.layer_to_heads:
+                        raise ValueError(f"CorerAnalyzer: run {run_id!r} captured layer "
+                                         f"{layer_num}, which has no configured heads")
+                    attn = attn[self.layer_to_heads[layer_num]]
+                attn_weights.append(attn.mean(-2))
+            attn_weights = torch.cat(attn_weights).sum(0)
 
             per_doc_results = [None for _ in range(len(doc_span[j]))]
             for i, span in enumerate(doc_span[j]):
@@ -219,45 +214,6 @@ class CorerAnalyzer:
                 ~visible_keys(q_len, kv_seq_len, layer.get("sliding_window"),
                               attn_weights.device, query_start),
                 torch.finfo(attn_weights.dtype).min)
-        attn_lses = torch.logsumexp(attn_weights, dim=-1, keepdim=True)
-        attn_weights = torch.exp(attn_weights - attn_lses)
-
-        del causal_mask, attn_lses
-        torch.cuda.empty_cache()
-
-        return attn_weights
-
-    def get_attn_head(self, all_layer, key_states, query_states):
-        """Causal softmax attention of the configured heads only, over the keys."""
-        num_layers, num_heads, q_len, head_dim = query_states.size()
-        num_key_value_heads = key_states.size(1)
-        num_key_value_groups = num_heads // num_key_value_heads
-        kv_seq_len = key_states.size(-2)
-
-        key_states = key_states.unsqueeze(2).expand(num_layers, num_key_value_heads, num_key_value_groups, kv_seq_len, head_dim)
-        key_states = key_states.reshape(num_layers, num_heads, kv_seq_len, head_dim)
-
-        layer_idx_to_position = {layer: i for i, layer in enumerate(self.layer_to_heads.keys())}
-        key_states = torch.cat([
-            key_states[layer_idx_to_position[layer_idx], head_indices]
-            for layer_idx, head_indices in self.layer_to_heads.items()
-        ], dim=0)
-
-        query_states = torch.cat([
-            query_states[layer_idx_to_position[layer_idx], head_indices]
-            for layer_idx, head_indices in self.layer_to_heads.items()
-        ], dim=0)
-        torch.cuda.empty_cache()
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2,-1)) / math.sqrt(head_dim)
-        del key_states, query_states
-        torch.cuda.empty_cache()
-
-        causal_mask = torch.ones_like(attn_weights.transpose(-1,-2))
-        causal_mask = torch.triu(causal_mask, diagonal=-(kv_seq_len-q_len))
-        causal_mask = causal_mask.transpose(-1,-2)
-        causal_mask = (1-causal_mask) * torch.finfo(causal_mask.dtype).min
-        attn_weights += causal_mask
         attn_lses = torch.logsumexp(attn_weights, dim=-1, keepdim=True)
         attn_weights = torch.exp(attn_weights - attn_lses)
 
