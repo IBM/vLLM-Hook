@@ -7,9 +7,10 @@ import logging
 import multiprocessing
 import os
 import queue as _queue
+import shutil
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import numpy as np
@@ -57,6 +58,7 @@ DELIVERY_FORMAT = "hs-layer-runs-v1"
 
 RANK_MARKER_NAME = "delivery.rank.json"
 RANK_MARKER_FORMAT = "hs-delivery-rank-v1"
+DROPPED_SUFFIX = "#dropped"     # quote() never writes '#', so no request dir ends with it
 
 QK_DELIVERY_FORMAT = QK_LAYOUT.delivery_format
 
@@ -1067,7 +1069,7 @@ def _load_delivered_one_rank(out_dir: str, *, allow_shard: bool = False, req_ids
         return out
     for name in sorted(os.listdir(out_dir)):
         d = os.path.join(out_dir, name)
-        if not os.path.isdir(d):
+        if not os.path.isdir(d) or name.endswith(DROPPED_SUFFIX):
             continue
         mans = read_manifests(d, run_ids)
         if not mans or mans[0].get("format") not in (None, DELIVERY_FORMAT):   # a Q/K delivery
@@ -1427,14 +1429,44 @@ def _poll(roots, ids: List[str], expected_layers, given: List[str], run_ids=None
     return _Poll(got, {}, views, dirs, None, skipped)
 
 
-def poll_delivered(roots, req_ids, expected_layers=None, run_ids=None):
-    """One non-blocking look at whether every id is delivered."""
+def poll_delivered(roots, req_ids, expected_layers=None, run_ids=None, load: bool = True):
+    """One non-blocking look at whether every id is delivered (row counts when not ``load``)."""
     ids = list(dict.fromkeys(str(x) for x in req_ids))
     given = [os.path.abspath(os.fspath(r)) for r in _as_paths(roots)]
-    p = _poll(roots, ids, expected_layers, given, run_ids)
+    p = _poll(roots, ids, expected_layers, given, run_ids, load)
     if p.got is not None:
         return p.got, {}, ()
     return None, {rid: msg for rid, (msg, _w) in p.pending.items()}, p.mark()
+
+
+def delivered_dirs(roots, req_ids) -> List[str]:
+    """Each id's request dir under every TP rank of the HS delivery ``roots``, present or not."""
+    return [os.path.join(d, req_dir_name(rid)) for r in _resolve_all(roots)
+            for d in ([d for _r, d in discover_delivery_ranks(r)] or [r]) for rid in req_ids]
+
+
+def drop_delivered_dirs(dirs: Iterable[str]) -> int:
+    """Remove delivered request dirs, skipping missing ones; refuses all if one has no manifest."""
+    dirs = [str(d) for d in dirs if os.path.isdir(d)]
+    bare = [d for d in dirs if not glob.glob(os.path.join(d, MANIFEST_GLOB)) and os.path.isdir(d)]
+    if bare:
+        raise GatherError(f"{bare[:4]}: no delivery manifest ({MANIFEST_GLOB}), so not a delivered "
+                          f"request dir; removing none of the {len(dirs)} dir(s)")
+    n = 0
+    for d in dirs:
+        gone = d + DROPPED_SUFFIX
+        shutil.rmtree(gone, ignore_errors=True)       # left by an earlier removal that died
+        try:
+            os.rename(d, gone)                        # readers see it whole or not at all
+        except FileNotFoundError:                     # a concurrent removal got there first
+            continue
+        n += 1
+        try:
+            shutil.rmtree(gone)
+        except OSError as e:
+            if os.path.exists(gone):
+                logger.warning("%s: no longer a delivery, but not fully removed: %s", gone, e)
+    return n
 
 
 def delivery_backlog(roots, req_ids, expected_layers=None, run_ids=None):
@@ -1789,13 +1821,14 @@ def poll_qk_delivered(root: str, req_ids, run_ids=None, tp_size: int = 1):
                                                    for r in range(int(tp_size))]
     dirs, missing, mark = [], {}, []
     for rid in req_ids:
-        for base in bases:
+        for r, base in enumerate(bases):
             d = os.path.join(base, req_dir_name(rid))
             try:
                 check_qk_delivery(d, run_ids=run_ids)
                 dirs.append(d)
             except NoDeliveryError as e:
-                what = e.what if len(bases) == 1 else f"{d}: {e.what}"
+                what = (e.what if len(bases) == 1 else
+                        f"tp_rank {r} of {len(bases)} has not delivered it ({d}: {e.what})")
                 missing[str(rid)] = f"{missing[str(rid)]}; {what}" if str(rid) in missing else what
                 try:
                     mark.append(sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d)))
@@ -1863,7 +1896,7 @@ __all__ = ["ApertureGatherProcess", "BATCH_BYTES_ENV", "DELIVER_ENV", "DELIVERY_
            "DELIVERY_TIMEOUT_ENV", "DeliveryTimeoutError", "NoDeliveryError", "QKRankTimeoutError",
            "TrimRefusedError",
            "delivery_root",
-           "delivery_backlog", "delivery_timeout_s",
+           "delivered_dirs", "delivery_backlog", "delivery_timeout_s", "drop_delivered_dirs",
            "wait_delivered",
            "GatherWorkers", "MANIFEST_GLOB", "resolve_gather_workers",
            "POLL_MS_ENV", "RANK_MARKER_FORMAT", "RANK_MARKER_NAME", "WORKERS_ENV",

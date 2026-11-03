@@ -154,7 +154,7 @@ def _ident(path: str):
 def append(hook_dir: str, run_id: str, *, kind: str, items: Iterable[Tuple[str, dict]],
            unit: Optional[str] = None, stamp: Optional[int] = None,
            nonce: Optional[str] = None, start: Optional[int] = None) -> List[str]:
-    """Add ``items`` to the run in order; returns its keys."""
+    """Add ``items`` to the run in order; returns the keys written, [] when it was not written."""
     if kind not in _KINDS:
         raise RunArtifactError(f"no run artifact for kind {kind!r}")
     items = list(items)
@@ -175,7 +175,7 @@ def append(hook_dir: str, run_id: str, *, kind: str, items: Iterable[Tuple[str, 
                     if stamp is not None and newer is not None and int(newer) > int(stamp):
                         logger.warning("run %r under %s: a newer write replaced it; %s is not "
                                        "written", run_id, hook_dir, [k for k, _ in items])
-                        return list(man.get("requests") or [])
+                        return []
                     man, present = None, []
                     stale = {p: _ident(p) for p in _kind_files(hook_dir, run_id, kind)}
                 elif (unit is not None and stamp is not None and man.get("start") is not None
@@ -183,7 +183,7 @@ def append(hook_dir: str, run_id: str, *, kind: str, items: Iterable[Tuple[str, 
                     logger.warning("run %r under %s: %s finished before the run's requests "
                                    "started (an older use of a reused id); not written", run_id,
                                    hook_dir, [k for k, _ in items])
-                    return list(man.get("requests") or [])
+                    return []
                 else:
                     stale = {}
                 if man is None and unit is not None:
@@ -242,7 +242,7 @@ def append(hook_dir: str, run_id: str, *, kind: str, items: Iterable[Tuple[str, 
                     man["nonces"] = {**(man.get("nonces") or {}),
                                      **{str(k): str(nonce) for k, _ in items}}
                 _write_json(man_path, man)
-                return keys
+                return [str(k) for k, _ in items]
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 

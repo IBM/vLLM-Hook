@@ -345,7 +345,8 @@ Where each call puts its data, how to read it and when it is ready:
 [examples/README.md](../examples/README.md#where-the-captured-data-goes). In short:
 `out[i].probes` / `llm.analyze()` offline, `response.probes` / `client.analyze()` served,
 `<hook_dir>/<run_id>/` with `save_to_disk`, and `load_delivered(<capture dir>)` for the
-hidden-state files. A served capture sent without `save_to_disk` may land in
+hidden-state files: it lists requests delivered and not yet sent to a client; MIA removes a
+request's files once it has sent them. A served capture sent without `save_to_disk` may land in
 `<hook_dir>/<run_id>/` instead of on the response; `client.analyze()` reads it either way. An
 explicit `save_to_disk` is never overridden.
 

@@ -25,7 +25,7 @@ PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
     "artifact_dtype": (
         "MIA_ARTIFACT_DTYPE", "native",
         "Quantize saved artifacts (int2, int4, int8, fp8_e4m3, fp8_e5m2, bf16, fp16, fp32); "
-        "lossy. Default native (no quantization).",
+        "lossy; eager engines only (CUDA graphs refuse it). Default native (no quantization).",
     ),
     "aperture_max_batched_tokens": (
         "MIA_APERTURE_MAX_BATCHED_TOKENS", "off",
