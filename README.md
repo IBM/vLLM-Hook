@@ -1,9 +1,9 @@
 # 🪝 vLLM-Hook MIA
 *A modular plugin library for vLLM.*
 
-📄 [Preprint] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
+📄 [Preprint] [2026-10] [**MIA**: Runtime-Reconfigurable Access to Model Internals in LLM Inference Engines](./docs/MIA_Arxiv_.pdf)
 
-📄 [Preprint] [**MIA**: Runtime-Reconfigurable Access to Model Internals in LLM Inference Engines](./docs/MIA_Arxiv_.pdf)
+📄 [Preprint] [2026-02] [**vLLM Hook** v0: A Plug-in for Programming Model Internals on vLLM](https://arxiv.org/abs/2603.06588v1)
 
 MIA is a plugin library designed to let developers and researchers **inspect**, **analyze**, and **steer** the internal operations of large language models running under the **vLLM** inference engine.  
 
@@ -23,11 +23,11 @@ New here? Start with the [Quickstart](#-quickstart).
 
 ## 📰 News & Events
 
+- **October 21, 2026** - Featured in IBM Research Blog: [*Toward fast AI interpretability and control*](https://research.ibm.com/blog/fast-interpretability-plugin-vllm).
+
 - **July 24, 2026** — Featured in IBM Think: [*A new way of debugging open-weight models*](https://www.ibm.com/think/news/new-way-debugging-open-weight-models).
 
 - **July 6, 2026** — Presented at ICML 2026: [*vLLM-Hook: Live Programming of Model Internals on vLLM*](https://icml.cc/virtual/2026/75729). (ICML registration and login are required to view the presentation.)
-
-- **October 21, 2026** - Featured in IBM Research Blog: [*Toward fast AI interpretability and control*](https://research.ibm.com/blog/fast-interpretability-plugin-vllm).
 
 ---
 
