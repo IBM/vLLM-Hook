@@ -312,6 +312,8 @@ class MiaClient:
                 if it.get("nonce"):
                     nonces.update({k: str(it["nonce"]) for k in keys})
             return
+        if any(it.get("capture") == "qk" for it in items):
+            return   # Q/K probes arrive in the body
         fetch = {int(it["item"]): _ItemFetch(self, rid, kind, it) for it in items}
         n = int(items[0]["n"]) if items else 1
         targets = [(response, lambda: fetch[0]()[0])]
@@ -372,7 +374,8 @@ class MiaClient:
             except run_artifact.RunArtifactError:
                 remote = not os.path.isdir(run_artifact.run_dir(self._hook_dir, rid_))
                 takes = "probes" in inspect.signature(self.analyzer.analyze).parameters
-                if not (remote and takes and not run_ids):
+                qk = any(it.get("capture") == "qk" for _r, _k, it in self._run_reads.get(rid_, []))
+                if qk or not (remote and takes and not run_ids):
                     raise
                 cache = None
                 for rid, kind, it in self._run_reads.get(rid_, []):

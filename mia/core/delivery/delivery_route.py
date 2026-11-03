@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 from urllib.parse import unquote
@@ -11,8 +12,9 @@ import vllm.envs as envs
 
 from . import run_artifact
 from mia.core.aperture.aperture_gather import (DELIVERY_HARD_CAP_S, DeliveryTimeoutError, GatherError,
-                              NoDeliveryError, delivery_base, delivery_root, delivery_timeout_s,
-                              discover_delivery_ranks, poll_delivered)
+                              NoDeliveryError, delivered_dirs, delivery_base, delivery_root,
+                              delivery_timeout_s, discover_delivery_ranks, drop_delivered_dirs,
+                              poll_delivered, poll_qk_delivered)
 from .delivered_probes import (AmbiguousDelivery, check_id, encode_delivery, external_id,
                                hs_probes, key_pattern, match_keys, response_id)
 from .delivery_selector import STAMP_ENV
@@ -26,9 +28,15 @@ ROUTE_PATH = "/v1/mia/delivered"
 MAX_N = 1024
 _READ_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mia-read")
 _WRITE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mia-write")
+_DROP_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mia-drop")   # removals only
 _TASKS: set = set()
 _INFO_ATTR = "_mia_delivery_info_task"
 _POLL_S = 0.25
+_POLL_MIN_S = 0.002                      # first re-poll; doubles up to _POLL_S
+# id -> why its delivery is gone (sent, or written to a run), so a repeated read fails fast
+_SENT: "OrderedDict[str, str]" = OrderedDict()
+SENT_MAX = 65536
+_SENT_WHY = "was already sent to a client and removed from the server"
 
 
 def route_enabled() -> bool:
@@ -53,9 +61,11 @@ def merge_info(results) -> dict:
     config: dict = {}
     roots: List[str] = []
     run_ids: Optional[set] = set()
+    kind: Optional[str] = None
     for r in results or ():
         if not isinstance(r, dict):
             continue
+        kind = kind or r.get("kind")
         for ln, n in r.get("names") or ():
             names.setdefault(int(ln), str(n))
         config = config or dict(r.get("config") or {})
@@ -69,7 +79,7 @@ def merge_info(results) -> dict:
             else:
                 run_ids = None
     return {"names": names, "config": config, "roots": roots,
-            "run_ids": sorted(run_ids) if run_ids else None}
+            "run_ids": sorted(run_ids) if run_ids else None, "kind": kind}
 
 
 async def engine_info(engine) -> dict:
@@ -114,15 +124,45 @@ def _scan_keys(ext: str, n: int, suffix: bool):
     return None, len(found)
 
 
+def drop_delivered(dirs=(), *, roots=None, keys=()) -> bool:
+    """Remove delivered ``dirs`` and HS ``keys`` under ``roots``; False (logged) when kept."""
+    try:
+        drop_delivered_dirs(list(dirs) + (delivered_dirs(roots, keys) if keys else []))
+        return True
+    except Exception as e:  # noqa: BLE001 -- a failed removal keeps the data, never fails a read
+        logger.warning("mia delivered data kept on the server: %s", e)
+        return False
+
+
+def _drop_sent(ext: str, keys, why: str = _SENT_WHY) -> None:
+    """Remove a sent delivery; a read of ``ext`` answers 410 from before the removal starts."""
+    _SENT[ext] = why
+    while len(_SENT) > SENT_MAX:
+        _SENT.popitem(last=False)
+    if not drop_delivered(roots=delivery_base(), keys=keys):
+        _SENT.pop(ext, None)
+
+
+def _send_drop(ext: str, keys, why: str = _SENT_WHY) -> None:
+    """Mark ``ext`` sent now (a retry gets 410), then remove its delivery on the drop pool."""
+    _SENT[ext] = why
+    try:
+        _DROP_POOL.submit(_drop_sent, ext, keys, why)
+    except RuntimeError:                    # pool shut down at exit: the data stays
+        _SENT.pop(ext, None)
+        raise
+
+
 async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float] = None,
-                         pool=None, run_ids=None, keys=None):
-    """Delivered keys and per-sample layers of one engine request."""
+                         pool=None, run_ids=None, keys=None, load: bool = True,
+                         poll_s: Optional[float] = None):
+    """Delivered keys and per-sample layers (row counts when not ``load``) of one engine request."""
     loop = asyncio.get_running_loop()
     pool = _READ_POOL if pool is None else pool
     idle = delivery_timeout_s() if timeout_s is None else float(timeout_s)
     suffix = _suffix()
     start = last = loop.time()
-    seen = None
+    seen, delay = None, _POLL_MIN_S
     while keys is None:
         keys, count = await loop.run_in_executor(pool, _scan_keys, ext, n, suffix)
         if keys is not None:
@@ -134,13 +174,14 @@ async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float]
             raise DeliveryTimeoutError(
                 f"{ext!r}: {count} of {n} sample deliveries after {now - start:.1f} s",
                 missing={ext: f"{count} of {n} sample deliveries present"})
-        await asyncio.sleep(_POLL_S)
+        await asyncio.sleep(delay if poll_s is None else poll_s)   # a given poll_s stays fixed
+        delay = min(2 * delay, _POLL_S)
     exp = {k: list(layers) for k in keys} if isinstance(layers, list) else None
     base = delivery_base()
-    seen, last = None, loop.time()
+    seen, last, delay = None, loop.time(), _POLL_MIN_S
     while True:
         got, missing, mark = await loop.run_in_executor(pool, poll_delivered, base, keys, exp,
-                                                        run_ids)
+                                                        run_ids, load)
         if got is not None:
             return keys, [got[k] for k in keys]
         now = loop.time()
@@ -149,7 +190,33 @@ async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float]
         if now - last >= idle or now - start >= DELIVERY_HARD_CAP_S:
             why = "; ".join(sorted(set(missing.values()))) or "not delivered"
             raise DeliveryTimeoutError(f"{ext!r}: {why}", missing={ext: why})
-        await asyncio.sleep(_POLL_S)
+        await asyncio.sleep(delay if poll_s is None else poll_s)   # a given poll_s stays fixed
+        delay = min(2 * delay, _POLL_S)
+
+
+async def await_qk_delivery(root: str, keys, *, tp_size: int = 1, run_ids=None,
+                            timeout_s: Optional[float] = None, pool=None,
+                            poll_s: Optional[float] = None) -> List[str]:
+    """The delivered dirs of ``keys`` under ``root`` (every TP rank's), polled off the loop."""
+    loop = asyncio.get_running_loop()
+    pool = _READ_POOL if pool is None else pool
+    idle = delivery_timeout_s() if timeout_s is None else float(timeout_s)
+    start = last = loop.time()
+    seen, delay = None, _POLL_MIN_S
+    while True:
+        got, missing, mark = await loop.run_in_executor(pool, poll_qk_delivered, root, list(keys),
+                                                        run_ids, tp_size)
+        if got is not None:
+            return got
+        now = loop.time()
+        if mark != seen:
+            seen, last = mark, now
+        if now - last >= idle or now - start >= DELIVERY_HARD_CAP_S:
+            why = "; ".join(sorted(set(missing.values()))) or "not delivered"
+            raise DeliveryTimeoutError(f"Q/K {list(keys)}: {why}", missing=missing,
+                                       roots=[str(root)])
+        await asyncio.sleep(delay if poll_s is None else poll_s)   # a given poll_s stays fixed
+        delay = min(2 * delay, _POLL_S)
 
 
 def _parse_layers(s: str):
@@ -173,8 +240,8 @@ def _encode(samples, keys, names, config) -> bytes:
 
 def build_router():
     # lazy: optional dependency (fastapi)
+    from fastapi.responses import JSONResponse, StreamingResponse
     from fastapi import APIRouter, Query, Request
-    from fastapi.responses import JSONResponse, Response
 
     router = APIRouter()
 
@@ -197,9 +264,16 @@ def build_router():
             return JSONResponse({"error": "invalid delivered-read request"}, status_code=400)
         if (os.environ.get(STAMP_ENV) or "").partition(":")[0] != "hybrid":
             return JSONResponse({"error": "no capture for this id"}, status_code=404)
+        gone = _SENT.get(ext)
+        if gone is not None:
+            return JSONResponse({"error": f"delivery for {rid!r} {gone}"}, status_code=410)
         loop = asyncio.get_running_loop()
         try:
             info = await engine_info(request.app.state.engine_client)
+            if info.get("kind") == "qk":
+                return JSONResponse({"error": "Q/K deliveries are read from save_to_disk runs or "
+                                              "the response body, not this route"},
+                                    status_code=404)
             keys, samples = await await_delivery(ext, n, lay, timeout_s=timeout_s,
                                                  run_ids=run_filter(info),
                                                  keys=sample_keys(key, n) if key else None)
@@ -220,7 +294,15 @@ def build_router():
         except Exception:  # noqa: BLE001
             logger.exception("mia delivered read %r failed", rid)
             return JSONResponse({"error": "delivery read failed"}, status_code=500)
-        return Response(content=data, media_type="application/octet-stream")
+
+        async def body():
+            yield data
+            yield b""      # returns once uvicorn's write buffer is below its high-water mark
+            if not await request.is_disconnected():     # a client lost by then keeps the delivery
+                _send_drop(ext, keys)
+
+        return StreamingResponse(body(), media_type="application/octet-stream",
+                                 headers={"content-length": str(len(data))})
 
     return router
 
@@ -337,9 +419,13 @@ async def _write_task(engine, ext, n, layers, metas, hook_dir, run_id, unit=None
                                               run_ids=run_filter(info), keys=keys)
         await await_turn(hook_dir, run_id, ext)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_WRITE_POOL, _write_items, ext, n, samples, metas,
-                                   info["names"], info["config"], hook_dir, run_id, unit, stamp,
-                                   nonce, start)
+        written = await loop.run_in_executor(_WRITE_POOL, _write_items, ext, n, samples, metas,
+                                             info["names"], info["config"], hook_dir, run_id,
+                                             unit, stamp, nonce, start)
+        sent = [k for k, w in zip(_keys, sample_keys(ext, n)) if w in written]
+        if sent:
+            _send_drop(ext, sent, f"was written to {hook_dir}/{run_id} on the server; read it "
+                                  f"there (its delivered copy was removed)")
     finally:
         end_turn(hook_dir, run_id, ext)
 
@@ -349,7 +435,7 @@ def _done(task) -> None:
     if task.cancelled():
         return
     e = task.exception()
-    if e is not None:
+    if e is not None and type(e).__name__ != "_QkRefusalRecorded":
         print(f"[mia/delivery] save_to_disk write FAILED for {task.get_name()}: {e!r}",
               flush=True)
 

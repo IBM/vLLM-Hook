@@ -24,7 +24,7 @@ mode MIA chose: `[mia] capture mode: FULL_AND_PIECEWISE CUDA graph (chosen by de
 | `MiaLLM.generate(...)` | `out[i].probes` per prompt; with several prompts `out[0].probes` holds the whole batch, one entry per prompt, for `llm.analyze(probes=out[0].probes, ...)` | on first access to `probes`, which waits for that output (a timeout names the request) |
 | `MiaClient.generate(...)` | `response.probes`; `client.analyze(...)` | shortly after the response; `response.probes` waits for it |
 | either, with `save_to_disk=True, run_id=R` | `<hook_dir>/R/`; `analyze(run_id=R)`, or `mia.artifacts.load_and_merge_hs_cache` / `load_and_merge_qk_cache(hook_dir, R)` | offline: when `generate` returns; served: shortly after the response (`client.analyze()` waits for it) |
-| hidden-state files (CUDA graphs) | `mia.core.aperture.aperture_gather.load_delivered(<capture dir>)` → `{request_id: {layer: Tensor}}` | lists only requests already delivered |
+| hidden-state files (CUDA graphs) | `mia.core.aperture.aperture_gather.load_delivered(<capture dir>)` → `{request_id: {layer: Tensor}}` | lists requests delivered and not yet sent to a client; MIA removes a request's files once it has sent them |
 
 - **`hook_dir`** defaults to `/dev/shm/mia` for `MiaClient`, `~/.cache/mia` for `MiaLLM`.
   `/dev/shm/mia` and `/tmp/mia_profile` are shared by every user of a node: pass your own
@@ -32,10 +32,14 @@ mode MIA chose: `[mia] capture mode: FULL_AND_PIECEWISE CUDA graph (chosen by de
 - **Capture dir** is `$MIA_APERTURE_DIR`, default `./hs_aperture_dump` (or `./qk_aperture_dump`)
   in the working directory; the engine log names it (`... aperture drain ON -> <dir>`). One live
   engine per capture dir and worker kind: a second is refused.
-- **MIA cleans up neither directory**, and an all-layers, all-tokens run writes tens of GB: keep the
-  capture dir until you have read your probes, then delete it.
+- **MIA cleans up neither directory**, except a request's delivered files once it has sent them
+  (or the request was aborted); an all-layers, all-tokens run writes tens of GB: keep the capture
+  dir until you have read your probes, then delete it.
 - **Layer names differ by reader:** `analyze()` keys hidden states by module name
   (`model.layers.0` for config layer 1), `load_delivered` by the config's 1-based layer number.
+- **If MIA refuses some requests of an offline `generate` call,** it raises `MiaDeliveryError` after
+  delivering the rest: `e.outputs` holds every output (a refused one's `probes` is None) and
+  `e.refused` maps each refused request id to its reason.
 - **Offline, `generate` can return before every output's data has landed.** The rest is finished
   when the `MiaLLM` is dropped or Python exits normally; killing the process right after
   `generate` can lose it.
@@ -60,7 +64,7 @@ mode MIA chose: `[mia] capture mode: FULL_AND_PIECEWISE CUDA graph (chosen by de
 A run that captured nothing looks like a fast run, so check rather than assume:
 
 - **The data exists.** `probes` is not `None`, `ls <hook_dir>/<run_id>/` lists files on the disk
-  route, or `load_delivered(<capture dir>)` lists your request.
+  route, or `load_delivered(<capture dir>)` lists your request until MIA has sent it.
 - **The analyzer returned something.** `stats["hidden_states"]` empty is a failed capture, not
   an empty model.
 - **The counters moved.** Run with `MIA_PROFILE=1` (on the server, in server mode). At exit each
@@ -91,7 +95,7 @@ Three things to know before you try it:
   [`docs/configs.md`](../docs/configs.md#sizing-the-capture-aperture-and-the-gpu-memory-it-costs)
   for the constraint.
 - **Q/K `score` capture requires TP = 1.** Raw Q/K shards fine; the rebuilt per-head scores do
-  not. Q/K capture on per-layer-geometry models (Gemma 4) also requires TP = 1.
+  not.
 - **Pipeline parallelism is refused**, not merely untested — under PP each rank holds only its
   own stage's layers and the rest are identity placeholders that the layer matcher would hook
   anyway, so capture would return zero-filled rows for every off-stage layer.

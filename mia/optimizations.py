@@ -25,12 +25,7 @@ PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
     "artifact_dtype": (
         "MIA_ARTIFACT_DTYPE", "native",
         "Quantize saved artifacts (int2, int4, int8, fp8_e4m3, fp8_e5m2, bf16, fp16, fp32); "
-        "lossy. Default native (no quantization).",
-    ),
-    "aperture_mmap": (
-        "MIA_APERTURE_MMAP", "off",
-        "Write capture files through a memory map; only with MIA_APERTURE_WRITE_MODE=legacy. "
-        "Default off.",
+        "lossy; eager engines only (CUDA graphs refuse it). Default native (no quantization).",
     ),
     "aperture_max_batched_tokens": (
         "MIA_APERTURE_MAX_BATCHED_TOKENS", "off",
@@ -42,6 +37,7 @@ PUBLIC_LEVERS: Dict[str, Tuple[str, str, str]] = {
 # Removed levers and why, so a stale config gets one clear message.
 _REMOVED = {
     "batched_egress": "it had no effect (nothing read MIA_BATCHED_EGRESS); delete it from the config",
+    "aperture_mmap": "the mmap write sink was removed; delete it from the config",
 }
 
 _TRUE = ("1", "true", "on", "yes")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -162,12 +163,14 @@ class _NotPlain(Exception):
 
 
 class _Interner:
-    """value -> small int, remembering ``json.dumps(value)``."""
-    __slots__ = ("_idx", "json")
+    """value -> small int, remembering ``json.dumps(value)``; inserts lock, ``values()`` is O(1)."""
+    __slots__ = ("_idx", "json", "_vals", "_lock")
 
     def __init__(self):
         self._idx: dict = {}
         self.json: list = []
+        self._vals: list = []
+        self._lock = threading.Lock()
 
     def __call__(self, v) -> int:
         key = (type(v), v)
@@ -176,15 +179,19 @@ class _Interner:
         except TypeError:
             raise _NotPlain(f"unhashable value {v!r}") from None
         if i is None:
-            i = self._idx[key] = len(self.json)
-            self.json.append(json.dumps(v))
+            with self._lock:
+                i = self._idx.get(key)
+                if i is None:
+                    js = json.dumps(v)
+                    i = len(self.json)
+                    self.json.append(js)
+                    self._vals.append(v)
+                    self._idx[key] = i
         return i
 
     def values(self) -> list:
-        out: list = [None] * len(self.json)
-        for (_t, v), i in self._idx.items():
-            out[i] = v
-        return out
+        """Index -> value: the live append-only list (a caller must not mutate it)."""
+        return self._vals
 
 
 class _LayerLists:
@@ -339,6 +346,14 @@ class QkSidecarLog:
 
     def has_entries(self) -> bool:
         return self.n_entries > 0
+
+    def req_ids(self) -> list:
+        """Interned req-id index -> req_id (the run index reads its arrays through these)."""
+        return self._rid.values()
+
+    def layer_lists(self) -> list:
+        """Interned layer-list index -> that record's layer tuple."""
+        return list(self._lay.lists)
 
     def prepare(self, records):
         if not records:

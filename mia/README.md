@@ -124,7 +124,8 @@ The engine. Its own modules are listed first, followed by its four subpackages.
 | `aperture_reader.py` | Rebuilds each request's per-layer tensors from an aperture raw dump and its sidecar. |
 | `aperture_metadata.py` | Per-step sidecar mapping aperture rows to (req_id, layer, tokens). |
 | `aperture_gather.py` | Hybrid delivery gather: scatters the shared layer files into per-request artifacts. `load_delivered` lives here. |
-| `aperture_run_index.py` | Run-encoded per-request row index into the shared HS layer files (`MIA_APERTURE_GATHER`). |
+| `aperture_run_index.py` | Run-encoded per-request row index into the shared HS and Q/K layer files (`MIA_APERTURE_GATHER`). |
+| `aperture_layout.py` | File names and row geometry of the shared layer files, per capture kind (HS, Q/K). |
 | `aperture_trim.py` | Reclaims the shared layer files behind the gather cursor (`MIA_APERTURE_GATHER_TRIM`). |
 | `aperture_sizing.py` | Byte budgets and the safe `max_num_batched_tokens` cap. |
 
