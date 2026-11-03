@@ -26,7 +26,7 @@ FLUSH_MS_ENV = "MIA_APERTURE_GATHER_FLUSH_MS"
 RUN_ID_KEY = "run_id"
 INDEX_NAME = "hs_run_index.jsonl"
 SEGMENT_FMT = "hs_run_index.seg.%06d.jsonl"
-SEGMENT_RE = re.compile(r"hs_run_index\.seg\.(\d{6})\.jsonl$")
+SEGMENT_RE = re.compile(r"hs_run_index\.seg\.(\d{6,})\.jsonl$")
 INDEX_HEADER_KEYS = ("index", "since", "up_to", "seq", "final", RUN_ID_KEY)
 
 
@@ -601,9 +601,7 @@ class ChainCursor:
         for rid in stamps:
             if rid in self.complete:
                 raise RunIndexError(f"{path}: {rid!r} is stamped complete twice")
-        rows = dict(self.rows)
-        for rid, r in reqs.items():
-            rows[rid] = rows.get(rid, 0) + r.n_rows
+        rows = {rid: self.rows.get(rid, 0) + r.n_rows for rid, r in reqs.items()}
         out: List[Tuple[str, dict]] = []
         for rid in sorted(stamps):
             st = stamps[rid]
@@ -611,13 +609,13 @@ class ChainCursor:
                 raise RunIndexError(
                     f"{path}: {rid!r} is stamped complete at watermark {st['w']} but this segment "
                     f"only covers rows below {up_to} -- the stamp precedes its own rows")
-            got = rows.get(rid, 0)
+            got = rows.get(rid, self.rows.get(rid, 0))
             if got != int(st["n_total"]):
                 raise RunIndexError(
                     f"{path}: {rid!r} is stamped complete with {st['n_total']} rows but the segments "
                     f"read so far hold {got} -- the artifact would be SHORT, refusing")
             out.append((rid, st))
-        self.rows = rows
+        self.rows.update(rows)
         self.lo = up_to
         self.seq += 1
         for rid, st in out:
@@ -648,6 +646,10 @@ def read_run_segments(run_dir: str, *, expect_run_id: Optional[str] = None, layo
     return header, reqs, cur.complete
 
 
+_FLUSH_LOG_KEEP = 4096
+_SUMMED = ("wall_ms", "cpu_ms", "encode_ms", "write_ms", "n_rows", "n_reqs")
+
+
 class RunIndexFlusher:
     """Publishes a :class:`RunIndex` (or :class:`QkRunIndex`) mid-run as replaced segments."""
 
@@ -663,6 +665,8 @@ class RunIndexFlusher:
         self._name = name
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._kick = threading.Event()
+        self.on_flush = None                     # called after every published segment
         self._thread: Optional[threading.Thread] = None
         self._since = 0
         self._seq = 0
@@ -671,7 +675,8 @@ class RunIndexFlusher:
         self._stopped = False
         self.flushes = 0
         self.skipped_stamps = 0
-        self._log: List[dict] = []
+        self._log: Deque[dict] = deque(maxlen=_FLUSH_LOG_KEEP)   # percentiles: the latest flushes
+        self._tot: Dict[str, List[float]] = {}                  # every flush: [sum, max] per figure
 
     def start(self) -> None:
         if self._thread is None:
@@ -685,6 +690,7 @@ class RunIndexFlusher:
     def stop(self) -> None:
         """Join the cadence thread, then publish one final segment and close the chain."""
         self._stop.set()
+        self._kick.set()
         t, self._thread = self._thread, None
         if t is not None:
             t.join(timeout=30.0)
@@ -698,8 +704,16 @@ class RunIndexFlusher:
             except Exception:  # noqa: BLE001
                 logger.exception("%s: the final index segment could not be written", self._name)
 
+    def kick(self) -> None:
+        """Publish the next segment now, not at the cadence; kicks before that flush coalesce."""
+        self._kick.set()
+
     def _run(self) -> None:
-        while not self._stop.wait(self._interval_s):
+        while True:
+            self._kick.wait(self._interval_s)
+            self._kick.clear()
+            if self._stop.is_set():
+                return
             try:
                 self.flush_once()
             except Exception:  # noqa: BLE001
@@ -750,14 +764,21 @@ class RunIndexFlusher:
             self._since = wm
             self._seq += 1
             self.flushes += 1
-            self._log.append({
+            rec = {
                 "seq": self._seq - 1, "since": int(self._since), "up_to": int(wm),
                 "n_reqs": len(reqs), "n_rows": int(sum(r.n_rows for r in reqs.values())),
                 "n_stamps": len(stamps), "n_blocks": len(blocks), "final": bool(final),
                 "encode_ms": enc_ms, "write_ms": write_ms,
                 "wall_ms": (time.perf_counter() - t0) * 1e3,
                 "cpu_ms": (time.thread_time() - cpu0) * 1e3,
-            })
+            }
+            self._log.append(rec)
+            for k in _SUMMED:
+                t = self._tot.setdefault(k, [0.0, 0.0])
+                t[0] += rec[k]
+                t[1] = max(t[1], rec[k])
+            if self.on_flush is not None:
+                self.on_flush()
             return path
 
     def stats(self) -> dict:
@@ -766,21 +787,23 @@ class RunIndexFlusher:
                 "unstamped_live": len(self._rows)}
 
     def summary(self) -> dict:
-        """What every flush of this chain cost, as percentiles."""
+        """What this chain's flushes cost: percentiles of the latest, totals of all."""
         log = list(self._log)
-        out = {"n": len(log), "seq": self._seq, "skipped_stamps": self.skipped_stamps,
+        out = {"n": self.flushes, "seq": self._seq, "skipped_stamps": self.skipped_stamps,
                "unstamped_live": len(self._rows)}
         if not log:
             return out
+        tot = self._tot
         for k in ("wall_ms", "cpu_ms", "encode_ms", "write_ms"):
             v = sorted(float(x.get(k, 0.0)) for x in log)
             n = len(v)
-            out[k] = {"p50": v[n // 2], "p99": v[min(n - 1, int(n * 0.99))], "max": v[-1],
-                      "sum": sum(v)}
+            out[k] = {"p50": v[n // 2], "p99": v[min(n - 1, int(n * 0.99))], "max": tot[k][1],
+                      "sum": tot[k][0]}
         rows = sorted(int(x.get("n_rows", 0)) for x in log)
         reqs = sorted(int(x.get("n_reqs", 0)) for x in log)
-        out["rows_per_flush"] = {"p50": rows[len(rows) // 2], "max": rows[-1], "sum": sum(rows)}
-        out["reqs_per_flush"] = {"p50": reqs[len(reqs) // 2], "max": reqs[-1]}
+        out["rows_per_flush"] = {"p50": rows[len(rows) // 2], "max": int(tot["n_rows"][1]),
+                                 "sum": int(tot["n_rows"][0])}
+        out["reqs_per_flush"] = {"p50": reqs[len(reqs) // 2], "max": int(tot["n_reqs"][1])}
         return out
 
     def summary_line(self, run_id=None) -> str:

@@ -228,6 +228,8 @@ class MultiLayerQKApertureDrain:
                     self._run_flusher.start()
                     self._gather_proc = ApertureGatherProcess.from_env(
                         run_dir, header=self.header, run_id=self.run_id, layout="qk")
+                    if self._gather_proc is not None:
+                        self._run_flusher.on_flush = self._gather_proc.wake
         self._steps: List[StepMeta] = []
         self._pending_entries: List[QKStepEntry] = []
         self._closed = False
@@ -247,8 +249,8 @@ class MultiLayerQKApertureDrain:
         if self._wp is not None:
             note = self._wp.summary()
             if self.gather_stamp:
-                note += (f" | qk hybrid delivery ON: run index qk_run_index.seg.* every "
-                         f"{self._flush_ms} ms, run id {self.run_id}")
+                note += (f" | qk hybrid delivery ON: run index qk_run_index.seg.* on each finish "
+                         f"and every {self._flush_ms} ms, run id {self.run_id}")
             return note
         return self._write_note
 
@@ -307,6 +309,8 @@ class MultiLayerQKApertureDrain:
                 self._deferred_finishes.append((str(req_id), bool(asked), meta))
             else:
                 self._run_index.note_finish(req_id, asked=asked, meta=meta)
+                if asked:
+                    self._run_flusher.kick()
 
     def _release_deferred_finishes(self) -> None:
         """Note the held finishes (caller holds ``_io_lock``)."""
@@ -314,6 +318,8 @@ class MultiLayerQKApertureDrain:
             held, self._deferred_finishes = self._deferred_finishes, []
             for rid, asked, meta in held:
                 self._run_index.note_finish(rid, asked=asked, meta=meta)
+            if any(asked for _rid, asked, _meta in held):
+                self._run_flusher.kick()
 
     def flush_run_index(self, *, up_to=None) -> Optional[str]:
         """Publish the next index segment now; return its path or None."""
@@ -568,6 +574,8 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
                             else:
                                 self._run_index.note_finish(item.req_id, asked=item.asked,
                                                             meta=item.meta)
+                                if item.asked:
+                                    self._run_flusher.kick()
                         else:
                             self._complete_inflight()
                             self._finalize_finish_isolated(item.req_id)
@@ -787,6 +795,8 @@ class OffLoopQKApertureDrain(MultiLayerQKApertureDrain):
             if held:
                 for fin in held:
                     self._run_index.note_finish(fin.req_id, asked=fin.asked, meta=fin.meta)
+                if any(fin.asked for fin in held):
+                    self._run_flusher.kick()
             t5 = time.perf_counter()
             by_mode: Dict[str, int] = {}
             busy = 0.0

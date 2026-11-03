@@ -29,6 +29,7 @@ _WRITE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mia-write")
 _TASKS: set = set()
 _INFO_ATTR = "_mia_delivery_info_task"
 _POLL_S = 0.25
+_POLL_MIN_S = 0.002                      # first re-poll; doubles up to _POLL_S
 
 
 def route_enabled() -> bool:
@@ -124,7 +125,7 @@ async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float]
     idle = delivery_timeout_s() if timeout_s is None else float(timeout_s)
     suffix = _suffix()
     start = last = loop.time()
-    seen = None
+    seen, delay = None, _POLL_MIN_S
     while keys is None:
         keys, count = await loop.run_in_executor(pool, _scan_keys, ext, n, suffix)
         if keys is not None:
@@ -136,10 +137,11 @@ async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float]
             raise DeliveryTimeoutError(
                 f"{ext!r}: {count} of {n} sample deliveries after {now - start:.1f} s",
                 missing={ext: f"{count} of {n} sample deliveries present"})
-        await asyncio.sleep(_POLL_S)
+        await asyncio.sleep(delay)
+        delay = min(2 * delay, _POLL_S)
     exp = {k: list(layers) for k in keys} if isinstance(layers, list) else None
     base = delivery_base()
-    seen, last = None, loop.time()
+    seen, last, delay = None, loop.time(), _POLL_MIN_S
     while True:
         got, missing, mark = await loop.run_in_executor(pool, poll_delivered, base, keys, exp,
                                                         run_ids)
@@ -151,7 +153,8 @@ async def await_delivery(ext: str, n: int, layers, *, timeout_s: Optional[float]
         if now - last >= idle or now - start >= DELIVERY_HARD_CAP_S:
             why = "; ".join(sorted(set(missing.values()))) or "not delivered"
             raise DeliveryTimeoutError(f"{ext!r}: {why}", missing={ext: why})
-        await asyncio.sleep(_POLL_S)
+        await asyncio.sleep(delay)
+        delay = min(2 * delay, _POLL_S)
 
 
 async def await_qk_delivery(root: str, keys, *, tp_size: int = 1, run_ids=None,
@@ -161,7 +164,7 @@ async def await_qk_delivery(root: str, keys, *, tp_size: int = 1, run_ids=None,
     pool = _READ_POOL if pool is None else pool
     idle = delivery_timeout_s() if timeout_s is None else float(timeout_s)
     start = last = loop.time()
-    seen = None
+    seen, delay = None, _POLL_MIN_S
     while True:
         got, missing, mark = await loop.run_in_executor(pool, poll_qk_delivered, root, list(keys),
                                                         run_ids, tp_size)
@@ -174,7 +177,8 @@ async def await_qk_delivery(root: str, keys, *, tp_size: int = 1, run_ids=None,
             why = "; ".join(sorted(set(missing.values()))) or "not delivered"
             raise DeliveryTimeoutError(f"Q/K {list(keys)}: {why}", missing=missing,
                                        roots=[str(root)])
-        await asyncio.sleep(_POLL_S)
+        await asyncio.sleep(delay)
+        delay = min(2 * delay, _POLL_S)
 
 
 def _parse_layers(s: str):

@@ -63,6 +63,8 @@ QK_DELIVERY_FORMAT = QK_LAYOUT.delivery_format
 DEFAULT_BATCH_BYTES = 256 << 20
 
 _TRIM_REPORT_S = 0.5
+_HOLE_SCAN_S = 1.0
+_HOLE_RETRY_S = 1.0
 
 DEFAULT_POLL_MS = 100
 
@@ -339,6 +341,8 @@ class GatherPass:
         self.on_batch: Optional[Callable[[], None]] = None
         self.run_id = None if run_id is None else str(run_id)
         self._cursor = ChainCursor(expect_run_id=self.run_id)
+        self._next_scan = 0.0
+        self._hole: Optional[tuple] = None       # (seq, first seen, a later segment's name)
         self._reqs: Dict[str, _ReqState] = {}
         self._finalized: set = set()             # Q/K ids whose completion stamp was consumed
         self._header: Optional[dict] = None
@@ -496,11 +500,22 @@ class GatherPass:
 
     def _refuse_a_hole(self) -> None:
         want = self._cursor.seq
-        later = [p for p in segment_paths(self.run_dir, layout=self.layout)
-                 if int(os.path.basename(p).split(".")[2]) > want]
-        if later:
+        nxt = os.path.join(self.run_dir, self.layout.segment_fmt % (want + 1))
+        later = [nxt] if os.path.exists(nxt) else []
+        t0 = time.monotonic()
+        if not later and t0 >= self._next_scan:   # the full listing is O(chain): <= 1/s and <= 1 %
+            later = [p for p in segment_paths(self.run_dir, layout=self.layout)
+                     if int(os.path.basename(p).split(".")[2]) > want]
+            self._next_scan = t0 + max(_HOLE_SCAN_S, 100.0 * (time.monotonic() - t0))
+        if later and (self._hole is None or self._hole[0] != want):
+            self._hole = (want, t0, os.path.basename(later[0]))
+        hole = self._hole
+        cur = os.path.join(self.run_dir, self.layout.segment_fmt % want)
+        # S lands before S+1: re-check S, and refuse only a gap that outlasts the retry
+        if (hole is not None and hole[0] == want and t0 - hole[1] >= _HOLE_RETRY_S
+                and not os.path.exists(cur)):
             raise RunIndexError(
-                f"{self.run_dir}: index segment {want} is MISSING while {os.path.basename(later[0])} "
+                f"{self.run_dir}: index segment {want} is MISSING while {hole[2]} "
                 f"exists -- the chain is written strictly in seq order, so this is a gap, and the "
                 f"rows of segment {want} are named by no segment at all. Refusing to skip them.")
 
@@ -1652,6 +1667,18 @@ class ApertureGatherProcess:
 
     def alive(self) -> bool:
         return bool(self._procs) and any(p.is_alive() for p in self._procs)
+
+    def wake(self) -> None:
+        """Have every child poll the index chain now; never blocks or raises."""
+        if self._closed:
+            return
+        for q in self._qs:
+            try:
+                # qsize() raises on macOS: there the wake is skipped and the child keeps its poll
+                if q.qsize() == 0:                   # one pending token already wakes it
+                    q.put_nowait(True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def close(self, timeout: float = 60.0) -> None:
         """Stop every child after one last pass, bounded."""

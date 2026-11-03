@@ -370,6 +370,8 @@ class MultiLayerApertureDrain:
                     self._run_flusher.start()
                     self._gather_proc = ApertureGatherProcess.from_env(
                         run_dir, header=self.header, run_id=self.run_id)
+                    if self._gather_proc is not None:
+                        self._run_flusher.on_flush = self._gather_proc.wake
         self._steps: List[StepMeta] = []
         self._pending_entries: List[LayerEntry] = []
         self._closed = False
@@ -518,6 +520,8 @@ class MultiLayerApertureDrain:
         """Record a finished request for the gather's completion stamp."""
         if self._run_index is not None and self.gather_stamp:
             self._run_index.note_finish(req_id, asked=asked)
+            if asked:
+                self._run_flusher.kick()
 
     def flush_run_index(self, *, up_to=None) -> Optional[str]:
         """Publish the next index segment now; return its path or None."""
@@ -818,6 +822,8 @@ class OffLoopApertureDrain(MultiLayerApertureDrain):
                             self._finalize_finish_isolated(item.req_id)
                         elif self._run_index is not None:
                             self._run_index.note_finish(item.req_id, asked=item.asked)
+                            if item.asked:
+                                self._run_flusher.kick()
                     else:
                         self._drain_item(item)
                     self._reclaim_settled_pending()

@@ -59,7 +59,7 @@ HS_LAYOUT = ApertureLayout(
     kind="hs", files=(("hs_layer", "row_shape"),), index_codec="runs-v1",
     index_name="hs_run_index.jsonl", segment_fmt="hs_run_index.seg.%06d.jsonl",
     segment_glob="hs_run_index.seg.*.jsonl",
-    segment_re=re.compile(r"hs_run_index\.seg\.(\d{6})\.jsonl$"),
+    segment_re=re.compile(r"hs_run_index\.seg\.(\d{6,})\.jsonl$"),
     delivery_format="hs-layer-runs-v1",
     trim_marker_fmt="hs_trim.w%02dof%02d.json", trim_marker_glob="hs_trim.w*of*.json",
     trim_marker_format="hs-trim-floor-v1", sidecar_name=HS_SIDECAR_NAME)
@@ -68,7 +68,7 @@ QK_LAYOUT = ApertureLayout(
     kind="qk", files=(("qk_k_layer", "k_row_shape"), ("qk_q_layer", "q_row_shape")),
     index_codec="qk-rows-v1", index_name="qk_run_index.jsonl",
     segment_fmt="qk_run_index.seg.%06d.jsonl", segment_glob="qk_run_index.seg.*.jsonl",
-    segment_re=re.compile(r"qk_run_index\.seg\.(\d{6})\.jsonl$"),
+    segment_re=re.compile(r"qk_run_index\.seg\.(\d{6,})\.jsonl$"),
     delivery_format="qk-layer-runs-v1",
     trim_marker_fmt="qk_trim.w%02dof%02d.json", trim_marker_glob="qk_trim.w*of*.json",
     trim_marker_format="qk-trim-floor-v1", sidecar_name=QK_SIDECAR_NAME)

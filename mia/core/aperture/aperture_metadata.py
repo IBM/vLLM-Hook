@@ -163,12 +163,13 @@ class _NotPlain(Exception):
 
 
 class _Interner:
-    """value -> small int, remembering ``json.dumps(value)``; inserts and ``values()`` lock."""
-    __slots__ = ("_idx", "json", "_lock")
+    """value -> small int, remembering ``json.dumps(value)``; inserts lock, ``values()`` is O(1)."""
+    __slots__ = ("_idx", "json", "_vals", "_lock")
 
     def __init__(self):
         self._idx: dict = {}
         self.json: list = []
+        self._vals: list = []
         self._lock = threading.Lock()
 
     def __call__(self, v) -> int:
@@ -184,16 +185,13 @@ class _Interner:
                     js = json.dumps(v)
                     i = len(self.json)
                     self.json.append(js)
+                    self._vals.append(v)
                     self._idx[key] = i
         return i
 
     def values(self) -> list:
-        with self._lock:
-            items = list(self._idx.items())
-            out: list = [None] * len(self.json)
-        for (_t, v), i in items:
-            out[i] = v
-        return out
+        """Index -> value: the live append-only list (a caller must not mutate it)."""
+        return self._vals
 
 
 class _LayerLists:
