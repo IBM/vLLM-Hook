@@ -25,6 +25,20 @@ def _real_rows(data: Dict, tensors) -> List[Optional[int]]:
     return [int((nz[i] * idx).max()) for i in range(tensors.shape[0])]
 
 
+def _request_means(data: Dict, rows: List[Optional[torch.Tensor]]) -> List[Optional[torch.Tensor]]:
+    """Mean of each request's rows; ``req_passes`` (passes per request) splits the passes."""
+    counts = data.get("req_passes")
+    counts = [len(rows)] if counts is None else [int(c) for c in counts]
+    if sum(counts) != len(rows):
+        raise ValueError(f"req_passes sums to {sum(counts)} but the entry holds {len(rows)} passes")
+    out, start = [], 0
+    for c in counts:
+        rs = [r for r in rows[start:start + c] if r is not None]
+        start += c
+        out.append(torch.cat(rs).float().mean(dim=0).to(rs[0].dtype) if rs else None)
+    return out
+
+
 class HiddenStatesAnalyzer:
     """Captured hidden states per layer, optionally reduced per prompt."""
     def __init__(self, hook_dir: str, layer_to_heads: Dict[int, list]):
@@ -64,9 +78,10 @@ class HiddenStatesAnalyzer:
                     if data.get("hs_mode", "all_tokens") == "last_token":
                         raise ValueError("reduce='mean_tokens' needs hs_mode='all_tokens'")
                     lens = _real_rows(data, tensors)
-                    rows = [t[:n].reshape(n, -1) for t, n in zip(tensors, lens) if t is not None and n]
-                    result[layer_name] = ([torch.cat(rows).float().mean(dim=0).to(rows[0].dtype)]
-                                          if rows else [None])
+                    rows = [None if t is None or not n else
+                            (t.unsqueeze(0) if t.dim() == 1 else t)[:n].flatten(1)
+                            for t, n in zip(tensors, lens)]
+                    result[layer_name] = _request_means(data, rows)
                 elif reduce == "norm":
                     result[layer_name] = [
                         None if t is None else torch.norm(t.float()).item() for t in tensors

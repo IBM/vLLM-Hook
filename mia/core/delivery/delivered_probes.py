@@ -292,8 +292,16 @@ def client_probes(rows_by_layer, meta, module_names) -> dict:
 _DISK_LISTS = {"hs_cache": ("hidden_states",), "qk_cache": ("q", "k_full", "k_prefix_ends")}
 
 
-def merge_disk(into: Optional[dict], one: dict) -> dict:
-    """Append one request's disk-layout probes to a run's cache, as ``flush_disk`` merges them."""
+def pad_req_passes(cache: Optional[dict], n: int) -> None:
+    """Give every HS entry of a run's cache one ``req_passes`` slot per request, ``n`` in all."""
+    for entry in (cache or {}).get("hs_cache", {}).values():
+        rp = entry.get("req_passes")
+        rp = [len(entry["hidden_states"])] if rp is None else list(rp)
+        entry["req_passes"] = rp + [0] * (n - len(rp))
+
+
+def merge_disk(into: Optional[dict], one: dict, slot: Optional[int] = None) -> dict:
+    """Append one request's disk-layout probes, the run's request ``slot``, to a run's cache."""
     key = "qk_cache" if "qk_cache" in one else "hs_cache"
     lists = _DISK_LISTS[key]
     if into is None:
@@ -301,10 +309,20 @@ def merge_disk(into: Optional[dict], one: dict) -> dict:
     for name, entry in one[key].items():
         have = into[key].get(name)
         if have is None:
-            into[key][name] = {**entry, **{k: list(entry[k]) for k in lists}}
+            have = into[key][name] = {**entry, **{k: list(entry[k]) for k in lists}}
+            if key == "hs_cache":
+                have["req_passes"] = []
         else:
+            if key == "hs_cache":
+                # A run written without req_passes counts as one request.
+                have.setdefault("req_passes", [len(have["hidden_states"])])
             for k in lists:
                 have[k].extend(entry[k])
+            if "pass_lens" in have:
+                have["pass_lens"] = have["pass_lens"] + list(entry.get("pass_lens", []))
+        if key == "hs_cache":
+            pad = [] if slot is None else [0] * (slot - len(have["req_passes"]))
+            have["req_passes"] = have["req_passes"] + pad + [len(entry["hidden_states"])]
     return into
 
 

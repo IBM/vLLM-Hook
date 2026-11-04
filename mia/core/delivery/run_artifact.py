@@ -20,7 +20,7 @@ from safetensors import safe_open
 
 from mia.errors import MiaDeliveryError
 from mia.core.delivery.artifact_writer import write_artifact
-from mia.core.delivery.delivered_probes import merge_disk
+from mia.core.delivery.delivered_probes import merge_disk, pad_req_passes
 from mia.core.runtime.tp_shard import rank_dir_name
 from mia.artifacts import QK_REFUSED_FILE, load_and_merge_hs_cache, note_refused_qk
 
@@ -220,10 +220,11 @@ def append(hook_dir: str, run_id: str, *, kind: str, items: Iterable[Tuple[str, 
                     if probes is None:
                         empty.append(str(k))
                         continue
-                    cache = merge_disk(cache, probes)
+                    cache = merge_disk(cache, probes, len(keys) - 1)
                     for e in probes[ckey].values():
                         mode = mode or e.get(mkey)
                 if data:
+                    pad_req_passes(cache, len(keys))
                     _write(kind, cache, d, mode or mode0)
                 for p, ident in stale.items():
                     if _ident(p) == ident:

@@ -131,6 +131,8 @@ def save_hs_cache_safetensors(cpu_cache: dict, run_dir: str,
             "layer_num": entry["layer_num"],
             "hs_mode": mode,
         })
+        if entry.get("req_passes") is not None:
+            layer_order[-1]["req_passes"] = [int(n) for n in entry["req_passes"]]
 
     meta: dict = {
         "config": cpu_cache["config"],

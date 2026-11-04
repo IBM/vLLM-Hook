@@ -46,7 +46,7 @@ The same code shape covers every use case — only `worker_name` / `analyzer_nam
 |---|---|---|---|---|
 | attention tracker | `capture_qk` / `qk` | `attn_tracker` | `input_range`, `attn_func` | `score` per prompt |
 | CoRe reranker | `capture_qk` / `qk` | `core_reranker` | `query_spec`, `na_spec` (+ `run_ids`) | `scores`, `ranking` per case |
-| hidden states | `capture_hs` / `hidden_states` | `hidden_states` | `reduce`: `none` · `mean` · `norm` | `hidden_states` per layer |
+| hidden states | `capture_hs` / `hidden_states` | `hidden_states` | `reduce`: `none` · `mean` · `mean_tokens` · `norm` | `hidden_states` per layer |
 | H-Node detector | `capture_hs` / `hidden_states` | `hnode_hallucination` | `probe_path`, `threshold` | `probabilities`, `verdicts` |
 | science hallucination | `capture_hs` / `hidden_states` | `science_hallucination` | `clf_path`, `model_id`, `label_names` | `predictions`, `prediction_labels` |
 | AttnLink-U | `capture_qk` / `qk` | `attnlink` | `candidates`, `candidate_spans`, `prompt_length` | `scores`, `ranking`, `selected` |
