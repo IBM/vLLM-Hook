@@ -44,6 +44,8 @@ def trim_probes(probes: dict, key: str, expected_len: int) -> None:
             if t.dim() == 3 and t.shape[1] > expected_len:
                 PROF.incr("trim.event")
                 entry[tkey] = t[:, :expected_len, :]
+                if tkey == "hidden_states" and entry.get("pass_lens") is not None:
+                    entry["pass_lens"] = [min(int(n), expected_len) for n in entry["pass_lens"]]
 
 
 def serialize_probes(probes: dict) -> dict:
@@ -197,6 +199,7 @@ def padded_reader(meta: dict) -> Optional[Callable]:
         else:
             targets = {L: torch.zeros(sh, dtype=dtype) for L, sh in shapes.items()}
         step = shape[1] * row
+        meta["pass_lens"] = [int(n) for n in sizes]
         out = {}
         for L, t in targets.items():
             # ctypes, not .numpy(): a numpy export makes the storage non-resizable.
@@ -215,6 +218,8 @@ def padded_offline_probes(padded_by_layer: Dict[int, Any], meta, module_names) -
             raise MiaDeliveryError(f"no module name for delivered layer {layer}")
         cache[module_names[layer]] = {"hidden_states": padded_by_layer[layer], "layer_num": layer,
                                       "hs_mode": meta["hs_mode"]}
+        if meta.get("pass_lens") is not None:
+            cache[module_names[layer]]["pass_lens"] = list(meta["pass_lens"])
     probes = {"hs_cache": cache, "config": dict(meta["config"])}
     trim_probes(probes, "hs_cache", int(meta["n_prompt"]) + int(meta["n_gen"]) - 1)
     return probes
@@ -241,6 +246,8 @@ def hs_probes(rows_by_layer: Dict[int, Any], meta: dict, module_names: Dict[int,
     for layer, passes in split.items():
         hs = stacked[layer] if layout == "rpc" else [p.clone() for p in passes]
         cache[module_names[layer]] = {"hidden_states": hs, "layer_num": layer, "hs_mode": mode}
+        if mode != "last_token":
+            cache[module_names[layer]]["pass_lens"] = [int(p.shape[0]) for p in passes]
     conf = dict(meta["config"])
     if layout == "rpc":
         return {"hs_cache": cache, "config": conf}
@@ -285,8 +292,16 @@ def client_probes(rows_by_layer, meta, module_names) -> dict:
 _DISK_LISTS = {"hs_cache": ("hidden_states",), "qk_cache": ("q", "k_full", "k_prefix_ends")}
 
 
-def merge_disk(into: Optional[dict], one: dict) -> dict:
-    """Append one request's disk-layout probes to a run's cache, as ``flush_disk`` merges them."""
+def pad_req_passes(cache: Optional[dict], n: int) -> None:
+    """Give every HS entry of a run's cache one ``req_passes`` slot per request, ``n`` in all."""
+    for entry in (cache or {}).get("hs_cache", {}).values():
+        rp = entry.get("req_passes")
+        rp = [len(entry["hidden_states"])] if rp is None else list(rp)
+        entry["req_passes"] = rp + [0] * (n - len(rp))
+
+
+def merge_disk(into: Optional[dict], one: dict, slot: Optional[int] = None) -> dict:
+    """Append one request's disk-layout probes, the run's request ``slot``, to a run's cache."""
     key = "qk_cache" if "qk_cache" in one else "hs_cache"
     lists = _DISK_LISTS[key]
     if into is None:
@@ -294,10 +309,20 @@ def merge_disk(into: Optional[dict], one: dict) -> dict:
     for name, entry in one[key].items():
         have = into[key].get(name)
         if have is None:
-            into[key][name] = {**entry, **{k: list(entry[k]) for k in lists}}
+            have = into[key][name] = {**entry, **{k: list(entry[k]) for k in lists}}
+            if key == "hs_cache":
+                have["req_passes"] = []
         else:
+            if key == "hs_cache":
+                # A run written without req_passes counts as one request.
+                have.setdefault("req_passes", [len(have["hidden_states"])])
             for k in lists:
                 have[k].extend(entry[k])
+            if "pass_lens" in have:
+                have["pass_lens"] = have["pass_lens"] + list(entry.get("pass_lens", []))
+        if key == "hs_cache":
+            pad = [] if slot is None else [0] * (slot - len(have["req_passes"]))
+            have["req_passes"] = have["req_passes"] + pad + [len(entry["hidden_states"])]
     return into
 
 

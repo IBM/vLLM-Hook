@@ -1751,7 +1751,7 @@ def _aperture_route_thresholds(worker_kind: str = "hs") -> "tuple[int, int]":
 
 def _analyzer_reducible(analyzer_name, analyzer_spec) -> bool:
     reduce = (analyzer_spec or {}).get("reduce", "none") if isinstance(analyzer_spec, dict) else "none"
-    reducible_reduce = reduce in ("mean", "norm")
+    reducible_reduce = reduce in ("mean", "mean_tokens", "norm")
     if not analyzer_name:
         return reducible_reduce
     entry = None

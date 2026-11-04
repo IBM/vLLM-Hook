@@ -223,7 +223,10 @@ def _load_and_merge_hs_safetensors(
             out[item["module_name"]] = {
                 "hidden_states": hidden_states,
                 "layer_num": item["layer_num"],
+                "hs_mode": hs_mode,
             }
+            if "req_passes" in item:
+                out[item["module_name"]]["req_passes"] = item["req_passes"]
         return out
 
     shards = _load_safetensors_shards(st_paths, "hs_cache", "hidden_states", build_hs_entries)

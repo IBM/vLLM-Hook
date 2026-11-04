@@ -362,7 +362,8 @@ class MiaClient:
         # lazy: keep mia.core.aperture and mia.core.delivery out of import mia; hs_probes patchable at call time
         from mia.core.delivery import run_artifact
         from mia.core.aperture.aperture_gather import delivery_timeout_s
-        from mia.core.delivery.delivered_probes import hs_probes, merge_disk
+        from mia.core.delivery.delivered_probes import (  # lazy: as above
+            hs_probes, merge_disk, pad_req_passes)
 
         nonces = {r: self._run_nonces.get(r) or None for r in (run_ids or [run_id])}
         # As long as the server's writer may wait for a delivery.
@@ -377,14 +378,16 @@ class MiaClient:
                 qk = any(it.get("capture") == "qk" for _r, _k, it in self._run_reads.get(rid_, []))
                 if qk or not (remote and takes and not run_ids):
                     raise
-                cache = None
+                cache, n = None, 0
                 for rid, kind, it in self._run_reads.get(rid_, []):
                     samples, _k, names, config = self._read_delivered(rid, kind, it)
                     for j, rows in enumerate(samples):
                         if rows:
                             cache = merge_disk(cache, hs_probes(
                                 rows, {**_item_meta(it, j), "config": config}, names,
-                                layout="disk"))
+                                layout="disk"), n)
+                        n += 1
+                pad_req_passes(cache, n)
                 with PROF.timed("analyzer.kernel"):
                     return self.analyzer.analyze(analyzer_spec, probes=cache)
         runs = run_ids or [run_id]

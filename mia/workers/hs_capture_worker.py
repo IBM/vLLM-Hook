@@ -182,6 +182,7 @@ class HSCaptureWorker:
                     "output_layers": output_layers,
                     "hs_mode": req_mode,
                     "save_to_disk": bool(extra.get("save_to_disk")),
+                    "is_prefill": is_prefill,
                 })
             return entries
 
@@ -262,6 +263,7 @@ class HSCaptureWorker:
                         layer_states[module_name].update(_hs_scale=[], _hs_qmeta=hs_qmeta)
                 ls = layer_states[module_name]
                 ls["hidden_states"].append(activation)
+                ls["_n_prefill"] = ls.get("_n_prefill", 0) + int(e["is_prefill"])
                 if hs_qmeta is not None:
                     ls["_hs_scale"].append(hs_scale)
 
@@ -484,6 +486,8 @@ class HSCaptureWorker:
                                 stacked = pad_sequence(tensors, batch_first=True)
                         cpu_dict[mod_name] = {"hidden_states": stacked,
                                               "layer_num": entry["layer_num"], "hs_mode": mode}
+                        if mode != "last_token":
+                            cpu_dict[mod_name]["pass_lens"] = [int(t.shape[0]) for t in tensors]
                     else:
                         cpu_dict[mod_name] = {
                             "hidden_states": _cpu_list(entry["hidden_states"], _census_acc),
@@ -491,6 +495,8 @@ class HSCaptureWorker:
                                                     for s in entry.get("_hs_scale", [])],
                             "hidden_states_qmeta": hs_qmeta,
                             "layer_num": entry["layer_num"], "hs_mode": mode}
+                    if mode != "last_token":
+                        cpu_dict[mod_name]["prefill_passes"] = int(entry.get("_n_prefill", 0))
             if _census_bucket is not None:
                 from mia.core.runtime.census import census_emit, census_record
                 census_emit(census_record(worker="hs", sink="rpc", req_id=req_id,
@@ -543,14 +549,17 @@ class HSCaptureWorker:
         cpu_cache: dict = {"config": self._conf, "hs_cache": {}}
         found_any = False
         flushed_ids: list = []
+        n_req = 0
 
         with PROF.timed("worker.cpu_transfer.hs"):
             for external_req_id in external_req_ids:
+                first = n_req
                 for req_id in iter_matching_req_ids(self._disk_states, external_req_id):
                     layer_dict = self._disk_states.pop(req_id)
                     if consumer is not None:
                         consumer.on_pop(req_id, layer_dict, release_pages=False)
                     flushed_ids.append(req_id)
+                    slot, n_req = n_req, n_req + 1
                     if not layer_dict:
                         continue
                     found_any = True
@@ -577,16 +586,22 @@ class HSCaptureWorker:
                         if mod_name in cpu_cache["hs_cache"]:
                             existing = cpu_cache["hs_cache"][mod_name]
                             existing["hidden_states"].extend(cpu_entry["hidden_states"])
+                            rp = existing["req_passes"]
+                            rp += [0] * (slot - len(rp)) + [len(_hs_hostlist)]
                             if hs_qmeta is not None:
                                 existing.setdefault("hidden_states_scale", []).extend(
                                     cpu_entry["hidden_states_scale"])
                                 existing.setdefault("hidden_states_qmeta", hs_qmeta)
                         else:
+                            cpu_entry["req_passes"] = [0] * slot + [len(_hs_hostlist)]
                             cpu_cache["hs_cache"][mod_name] = cpu_entry
                     if _census_bucket is not None:
                         from mia.core.runtime.census import census_emit, census_record
                         census_emit(census_record(worker="hs", sink="disk", req_id=req_id,
                                                    bucket=_census_bucket, acc=_census_acc))
+                n_req = max(n_req, first + 1)  # a request that captured nothing keeps its slot
+        for e in cpu_cache["hs_cache"].values():
+            e["req_passes"] += [0] * (n_req - len(e["req_passes"]))
 
         if not found_any:
             if consumer is not None:

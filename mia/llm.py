@@ -5,6 +5,7 @@ import json
 import uuid
 from typing import Optional, Dict, List
 
+import torch
 import vllm.plugins
 from vllm import LLM, SamplingParams
 
@@ -15,6 +16,16 @@ from mia.artifacts import dispatch_disk_analyze
 from mia._profiler import PROF
 from mia.workers.steer_worker import resolve_steer_modes
 from mia.core.delivery.artifact_quant import dequantize_cache_inplace
+
+
+def _prompt_pass(le: dict, v):
+    """A request's prompt pass: ``v[0]``, or its prefill chunks joined when eager split it."""
+    k = int(le.get("prefill_passes") or 0)
+    if k > 1 and isinstance(v, list):
+        return torch.cat(v[:k])
+    if k > 1 and le.get("pass_lens") is not None and v.dim() == 3:
+        return torch.cat([v[i][:int(n)] for i, n in enumerate(le["pass_lens"][:k])])
+    return v[0]
 
 
 def _merge_probes(all_probes: list) -> dict:
@@ -37,16 +48,23 @@ def _merge_probes(all_probes: list) -> dict:
             for p in all_probes:
                 le = p.get(cache_key, {}).get(layer, {})
                 for k, v in le.items():
-                    if k not in TENSOR_KEYS:
+                    if k not in TENSOR_KEYS and k not in ("pass_lens", "prefill_passes"):
                         entry.setdefault(k, v)
             for tensor_key in TENSOR_KEYS:
                 vals = []
                 for p in all_probes:
                     le = p.get(cache_key, {}).get(layer, {})
                     v = le.get(tensor_key)
-                    vals.append(v[0] if v is not None and len(v) > 0 else None)
+                    if v is None or len(v) == 0:
+                        vals.append(None)
+                    elif cache_key == "hs_cache" and tensor_key == "hidden_states":
+                        vals.append(_prompt_pass(le, v))
+                    else:
+                        vals.append(v[0])
                 if any(v is not None for v in vals):
                     entry[tensor_key] = vals
+            if cache_key == "hs_cache" and "hidden_states" in entry:
+                entry["req_passes"] = [1] * len(entry["hidden_states"])
             merged[cache_key][layer] = entry
     return merged
 
@@ -361,7 +379,8 @@ class MiaLLM:
                 def merged():
                     with PROF.timed("miallm.merge_probes"):
                         parts = [(s() if s is not None else None) or {} for s in srcs]
-                        return _dequantized(_merge_probes(parts)) if any(parts) else None
+                        return (_merge_probes([_dequantized(p) for p in parts])
+                                if any(parts) else None)
                 if any(pending(o) for o in outputs):
                     try:
                         attach_lazy(outputs[0], merged)
