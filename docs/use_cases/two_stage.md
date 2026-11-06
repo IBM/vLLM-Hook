@@ -51,7 +51,7 @@ On this data a second probe on the same prompt changes the false-positive rate b
 
 At one global threshold the false-positive rate also varies by tool suite, from 0.18 on workspace to 0.79 on slack. Thresholds set per suite with `threshold_for_fpr` even this out but lower pooled recall from 0.90 to 0.84 at the same target rate. Recalibrate per deployment if its false-positive budget is fixed and pooled recall matters less.
 
-Scripts and full results are in the training repo.
+The evaluation scripts and per-seed results are not published yet, so these numbers cannot be reproduced from public code until they are.
 
 ---
 
