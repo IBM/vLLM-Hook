@@ -61,9 +61,45 @@ The evaluation scripts and per-seed results are not published yet, so these numb
 
 ---
 
+## On GPU with the current backend
+
+These runs used vLLM 0.32 on one NVIDIA A40 with `gpu_memory_utilization=0.42` and CUDA graphs on.
+
+`examples/demo_two_stage.py` runs end to end and gives the three demo steps the verdicts pass, pass and flag, with risk scores of 0.075, 0.048 and 0.733. Running both analyzers in batches of 32 over all 1,826 steps, the cascade's verdicts differ from a one-step-at-a-time capture on 19 steps and from the stored training features on 17. The `tool_call_risk` analyzer gives the same stage-1 scores. Prefill states from this backend match the training features at a median cosine of 0.99966 (minimum 0.9956), and the released probe's in-sample AUROC on attacked steps is 0.903 on them against 0.902 on the stored ones. At its threshold, 29 of 1,826 verdicts flip.
+
+Capture latency stays within run-to-run noise. On 64 real steps, each generating 32 tokens, the median time per step at batch size 1 is shown below, with all 64 steps in one batch in the last column.
+
+| Configuration | Batch size 1 | 64 steps batched |
+|---|---|---|
+| Capture off | 0.930 s | 8.11 s |
+| Capture at prefill (`tool_call_risk`, `two_stage_probe`) | 0.928 s | 8.06 s |
+| Capture at prefill and every decode pass | 0.935 s | 8.15 s |
+| Plain vLLM without vLLM-Hook | 0.949 s | 8.17 s |
+
+Both analyzers score a batch of 64 steps on CPU in 1.5 ms and 0.5 ms. The GPU was shared with another job, and a lock kept the two from running at once.
+
+### Decision-time stage 2
+
+A second set of hidden states comes from the first 16 generated tokens of the action (`hooks_on="both"`, layer 28, one request per call). This check runs after generation starts but before the tool executes. The probe averages those states and is trained on attacked steps with the outcome label. The evaluation fixed the detectors and protocol in advance and uses the same split and calibration as above. Of the 1,826 steps, 1,626 regenerate the labelled action on this backend and are kept. The table compares each cascade with the released probe at a 90% recall target on those steps.
+
+| Detector | Recall | FPR, attacked but safe | FPR, clean |
+|---|---|---|---|
+| Released probe alone | 0.901 | 0.418 | 0.430 |
+| Stage 2 = injection-presence probe | 0.891 | 0.409 | 0.148 |
+| Stage 2 = decision-time probe | 0.880 [−0.051, +0.006] | 0.292 [−0.188, −0.066] | 0.360 [−0.136, −0.006] |
+| Stage 2 = presence × decision-time probe | 0.880 [−0.052, +0.008] | 0.277 [−0.203, −0.080] | 0.230 [−0.270, −0.130] |
+
+For about two points of recall, the decision-time stage cuts the false-positive rate on attacked-but-safe steps (the model saw an injection and ignored it) by about a third. Multiplying in the presence probe keeps most of the clean-step gain. As a control, a stage that only knows the name of the tool being called reaches 0.343 on attacked-but-safe steps. In a comparison run after these results, the presence-times-decision cascade is lower than that control on both false-positive rates, with intervals that exclude zero, while the decision-time stage alone is not clearly lower on attacked-but-safe steps.
+
+A robustness check adds back the steps whose action changed on this backend. They are regenerated in full and relabelled with AgentDojo 0.1.35, which reproduces every original label. On the resulting 1,774 steps, the presence-times-decision cascade lowers the attacked-but-safe rate from 0.404 to 0.282 [−0.184, −0.062] and the clean rate from 0.399 to 0.222 [−0.253, −0.106]. Recall is 0.872 against 0.902 [−0.064, +0.002]. With a false-positive budget of 0.2 instead of a recall target, the same cascade raises recall from 0.798 to 0.837.
+
+The `two_stage_probe` analyzer does not yet read decode-pass states. Supporting it means grouping passes by request in batched runs.
+
+---
+
 ## Limitations
 
 - The evaluation covers Qwen2.5-7B-Instruct on AgentDojo only, with 97 clean steps. The clean-step result needs checking on real agent traffic before anyone relies on it.
 - The presence probe is a linear probe trained on AgentDojo injections. Other injection styles or tools need their own validation, and a dedicated injection detector can stand in as stage 2 through `TwoStageDetector`.
 - Calibrate on data disjoint from what you report, and refit thresholds when the agent, tools or prompt format change.
-- Both stages read the last prompt token. Decision-time features need a different capture mode and a new probe.
+- The cascade in the analyzer reads the last prompt token only. The decision-time stage above was evaluated with one request per call and needs analyzer support before it can serve batches.
