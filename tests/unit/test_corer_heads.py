@@ -11,7 +11,7 @@ from mia.analyzers.core_reranker_analyzer import CorerAnalyzer
 HEADS, HEAD_DIM, SEQ = 4, 8, 30
 LAYERS = (2, 5)
 DOC_A, DOC_B = (2, 8), (10, 16)
-Q_START, AFTER_INSTRUCT, Q_END = 18, 21, 26
+Q_START, AFTER_INSTRUCT, Q_END = 18, 21, SEQ - 1   # the query ends the prompt
 
 
 def _save_run(hook_dir, run_id, layers, kv_heads=HEADS):
@@ -50,8 +50,7 @@ def _expected_token_scores(layers, layer_to_heads, kv_heads=HEADS):
         n_rows = rows.shape[0]
         for h in heads:
             for r in range(n_rows):
-                # a query row sees the keys up to its offset from the end of the prompt
-                seen = r + SEQ - n_rows + 1
+                seen = Q_START + r + 1      # query row r is prompt position Q_START + r
                 logits = keys[:seen, h // groups] @ rows[r, h] / math.sqrt(HEAD_DIM)
                 total[:seen] += torch.softmax(logits, dim=0) / n_rows
     return [total[s:e + 1] for s, e in (DOC_A, DOC_B)]
