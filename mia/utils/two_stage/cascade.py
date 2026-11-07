@@ -27,15 +27,28 @@ Scorer = Callable[[Any], Sequence[float]]
 _EPS = 1e-9
 
 
-def threshold_for_recall(pos_scores: Sequence[float], recall: float) -> float:
-    """Largest threshold that flags at least ``recall`` of the positives."""
+def _needed(n: int, rate: float, finite_sample: bool) -> int:
+    """Positives that must clear the threshold. ``finite_sample`` uses the split-conformal
+    count ceil((n + 1) * rate), so that a new exchangeable positive clears it with
+    probability at least ``rate``. That count can exceed ``n``."""
+    k = int(np.ceil(((n + 1) if finite_sample else n) * rate - _EPS))
+    return max(k, 1)
+
+
+def threshold_for_recall(pos_scores: Sequence[float], recall: float, finite_sample: bool = False) -> float:
+    """Largest threshold that flags at least ``recall`` of the positives.
+
+    With ``finite_sample=True`` the threshold is the split-conformal one, which holds the
+    recall in expectation on new positives. It is ``-inf`` (flag everything) when there are
+    too few positives for the requested recall.
+    """
     s = np.sort(np.asarray(pos_scores, dtype=np.float64))[::-1]
     if s.size == 0:
         raise ValueError("threshold_for_recall needs at least one positive score")
     if not 0.0 < recall <= 1.0:
         raise ValueError(f"recall must be in (0, 1], got {recall}")
-    k = int(np.ceil(recall * s.size - _EPS))
-    return float(s[max(k, 1) - 1])
+    k = _needed(s.size, recall, finite_sample)
+    return float(s[k - 1]) if k <= s.size else float("-inf")
 
 
 def threshold_for_fpr(neg_scores: Sequence[float], fpr: float) -> float:
@@ -95,12 +108,49 @@ def evaluate_cascade(s1, s2, y, t1: float, t2: float) -> OperatingPoint:
     )
 
 
+def _check_calibration_inputs(s1, s2, y):
+    a = np.asarray(s1, dtype=np.float64)
+    b = np.asarray(s2, dtype=np.float64)
+    y = np.asarray(y).astype(bool)
+    if not (a.shape == b.shape == y.shape) or a.ndim != 1:
+        raise ValueError("s1, s2 and y must be 1-D and the same length")
+    if np.isnan(b).any():
+        raise ValueError("calibration needs stage-2 scores on every calibration item")
+    if y.all() or not y.any():
+        raise ValueError("calibration needs both positives and negatives")
+    return a, b, y
+
+
+def calibrate_cascade_for_fpr(s1, s2, y, target_fpr: float) -> OperatingPoint:
+    """Choose (t1, t2) with the highest recall at a false-positive rate of at most ``target_fpr``.
+
+    This is the fixed-alarm-budget counterpart of ``calibrate_cascade``. Every stage-1
+    threshold is tried. For each, ``t2`` is the smallest value that keeps the negatives
+    flagged by both stages within budget. Ties go to the lower false-positive rate, then to
+    the lower stage-2 rate. Report results on items the calibration never saw.
+    """
+    a, b, y = _check_calibration_inputs(s1, s2, y)
+    if not 0.0 <= target_fpr <= 1.0:
+        raise ValueError(f"target_fpr must be in [0, 1], got {target_fpr}")
+    allowed = int(np.floor(target_fpr * int((~y).sum()) + _EPS))
+    best: Optional[OperatingPoint] = None
+    for t1 in np.unique(a)[::-1]:
+        gate = a >= t1
+        neg = np.sort(b[gate & ~y])[::-1]
+        t2 = float(np.nextafter(neg[allowed], np.inf)) if allowed < neg.size else float("-inf")
+        point = evaluate_cascade(a, b, y, t1, t2)
+        if best is None or (-point.recall, point.fpr, point.stage2_rate) < (-best.recall, best.fpr, best.stage2_rate):
+            best = point
+    return best
+
+
 def calibrate_cascade(
     s1,
     s2,
     y,
     target_recall: float,
     max_stage2_rate: Optional[float] = None,
+    finite_sample: bool = False,
 ) -> OperatingPoint:
     """Choose (t1, t2) with the lowest false-positive rate at ``target_recall``.
 
@@ -110,26 +160,21 @@ def calibrate_cascade(
     tried. For each, ``t2`` is the largest value that keeps overall recall at
     or above the target. Ties go to the lower stage-2 rate. ``max_stage2_rate``
     caps the fraction of items sent to stage 2, for a stage 2 that is
-    expensive to run.
+    expensive to run. ``finite_sample=True`` uses the split-conformal count of
+    positives (see ``threshold_for_recall``), which is slightly stricter.
 
     The returned point describes the calibration set. Report results on items
     the calibration never saw.
     """
-    a = np.asarray(s1, dtype=np.float64)
-    b = np.asarray(s2, dtype=np.float64)
-    y = np.asarray(y).astype(bool)
-    if not (a.shape == b.shape == y.shape) or a.ndim != 1:
-        raise ValueError("s1, s2 and y must be 1-D and the same length")
-    if np.isnan(b).any():
-        raise ValueError("calibrate_cascade needs stage-2 scores on every calibration item")
+    a, b, y = _check_calibration_inputs(s1, s2, y)
     n_pos = int(y.sum())
-    if n_pos == 0 or n_pos == y.size:
-        raise ValueError("calibration needs both positives and negatives")
     if not 0.0 < target_recall <= 1.0:
         raise ValueError(f"target_recall must be in (0, 1], got {target_recall}")
-    need = max(int(np.ceil(target_recall * n_pos - _EPS)), 1)
+    need = _needed(n_pos, target_recall, finite_sample)
+    if need > n_pos:
+        raise ValueError("too few calibration positives for target_recall with finite_sample=True")
 
-    t1_max = threshold_for_recall(a[y], target_recall)
+    t1_max = threshold_for_recall(a[y], target_recall, finite_sample)
     candidates = np.unique(a[y][a[y] <= t1_max])[::-1]   # strictest first
 
     best: Optional[OperatingPoint] = None
@@ -200,3 +245,30 @@ class TwoStageDetector:
             stage2_scores=s2,
             reached_stage2=reached,
         )
+
+
+def save_cascade_config(path: str, stage1_probe: str, stage2_probe: str,
+                        point: OperatingPoint, **meta) -> dict:
+    """Write the ``cascade.json`` that ``two_stage_probe`` reads.
+
+    Probe paths inside the directory of ``path`` are stored relative to it, so the folder can
+    be moved as a unit. ``meta`` (data, split, target) is stored under "calibration" with the
+    operating point measured on the calibration set.
+    """
+    import json
+    import os
+
+    base = os.path.dirname(os.path.abspath(path))
+
+    def rel(p):
+        p = os.path.abspath(p)
+        return os.path.relpath(p, base) if os.path.commonpath([p, base]) == base else p
+
+    cfg = {
+        "stage1": {"probe_path": rel(stage1_probe), "threshold": point.stage1_threshold},
+        "stage2": {"probe_path": rel(stage2_probe), "threshold": point.stage2_threshold},
+        "calibration": {"operating_point": point.to_dict(), **meta},
+    }
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg

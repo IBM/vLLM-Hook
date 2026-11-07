@@ -83,16 +83,25 @@ class TwoStageProbeAnalyzer:
     ) -> Dict:
         """Score each step with both stages.
 
-        Each stage's ``threshold`` defaults to the one in its probe.json. Set
-        ``"score_all": true`` to score stage 2 on every step, which is what
-        recalibrating the thresholds needs.
+        Both thresholds must come from ``cascade.json`` or the spec. Each
+        probe.json threshold is ignored, because it was calibrated for that
+        probe alone. Set ``"score_all": true`` to score stage 2 on every step,
+        which is what recalibrating the thresholds needs.
         """
         spec = analyzer_spec or {}
         stages = resolve_spec(spec)
         p1 = self._probe(stages["stage1"]["probe_path"])
         p2 = self._probe(stages["stage2"]["probe_path"])
-        t1 = float(stages["stage1"].get("threshold", p1.artifact.threshold))
-        t2 = float(stages["stage2"].get("threshold", p2.artifact.threshold))
+        missing = [s for s in STAGES if stages[s].get("threshold") is None]
+        if missing:
+            raise ValueError(
+                f"TwoStageProbeAnalyzer needs a calibrated threshold for {', '.join(missing)}. "
+                "A probe.json threshold was set for that probe alone, so it is not used here. "
+                "Calibrate both with mia.utils.two_stage.calibrate_cascade and write them with "
+                "save_cascade_config, or pass them in the spec."
+            )
+        t1 = float(stages["stage1"]["threshold"])
+        t2 = float(stages["stage2"]["threshold"])
 
         if probes is not None:
             hs_cache = probes["hs_cache"]

@@ -9,8 +9,10 @@ from mia.utils.two_stage.cascade import (
     OperatingPoint,
     TwoStageDetector,
     calibrate_cascade,
+    calibrate_cascade_for_fpr,
     cascade_flags,
     evaluate_cascade,
+    save_cascade_config,
     threshold_for_fpr,
     threshold_for_recall,
 )
@@ -20,8 +22,10 @@ __all__ = [
     "OperatingPoint",
     "TwoStageDetector",
     "calibrate_cascade",
+    "calibrate_cascade_for_fpr",
     "cascade_flags",
     "evaluate_cascade",
+    "save_cascade_config",
     "threshold_for_fpr",
     "threshold_for_recall",
 ]

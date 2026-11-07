@@ -15,8 +15,10 @@ from mia.analyzers.two_stage_probe_analyzer import TwoStageProbeAnalyzer
 from mia.utils.two_stage import (
     TwoStageDetector,
     calibrate_cascade,
+    calibrate_cascade_for_fpr,
     cascade_flags,
     evaluate_cascade,
+    save_cascade_config,
     threshold_for_fpr,
     threshold_for_recall,
 )
@@ -205,7 +207,8 @@ def test_analyzer_flags_only_when_both_stages_fire(tmp_path):
     rng = np.random.default_rng(2)
     x21, x14 = rng.normal(size=(64, HIDDEN)).astype(np.float32), rng.normal(size=(64, HIDDEN)).astype(np.float32)
     out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
-        analyzer_spec={"stage1": {"probe_path": p1}, "stage2": {"probe_path": p2}},
+        analyzer_spec={"stage1": {"probe_path": p1, "threshold": 0.5},
+                       "stage2": {"probe_path": p2, "threshold": 0.5}},
         probes={"hs_cache": _cache(x14, x21)})
     q1, q2 = _prob(x21, a), _prob(x14, b)
     np.testing.assert_allclose(out["stage1"]["probabilities"], q1, rtol=1e-5)
@@ -245,7 +248,8 @@ def test_analyzer_with_open_stage2_matches_tool_call_risk(tmp_path):
     single = ToolCallRiskAnalyzer(str(tmp_path), {}).analyze(
         analyzer_spec={"probe_path": p1}, probes={"hs_cache": cache})
     two = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
-        analyzer_spec={"stage1": {"probe_path": p1}, "stage2": {"probe_path": p2, "threshold": 0.0}},
+        analyzer_spec={"stage1": {"probe_path": p1, "threshold": 0.5},
+                       "stage2": {"probe_path": p2, "threshold": 0.0}},
         probes={"hs_cache": cache})
     assert two["verdicts"] == single["verdicts"]
     np.testing.assert_allclose(two["stage1"]["probabilities"], single["probabilities"], rtol=1e-6)
@@ -259,11 +263,71 @@ def test_analyzer_errors_name_the_fix(tmp_path):
     with pytest.raises(ValueError, match="missing stage2"):
         an.analyze(analyzer_spec={"stage1": {"probe_path": p1}}, probes={"hs_cache": cache})
     with pytest.raises(RuntimeError, match="Add layer 7"):
-        an.analyze(analyzer_spec={"stage1": {"probe_path": p1}, "stage2": {"probe_path": p2,
-                   "threshold": 0.0}}, probes={"hs_cache": cache})
+        an.analyze(analyzer_spec={"stage1": {"probe_path": p1, "threshold": 0.5},
+                                  "stage2": {"probe_path": p2, "threshold": 0.0}},
+                   probes={"hs_cache": cache})
 
 
 def test_both_analyzers_are_registered():
     register_plugins()
     assert PluginRegistry.get_analyzer("tool_call_risk") is not None
     assert PluginRegistry.get_analyzer("two_stage_probe") is not None
+
+
+# ---- r1 additions: release contract ------------------------------------------------------
+
+def test_analyzer_refuses_uncalibrated_thresholds(tmp_path):
+    """probe.json thresholds belong to each probe alone, so the cascade must be given its own."""
+    p1, _ = _write_probe(tmp_path / "s1", 21, 0.5, 0)
+    p2, _ = _write_probe(tmp_path / "s2", 14, 0.5, 1)
+    cache = _cache(*np.zeros((2, 2, HIDDEN), dtype=np.float32))
+    with pytest.raises(ValueError, match="calibrated threshold for stage2"):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
+            analyzer_spec={"stage1": {"probe_path": p1, "threshold": 0.5}, "stage2": {"probe_path": p2}},
+            probes={"hs_cache": cache})
+
+
+def test_calibrate_save_load_round_trip(tmp_path):
+    """calibrate_cascade -> save_cascade_config -> analyzer gives the calibrated verdicts."""
+    p1, a = _write_probe(tmp_path / "s1", 21, 0.5, 0)
+    p2, b = _write_probe(tmp_path / "s2", 14, 0.5, 1)
+    rng = np.random.default_rng(5)
+    x21, x14 = rng.normal(size=(200, HIDDEN)).astype(np.float32), rng.normal(size=(200, HIDDEN)).astype(np.float32)
+    q1, q2 = _prob(x21, a), _prob(x14, b)
+    y = (q1 + q2 + rng.normal(scale=0.3, size=200)) > 1.0
+    op = calibrate_cascade(q1, q2, y, 0.9)
+    cfg = save_cascade_config(str(tmp_path / "cascade.json"), p1, p2, op, data="synthetic")
+    assert cfg["stage1"]["probe_path"] == "s1/probe.npz" and cfg["calibration"]["data"] == "synthetic"
+    out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
+        analyzer_spec={"cascade_path": str(tmp_path / "cascade.json")}, probes={"hs_cache": _cache(x14, x21)})
+    want = cascade_flags(q1, q2, op.stage1_threshold, op.stage2_threshold)
+    assert out["verdicts"] == ["flag" if f else "pass" for f in want]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_fpr_calibration_matches_brute_force(seed):
+    rng = np.random.default_rng(300 + seed)
+    n = 30
+    s1, s2 = rng.integers(0, 6, n).astype(float), rng.integers(0, 6, n).astype(float)
+    y = rng.random(n) < 0.4
+    y[:2] = [True, False]
+    target = 0.25
+    pts = [evaluate_cascade(s1, s2, y, t1, t2)
+           for t1 in np.unique(s1) for t2 in np.r_[np.unique(s2), np.inf]]
+    best = max(p.recall for p in pts if p.fpr <= target)
+    op = calibrate_cascade_for_fpr(s1, s2, y, target)
+    assert op.fpr <= target + 1e-12 and op.recall == pytest.approx(best)
+
+
+def test_finite_sample_threshold_is_conformal_and_stricter():
+    pos = np.arange(1, 20, dtype=float)                   # 19 positives
+    assert threshold_for_recall(pos, 0.9, finite_sample=True) == 2.0    # ceil(20 * 0.9) = 18th largest
+    assert threshold_for_recall(pos, 0.9) == 2.0                        # ceil(19 * 0.9) = 18th largest
+    assert threshold_for_recall(pos, 0.95, finite_sample=True) == 1.0   # ceil(20 * 0.95) = 19
+    assert threshold_for_recall(pos, 0.99, finite_sample=True) == float("-inf")
+    s1, s2, y = _synthetic(400, 8)
+    loose = calibrate_cascade(s1, s2, y, 0.9)
+    strict = calibrate_cascade(s1, s2, y, 0.9, finite_sample=True)
+    assert strict.recall >= loose.recall
+    with pytest.raises(ValueError, match="too few calibration positives"):
+        calibrate_cascade(s1[:20], s2[:20], y[:20] | (np.arange(20) < 2), 0.99, finite_sample=True)
