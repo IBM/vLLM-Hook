@@ -9,6 +9,7 @@ Downloads the probes, the calibrated cascade.json and three AgentDojo steps on f
 """
 from __future__ import annotations
 
+import argparse
 import json
 import multiprocessing as mp
 import os
@@ -62,13 +63,18 @@ def report(steps, actions, result):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    args = parser.parse_args()
+
     ensure_artifacts()
     with open(os.path.join(ART_DIR, "demo_steps.jsonl")) as f:
         steps = [json.loads(line) for line in f]
 
     llm = MiaLLM(model=MODEL, worker_name="capture_hs", analyzer_name="two_stage_probe",
                  config_file=INFER_CFG, hook_dir="/dev/shm/mia",
-                 gpu_memory_utilization=0.8, max_model_len=4096)
+                 gpu_memory_utilization=args.gpu_memory_utilization, max_model_len=args.max_model_len)
     prompts = [
         {"prompt_token_ids": llm.tokenizer.apply_chat_template(
             s["messages"], tools=s["tools"], add_generation_prompt=True, tokenize=True,
