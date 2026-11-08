@@ -24,8 +24,9 @@ Requiring both stages can lower the false-positive rate of stage 1 but can never
 | `threshold_for_fpr(neg_scores, fpr)` | Single-stage threshold for a false-positive budget, from negatives alone such as one deployment's benign traffic. |
 | `TwoStageDetector(stage1, stage2, t1, t2)` | Runs any two scorers and calls `stage2` only on the stage-1 flags. |
 | `save_cascade_config(path, stage1_probe, stage2_probe, point, **meta)` | Writes the `cascade.json` the analyzer reads. |
+| `tool_call_window(tokenizer, token_ids, max_tokens=64)` | Generated-token window of the first tool call in an action, for a `decode_window` probe. |
 
-The `two_stage_probe` analyzer (worker `capture_hs`) runs linear probes in the `tool_call_risk` artifact format on one capture. A stage is one probe or a product of probes (`{"product": [...]}`). Each probe reads either the last prompt token (`"position": "prompt_last"`, the default) or the mean of the states for the first generated tokens (`"decode_mean"`), as set in its probe.json or the spec:
+The `two_stage_probe` analyzer (worker `capture_hs`) runs linear probes in the `tool_call_risk` artifact format on one capture. A stage is one probe or a product of probes (`{"product": [...]}`). Each probe reads the last prompt token (`"position": "prompt_last"`, the default), the mean of the states for the first generated tokens (`"decode_mean"`), or their mean over a per-request window of generated tokens (`"decode_window"`), as set in its probe.json or the spec:
 
 ```python
 from mia.utils.two_stage import calibrate_cascade, save_cascade_config
