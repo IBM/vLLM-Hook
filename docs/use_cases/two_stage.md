@@ -18,14 +18,14 @@ Requiring both stages can lower the false-positive rate of stage 1 but can never
 
 | Function | Use |
 |---|---|
-| `calibrate_cascade(s1, s2, y, target_recall, max_stage2_rate=None, finite_sample=False)` | Lowest false-positive rate at a target recall. `max_stage2_rate` caps the share of steps sent to an expensive stage 2. |
+| `calibrate_cascade(s1, s2, y, target_recall, max_stage2_rate=None, finite_sample=False, stage1_recall=None)` | Lowest false-positive rate at a target recall. `max_stage2_rate` caps the share of steps sent to an expensive stage 2. `stage1_recall` fixes the stage-1 gate and searches only the stage-2 threshold, which holds recall better on new data. |
 | `calibrate_cascade_for_fpr(s1, s2, y, target_fpr)` | Highest recall within a false-positive budget. |
 | `threshold_for_recall(pos_scores, recall, finite_sample=False)` | Single-stage threshold for a target recall. `finite_sample=True` uses the split-conformal count. |
 | `threshold_for_fpr(neg_scores, fpr)` | Single-stage threshold for a false-positive budget, from negatives alone such as one deployment's benign traffic. |
 | `TwoStageDetector(stage1, stage2, t1, t2)` | Runs any two scorers and calls `stage2` only on the stage-1 flags. |
 | `save_cascade_config(path, stage1_probe, stage2_probe, point, **meta)` | Writes the `cascade.json` the analyzer reads. |
 
-The `two_stage_probe` analyzer (worker `capture_hs`) runs two linear probes in the `tool_call_risk` artifact format on one capture:
+The `two_stage_probe` analyzer (worker `capture_hs`) runs linear probes in the `tool_call_risk` artifact format on one capture. A stage is one probe or a product of probes (`{"product": [...]}`). Each probe reads either the last prompt token (`"position": "prompt_last"`, the default) or the mean of the states for the first generated tokens (`"decode_mean"`), as set in its probe.json or the spec:
 
 ```python
 from mia.utils.two_stage import calibrate_cascade, save_cascade_config
@@ -37,7 +37,7 @@ out = llm.analyze(analyzer_spec={"cascade_path": "cascade.json"}, run_id=run_id)
 # out["verdicts"], out["reached_stage2"], out["stage1"]["probabilities"], out["stage2"]["probabilities"]
 ```
 
-Both thresholds must come from `cascade.json` or the spec. The analyzer ignores each `probe.json` threshold, because that one was set for the probe on its own. The infer config must capture every probe layer. `"score_all": true` scores stage 2 on every step, which recalibration needs.
+Both thresholds must come from `cascade.json` or the spec. The analyzer ignores each `probe.json` threshold, because that one was set for the probe on its own. The infer config must capture every probe layer. `"score_all": true` scores stage 2 on every step, which recalibration needs. A `decode_mean` probe needs each request's own capture, so generate with `extra_args={"hooks_on": "both"}` and `merge_probes=False`, then pass `probes=[o.probes for o in outputs]`. The default merged capture keeps only the prompt passes.
 
 ---
 
@@ -65,7 +65,7 @@ The evaluation scripts and per-seed results are not published yet, so these numb
 
 These runs used vLLM 0.32 on one NVIDIA A40 with `gpu_memory_utilization=0.42` and CUDA graphs on.
 
-`examples/demo_two_stage.py` runs end to end and gives the three demo steps the verdicts pass, pass and flag, with risk scores of 0.075, 0.048 and 0.733. Running both analyzers in batches of 32 over all 1,826 steps, the cascade's verdicts differ from a one-step-at-a-time capture on 19 steps and from the stored training features on 17. The `tool_call_risk` analyzer gives the same stage-1 scores. Prefill states from this backend match the training features at a median cosine of 0.99966 (minimum 0.9956), and the released probe's in-sample AUROC on attacked steps is 0.903 on them against 0.902 on the stored ones. At its threshold, 29 of 1,826 verdicts flip.
+`examples/demo_two_stage.py` runs end to end and gives the three demo steps the verdicts pass, pass and flag, with risk scores of 0.075, 0.048 and 0.733. Running both analyzers in batches of 32 over all 1,826 steps, the cascade's verdicts differ from a one-step-at-a-time capture on 19 steps and from the stored training features on 17. The `tool_call_risk` analyzer gives the same stage-1 scores. Prefill states from this backend match the training features at a median cosine of 0.99966 (minimum 0.9956), and the released probe's in-sample AUROC on attacked steps is 0.903 on them against 0.902 on the stored ones. At its 90%-recall threshold of 0.11, 29 of 1,826 verdicts flip between backends and 19 between batched and one-at-a-time capture on this backend, because 155 steps score within 0.02 of that threshold. At a threshold of 0.5 the counts are 9 and 7. Retraining the probes on this backend's states changes held-out recall and false-positive rates by at most 0.023.
 
 Capture latency stays within run-to-run noise. On 64 real steps, each generating 32 tokens, the median time per step at batch size 1 is shown below, with all 64 steps in one batch in the last column.
 
@@ -91,9 +91,23 @@ A second set of hidden states comes from the first 16 generated tokens of the ac
 
 For about two points of recall, the decision-time stage cuts the false-positive rate on attacked-but-safe steps (the model saw an injection and ignored it) by about a third. Multiplying in the presence probe keeps most of the clean-step gain. As a control, a stage that only knows the name of the tool being called reaches 0.343 on attacked-but-safe steps. In a comparison run after these results, the presence-times-decision cascade is lower than that control on both false-positive rates, with intervals that exclude zero, while the decision-time stage alone is not clearly lower on attacked-but-safe steps.
 
-A robustness check adds back the steps whose action changed on this backend. They are regenerated in full and relabelled with AgentDojo 0.1.35, which reproduces every original label. On the resulting 1,774 steps, the presence-times-decision cascade lowers the attacked-but-safe rate from 0.404 to 0.282 [−0.184, −0.062] and the clean rate from 0.399 to 0.222 [−0.253, −0.106]. Recall is 0.872 against 0.902 [−0.064, +0.002]. With a false-positive budget of 0.2 instead of a recall target, the same cascade raises recall from 0.798 to 0.837.
+A second check adds back the steps whose action changed on this backend. They are regenerated in full and relabelled with AgentDojo 0.1.35, which reproduces every original label. On the resulting 1,774 steps, the presence-times-decision cascade lowers the attacked-but-safe rate from 0.404 to 0.282 [−0.184, −0.062] and the clean rate from 0.399 to 0.222 [−0.253, −0.106]. Recall is 0.872 against 0.902 [−0.064, +0.002]. With a false-positive budget of 0.2 instead of a recall target, the same cascade raises recall from 0.798 to 0.837.
 
-The `two_stage_probe` analyzer does not yet read decode-pass states. Supporting it means grouping passes by request in batched runs.
+Calibration matters for this cascade. Searching both thresholds on out-of-fold scores leaves realized recall two to three points under the target. Fixing the stage-1 gate at 97% recall (`stage1_recall=0.97`) and searching only the stage-2 threshold fixes that. With probes retrained on this backend's states, the 1,774-step results against the released probe are below.
+
+| | Released probe | Decision cascade with fixed gate | Interval of the change |
+|---|---|---|---|
+| Recall | 0.899 | 0.893 | [−0.038, +0.028] |
+| FPR, attacked but safe | 0.402 | 0.289 | [−0.167, −0.057] |
+| FPR, clean | 0.389 | 0.232 | [−0.232, −0.080] |
+
+The fixed gate costs about two points of false-positive rate against the joint search, and it is the wrong choice for the presence-only cascade, whose attacked-but-safe rate rises to 0.57 under it.
+
+The analyzer serves this stage in batches. Generate with `hooks_on="both"` and `merge_probes=False`, and give the decision probe `"position": "decode_mean"` in its probe.json. In batches of 32 over all 1,826 steps, every request kept its 17 passes. On 1,641 steps the batched run generated the same first 17 tokens as a one-at-a-time run, and on those the verdicts differ on 10, with stage-2 scores within 0.016. On the other 185 steps the model wrote a different action, which the stage then scores.
+
+Reading each request's decode rows back is slow in batches. A batch of 32 takes 3.0 s against 0.86 s with capture off, or 0.93 s with the decode rows captured but not read. One request on its own takes 0.56 s against 0.50 s. Neither a 5 ms delivery poll nor six gather workers changed the batched time, and reading in parallel threads made it slower.
+
+`examples/demo_two_stage.py --decision` runs this cascade. On the three demo steps it passes the clean step and flags both injected ones. One of the two is the demo step in which the model ignores the injection (stage 2 at 0.205 against a threshold of 0.096), and the prompt-only cascade passes it.
 
 ---
 
@@ -102,4 +116,4 @@ The `two_stage_probe` analyzer does not yet read decode-pass states. Supporting 
 - The evaluation covers Qwen2.5-7B-Instruct on AgentDojo only, with 97 clean steps. The clean-step result needs checking on real agent traffic before anyone relies on it.
 - The presence probe is a linear probe trained on AgentDojo injections. Other injection styles or tools need their own validation, and a dedicated injection detector can stand in as stage 2 through `TwoStageDetector`.
 - Calibrate on data disjoint from what you report, and refit thresholds when the agent, tools or prompt format change.
-- The cascade in the analyzer reads the last prompt token only. The decision-time stage above was evaluated with one request per call and needs analyzer support before it can serve batches.
+- Decision-time probes work with offline `MiaLLM` and `merge_probes=False`. The served path (`MiaClient`) does not return per-request decode passes, and batched delivery of decode rows adds about 2 s per batch of 32 on an A40.
