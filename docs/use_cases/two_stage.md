@@ -82,6 +82,12 @@ vLLM-Hook's own Attention Tracker analyzer can serve as stage 2 with no training
 
 Granite 3.1 needed two accommodations. Its chat template drops `tool_calls` and replaces the tool-calling instruction whenever a system message is given. So prior calls are written in its own `<|tool_call|>` syntax and that instruction is prepended. Even so, Granite never emitted `<|tool_call|>`, and its actions were read from any JSON call in the text. Strict parsing finds only 13 unsafe steps, too few to evaluate.
 
+### Clean steps at every depth of a task
+
+The clean steps above sit at one point of each task, the same depth as the attacked steps with the injection. Cutting each task's own ground-truth trajectory before its first call and after every call gives 337 more clean steps per model, with no injection anywhere. Scored by detectors trained and calibrated on the original steps of the other user tasks, they draw far more false alarms than the original clean steps. The risk probe alone flags 0.713 of them on Qwen, 0.670 on Granite and 0.790 on Hermes, against 0.405, 0.345 and 0.371 on the original clean steps. The presence cascade flags 0.336, 0.539 and 0.433, against 0.165, 0.211 and 0.144. It still lowers the risk probe's rate on every model (intervals [−0.435, −0.319], [−0.185, −0.077] and [−0.413, −0.295]).
+
+Most of the presence cascade's excess is at a task's first step, before any tool has returned anything. There it flags 0.778, 1.000 and 0.933 of the steps. In AgentDojo's setting an injection can only arrive in a tool output, so a deployment like it can skip steps that hold none, which the caller has to do because the analyzer scores every request. This is a recommendation, not something the evaluation tested, and it does not apply when untrusted text reaches the prompt another way, such as retrieved documents. On the steps with at least one tool output the presence cascade flags 0.157, 0.352 and 0.231, still above the original clean-step rates on Granite and Hermes, and the risk probe alone still flags 0.606, 0.536 and 0.721.
+
 ### Reading the decision stage at the tool call
 
 Granite starts its call within the first 16 tokens in 106 of its 150 unsafe actions (Qwen 268 of 353, Hermes 88 of 104). It writes the arguments before the tool name, and the name comes after token 16 in 116 of the 150. Its safe calls usually start later, after token 16 in 162 of 253, while 33 of its unsafe calls do.
@@ -177,7 +183,7 @@ Reading each request's decode rows back is slow in batches. Across five measurem
 
 ## Limitations
 
-- The evaluation covers three 8B-class models on AgentDojo v1 only, with 97 clean steps per model. The clean-step result needs checking on real agent traffic before anyone relies on it.
+- The evaluation covers three 8B-class models on AgentDojo v1 only, with 97 clean steps per model at the injection depth and 337 more across every depth of each task. False alarms are much higher on the latter. Skipping steps without a tool output removes the worst of them but not all, and the clean-step rate needs checking on real agent traffic before anyone relies on it.
 - The presence probe is a linear probe trained on AgentDojo injections. Other injection styles or tools need their own validation, and a dedicated injection detector can stand in as stage 2 through `TwoStageDetector`.
 - Calibrate on data disjoint from what you report, and refit thresholds when the agent, tools or prompt format change.
 - In splits A to C each test step's injection task also appears in training. On held-out injection tasks the decision stage lost recall on Qwen, and on Hermes among steps with a tool call, and every detector, the risk probe included, lost recall on the newer v1.2 injection tasks. Validate on attacks that were not in the training data.
