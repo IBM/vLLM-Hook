@@ -57,6 +57,28 @@ A second risk probe barely helps, because the two probes rank steps alike (Spear
 
 At one global threshold the false-positive rate also varies by tool suite, from 0.18 on workspace to 0.79 on slack. Thresholds set per suite with `threshold_for_fpr` even this out but lower pooled recall from 0.90 to 0.84 at the same budget.
 
+## Other models, tool suites and attack templates
+
+The same pipeline ran on two more 8B models: ibm-granite/granite-3.1-8b-instruct and NousResearch/Hermes-3-Llama-3.1-8B, with Qwen2.5-7B-Instruct rerun alongside. For each model one GPU pass captures the states and continues the same generation, and the labels describe the exact action the features saw. The probes read the model's last decoder layer (28, 40 and 32). The evaluation was fixed before any of these captures existed. Split A groups folds by user task, as above, split B holds out a whole tool suite, and split C holds out a whole attack template. Brackets are 95% intervals of the change from the risk probe alone, at a 90% recall target. Split C has no clean steps in its test sets (n.a.).
+
+| Model (unsafe steps) | Split | Risk probe alone: recall / FPR attacked-safe / FPR clean | Presence cascade: FPR clean | Decision cascade: FPR attacked-safe |
+|---|---|---|---|---|
+| Qwen2.5-7B (353) | A | 0.900 / 0.432 / 0.405 | 0.165 [−0.314, −0.165] | 0.331 [−0.160, −0.040] |
+| | B | 0.907 / 0.485 / 0.412 | 0.144 [−0.361, −0.175] | 0.685 [+0.102, +0.301] |
+| | C | 0.904 / 0.385 / n.a. | n.a. | 0.312 [−0.130, −0.015] |
+| Granite-3.1-8B (150) | A | 0.893 / 0.346 / 0.345 | 0.211 [−0.191, −0.080] | 0.439 [+0.033, +0.152] |
+| | B | 0.847 / 0.456 / 0.433 | 0.289 [−0.216, −0.082] | 0.400 [−0.152, +0.037] |
+| | C | 0.953 / 0.372 / n.a. | n.a. | 0.377 [−0.052, +0.064] |
+| Hermes-3-Llama-3.1-8B (104) | A | 0.904 / 0.347 / 0.371 | 0.144 [−0.299, −0.152] | 0.144 [−0.261, −0.144] |
+| | B | 0.856 / 0.433 / 0.412 | 0.381 [−0.072, 0.000] | 0.242 [−0.269, −0.120] |
+| | C | 0.904 / 0.403 / n.a. | n.a. | 0.114 [−0.348, −0.232] |
+
+The presence cascade cuts clean-step false alarms on all three models in split A, and on held-out tool suites for Qwen and Granite. Its recall cost stays within about two points, except Hermes in split A at 0.865.
+
+The decision cascade depends on how fast the model writes its call. Qwen and Hermes start a JSON call within the first 80 characters in 76% and 85% of their unsafe actions, and for them the decision stage lowers the attacked-but-safe rate. Hermes gains on every split. Qwen gains in splits A and C, but on a held-out suite its thresholds do not transfer and the rate rises. Recalibrating only the thresholds on half of the new suite's user tasks brings Qwen back to 0.409 against 0.503 [−0.161, −0.032]. Granite writes the call within 80 characters in only 32% of its unsafe actions, usually after a sentence of prose, and the decision stage does not help it.
+
+Granite 3.1 needed two accommodations. Its chat template drops `tool_calls` and replaces the tool-calling instruction whenever a system message is given. So prior calls are written in its own `<|tool_call|>` syntax and that instruction is prepended. Even so, Granite never emitted `<|tool_call|>`, and its actions were read from any JSON call in the text. Strict parsing finds only 13 unsafe steps, too few to evaluate.
+
 The evaluation scripts and per-seed results are not published yet, so these numbers cannot be reproduced from public code until they are.
 
 ---
