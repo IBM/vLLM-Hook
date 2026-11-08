@@ -16,6 +16,7 @@ from mia.utils.two_stage.cascade import (
     threshold_for_fpr,
     threshold_for_recall,
 )
+from mia.utils.two_stage.tool_call import find_tool_call, tool_call_window
 
 __all__ = [
     "CascadeResult",
@@ -25,7 +26,9 @@ __all__ = [
     "calibrate_cascade_for_fpr",
     "cascade_flags",
     "evaluate_cascade",
+    "find_tool_call",
     "save_cascade_config",
     "threshold_for_fpr",
     "threshold_for_recall",
+    "tool_call_window",
 ]

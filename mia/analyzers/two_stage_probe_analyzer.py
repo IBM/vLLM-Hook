@@ -11,6 +11,11 @@ Each probe reads one layer at one position:
                 request's own capture with ``hooks_on="both"``:
                 ``out = llm.generate(prompts, sp, merge_probes=False)`` and
                 ``probes=[o.probes for o in out]``.
+  decode_window mean of the states for the generated tokens in a per-request window, given as
+                ``"decode_windows": [[start, end] or None, ...]`` in the spec, one entry per
+                request (0-based generated-token indices, end exclusive). A request without a
+                window falls back to tokens 1..decode_tokens. ``mia.utils.two_stage.tool_call_window``
+                finds the window of the first tool call. Same capture as decode_mean.
 ``position`` and ``decode_tokens`` default to the probe's probe.json and can be set in the spec.
 Nothing here depends on the task the probes were trained for.
 """
@@ -28,7 +33,7 @@ from mia.utils.tool_call_risk.score import ToolCallRiskProbe
 from mia.utils.two_stage.cascade import TwoStageDetector
 
 STAGES = ("stage1", "stage2")
-POSITIONS = ("prompt_last", "decode_mean")
+POSITIONS = ("prompt_last", "decode_mean", "decode_window")
 
 
 def _layer_entry(hs_cache: Dict, layer: int) -> Dict:
@@ -50,20 +55,29 @@ def last_token_features(hs_cache: Dict, layer: int) -> np.ndarray:
 
 
 def request_features(probes: Dict, layer: int, position: str = "prompt_last",
-                     decode_tokens: int = 16) -> np.ndarray:
-    """(hidden,) feature of one request from its own capture (``merge_probes=False``)."""
+                     decode_tokens: int = 16, window: Optional[Sequence[int]] = None) -> np.ndarray:
+    """(hidden,) feature of one request from its own capture (``merge_probes=False``).
+
+    Decode pass ``t`` (0-based) is the state whose input is generated token ``t``, so the last
+    generated token has no state. ``window`` is used by ``decode_window`` only.
+    """
     entry = _layer_entry(probes["hs_cache"], layer)
     passes = [t if t.dim() == 1 else t[-1] for t in unpack_hidden_states(entry)]
     n_prefill = max(int(entry.get("_n_prefill", 1)), 1)
     if position == "prompt_last":
         return passes[n_prefill - 1].float().cpu().numpy()
-    if position != "decode_mean":
+    if position not in ("decode_mean", "decode_window"):
         raise ValueError(f"position must be one of {POSITIONS}, got {position!r}")
-    dec = passes[n_prefill:n_prefill + decode_tokens]
+    start, end = 0, decode_tokens
+    if position == "decode_window" and window is not None:
+        start, end = int(window[0]), int(window[1])
+        if not 0 <= start < end:
+            raise ValueError(f"decode window must satisfy 0 <= start < end, got {window!r}")
+    dec = passes[n_prefill + start:n_prefill + end]
     if not dec:
         raise ValueError(
-            "decode_mean needs decode-pass states: generate with SamplingParams(extra_args="
-            "{'hooks_on': 'both'}) and max_tokens >= 2")
+            f"{position} needs decode-pass states for generated tokens {start}..{end - 1}: generate with "
+            "SamplingParams(extra_args={'hooks_on': 'both'}) and enough max_tokens")
     return torch.stack(dec).float().mean(0).cpu().numpy()
 
 
@@ -121,7 +135,7 @@ class TwoStageProbeAnalyzer:
         return self._probes[path]
 
     def _features(self, member: Dict, probe: ToolCallRiskProbe,
-                  probes: Union[Dict, Sequence[Dict]]) -> np.ndarray:
+                  probes: Union[Dict, Sequence[Dict]], windows: Optional[Sequence] = None) -> np.ndarray:
         position = member.get("position", probe.artifact.meta.get("position", "prompt_last"))
         k = int(member.get("decode_tokens", probe.artifact.meta.get("decode_tokens", 16)))
         if isinstance(probes, dict):
@@ -131,7 +145,10 @@ class TwoStageProbeAnalyzer:
                     "does not hold. Generate with merge_probes=False and pass "
                     "probes=[o.probes for o in outputs].")
             return last_token_features(probes["hs_cache"], probe.layer)
-        return np.stack([request_features(p, probe.layer, position, k) for p in probes])
+        if windows is not None and len(windows) != len(probes):
+            raise ValueError(f"decode_windows has {len(windows)} entries for {len(probes)} requests")
+        return np.stack([request_features(p, probe.layer, position, k, windows[i] if windows is not None else None)
+                         for i, p in enumerate(probes)])
 
     def analyze(
         self,
@@ -171,7 +188,7 @@ class TwoStageProbeAnalyzer:
             feats[s] = []
             for m in stages[s]["members"]:
                 pr = self._probe(m["probe_path"])
-                feats[s].append((pr, self._features(m, pr, probes)))
+                feats[s].append((pr, self._features(m, pr, probes, spec.get("decode_windows"))))
         n = len(feats["stage1"][0][1])
 
         def scorer(stage):

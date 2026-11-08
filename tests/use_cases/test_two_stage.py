@@ -433,3 +433,85 @@ def test_save_cascade_config_writes_product_stage(tmp_path):
     out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
         analyzer_spec={"cascade_path": str(tmp_path / "cascade.json"), "score_all": True}, probes=reqs)
     assert len(out["verdicts"]) == 4 and all(p is not None for p in out["stage2"]["probabilities"])
+
+
+# ---- r5: decision probes read at the tool call --------------------------------------------
+
+from mia.utils.two_stage import find_tool_call, tool_call_window  # noqa: E402
+
+
+class _CharTokenizer:
+    """One token per character, so token and character positions coincide."""
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids)
+
+
+class _ChunkTokenizer:
+    """Fixed-width multi-character tokens, as a stand-in for a subword vocabulary."""
+    def __init__(self, text, width=3):
+        self.pieces = [text[i:i + width] for i in range(0, len(text), width)]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(self.pieces[i] for i in ids)
+
+
+@pytest.mark.parametrize("text,start,end_char", [
+    ('<tool_call>\n{"name": "send_money", "arguments": {"iban": "X"}}\n</tool_call>', 0, '}}'),
+    ('Sure, let me check.\n<tool_call>[{"arguments": {"file_id": "13"}, "name": "delete_file"}]', 20, '}]'),
+    ('The file is ready. {"name": "read_file", "parameters": {"id": 1}} done', 19, '}}'),
+])
+def test_find_tool_call_formats(text, start, end_char):
+    s, e = find_tool_call(text)
+    assert s == start and text[e - 2:e] == end_char
+
+
+def test_find_tool_call_ignores_json_without_a_call_and_keeps_a_bare_tag():
+    assert find_tool_call('Totals: {"a": 1} and [1, 2]') is None
+    assert find_tool_call("no call here") is None
+    text = 'Plan first. <tool_call>{"name": "x", "argu'
+    assert find_tool_call(text) == (text.index("<tool_call>"), len(text))
+
+
+def test_tool_call_window_indexes_generated_tokens():
+    text = 'I will look it up. <tool_call>{"name": "search", "arguments": {"q": "paris"}}</tool_call>'
+    s, e = find_tool_call(text)
+    ids = [ord(c) for c in text]
+    assert tool_call_window(_CharTokenizer(), ids) == (s, e)
+    assert tool_call_window(_CharTokenizer(), ids, max_tokens=8) == (s, s + 8)
+    tok = _ChunkTokenizer(text)
+    w = tool_call_window(tok, list(range(len(tok.pieces))))
+    assert w == (s // 3, (e - 1) // 3 + 1)
+    assert tool_call_window(_CharTokenizer(), [ord(c) for c in "just text"]) is None
+    assert tool_call_window(_CharTokenizer(), []) is None
+
+
+def test_decode_window_reads_the_given_tokens_and_falls_back():
+    rng = np.random.default_rng(20)
+    pl, dec = rng.normal(size=HIDDEN).astype(np.float32), rng.normal(size=(30, HIDDEN)).astype(np.float32)
+    req = _request(pl, list(dec))
+    np.testing.assert_allclose(request_features(req, 21, "decode_window", 16, (5, 9)), dec[5:9].mean(0), rtol=1e-5)
+    np.testing.assert_allclose(request_features(req, 21, "decode_window", 4, None), dec[:4].mean(0), rtol=1e-5)
+    np.testing.assert_allclose(request_features(req, 21, "decode_window", 16, (20, 64)), dec[20:].mean(0), rtol=1e-5)
+    with pytest.raises(ValueError, match="start < end"):
+        request_features(req, 21, "decode_window", 16, (9, 9))
+    with pytest.raises(ValueError, match="generated tokens 40"):
+        request_features(req, 21, "decode_window", 16, (40, 50))
+
+
+def test_analyzer_takes_per_request_decode_windows(tmp_path):
+    p1, a = _write_positioned(tmp_path / "s1", 21, 0, "prompt_last")
+    pw, c = _write_positioned(tmp_path / "win", 21, 3, "decode_window", decode_tokens=4)
+    rng = np.random.default_rng(21)
+    n = 12
+    pl = rng.normal(size=(n, HIDDEN)).astype(np.float32)
+    dec = rng.normal(size=(n, 20, HIDDEN)).astype(np.float32)
+    reqs = [_request(pl[i], list(dec[i])) for i in range(n)]
+    windows = [(i, i + 5) if i % 3 else None for i in range(n)]
+    spec = {"stage1": {"probe_path": p1, "threshold": 0.4}, "stage2": {"probe_path": pw, "threshold": 0.3},
+            "decode_windows": windows, "score_all": True}
+    out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(analyzer_spec=spec, probes=reqs)
+    feats = np.stack([dec[i, w[0]:w[1]].mean(0) if w else dec[i, :4].mean(0) for i, w in enumerate(windows)])
+    np.testing.assert_allclose(out["stage2"]["probabilities"], _prob(feats, c), rtol=1e-4)
+    with pytest.raises(ValueError, match="decode_windows has 3 entries for 12 requests"):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(analyzer_spec={**spec, "decode_windows": windows[:3]},
+                                                         probes=reqs)
