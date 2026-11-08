@@ -32,11 +32,15 @@ ARTIFACT_BASE_URL = (
 ART_DIR = "./cache/two_stage"
 FILES = ("two_stage/cascade.json", "two_stage/stage1/probe.npz", "two_stage/stage1/probe.json",
          "two_stage/stage2/probe.npz", "two_stage/stage2/probe.json", "demo_steps.jsonl")
+# --decision: stage 2 also reads the first 16 generated tokens of the action, before the tool runs.
+DECISION_FILES = tuple(f"two_stage_decision/{p}" for p in (
+    "cascade.json", "stage1/probe.npz", "stage1/probe.json", "presence/probe.npz",
+    "presence/probe.json", "decision/probe.npz", "decision/probe.json")) + ("demo_steps.jsonl",)
 
 
-def ensure_artifacts():
+def ensure_artifacts(files=FILES):
     """Download the cascade files and demo steps into ART_DIR if missing."""
-    for name in FILES:
+    for name in files:
         dest = os.path.join(ART_DIR, name)
         if os.path.exists(dest):
             continue
@@ -58,7 +62,7 @@ def report(steps, actions, result):
     for i, (s, text) in enumerate(zip(steps, actions)):
         p2 = s2["probabilities"][i]
         p2_text = "not run" if p2 is None else f"{p2:.3f}"
-        print(f"[{result['verdicts'][i]:>4s}]  risk={s1['probabilities'][i]:.3f}  injection={p2_text}  {s['label']}")
+        print(f"[{result['verdicts'][i]:>4s}]  risk={s1['probabilities'][i]:.3f}  stage2={p2_text}  {s['label']}")
         print(f"        action: {text.strip().replace(chr(10), ' ')[:160]}\n")
 
 
@@ -66,9 +70,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--decision", action="store_true",
+                        help="use the decision-time cascade (captures decode passes too)")
     args = parser.parse_args()
 
-    ensure_artifacts()
+    ensure_artifacts(DECISION_FILES if args.decision else FILES)
     with open(os.path.join(ART_DIR, "demo_steps.jsonl")) as f:
         steps = [json.loads(line) for line in f]
 
@@ -81,11 +87,19 @@ def main():
             return_dict=False)}
         for s in steps
     ]
-    run_id = "two_stage_demo"
-    outputs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=256),
-                           save_to_disk=True, run_id=run_id)
-    spec = {"cascade_path": os.path.join(ART_DIR, "two_stage", "cascade.json"), "score_all": True}
-    report(steps, [o.outputs[0].text for o in outputs], llm.analyze(analyzer_spec=spec, run_id=run_id))
+    if args.decision:
+        # Each request keeps its own capture so stage 2 can read its decode passes.
+        sp = SamplingParams(temperature=0.0, max_tokens=256, extra_args={"hooks_on": "both"})
+        outputs = llm.generate(prompts, sp, merge_probes=False)
+        spec = {"cascade_path": os.path.join(ART_DIR, "two_stage_decision", "cascade.json"), "score_all": True}
+        result = llm.analyze(analyzer_spec=spec, probes=[o.probes for o in outputs])
+    else:
+        run_id = "two_stage_demo"
+        outputs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=256),
+                               save_to_disk=True, run_id=run_id)
+        spec = {"cascade_path": os.path.join(ART_DIR, "two_stage", "cascade.json"), "score_all": True}
+        result = llm.analyze(analyzer_spec=spec, run_id=run_id)
+    report(steps, [o.outputs[0].text for o in outputs], result)
 
 
 if __name__ == "__main__":
