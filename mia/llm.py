@@ -377,10 +377,16 @@ class MiaLLM:
                 outputs = self.llm.generate(prompts, sp_list, **passthrough)
 
         if hook and self.worker_name and not save_to_disk and not merge_probes:
+            # Keep each request's capture lazy, as the merged path does; dequantize on read.
+            from mia.core.delivery.delivered_probes import _PENDING, attach_lazy, pending
             for o in outputs:
-                p = getattr(o, "probes", None)
-                if p is not None:
-                    o.probes = _dequantized(p)
+                if pending(o):
+                    fn = _PENDING[id(o)].fn
+                    attach_lazy(o, lambda fn=fn: _dequantized(fn()))
+                else:
+                    p = getattr(o, "probes", None)
+                    if p is not None:
+                        o.probes = _dequantized(p)
             return outputs
 
         if hook and self.worker_name and not save_to_disk:
