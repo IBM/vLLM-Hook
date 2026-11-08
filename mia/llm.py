@@ -298,6 +298,7 @@ class MiaLLM:
         use_hook: Optional[bool] = None,
         save_to_disk: bool = False,
         run_id: Optional[str] = None,
+        merge_probes: bool = True,
         **kwargs
     ):
         """Generate as ``vllm.LLM.generate`` does, with the worker armed on every prompt.
@@ -308,6 +309,10 @@ class MiaLLM:
             use_hook: arm the worker for this call (default: ``enable_hook``).
             save_to_disk: write captured data to ``<hook_dir>/<run_id>/`` instead of ``probes``.
             run_id: the run's name (default: a new uuid).
+            merge_probes: with several prompts, merge every prompt's capture into
+                ``out[0].probes`` (default). The merge keeps each request's prompt pass only.
+                ``False`` leaves ``out[i].probes`` holding request i's own capture,
+                including decode passes when ``hooks_on`` covers them.
         Returns:
             The ``RequestOutput`` list; ``out[i].probes`` holds prompt i's capture, and with
             several prompts ``out[0].probes`` holds the whole batch.
@@ -370,6 +375,13 @@ class MiaLLM:
                 outputs = self.llm.generate(prompts, sp_list[0], **passthrough)
             else:
                 outputs = self.llm.generate(prompts, sp_list, **passthrough)
+
+        if hook and self.worker_name and not save_to_disk and not merge_probes:
+            for o in outputs:
+                p = getattr(o, "probes", None)
+                if p is not None:
+                    o.probes = _dequantized(p)
+            return outputs
 
         if hook and self.worker_name and not save_to_disk:
             # lazy: keep mia.core.delivery out of import mia

@@ -151,6 +151,7 @@ def calibrate_cascade(
     target_recall: float,
     max_stage2_rate: Optional[float] = None,
     finite_sample: bool = False,
+    stage1_recall: Optional[float] = None,
 ) -> OperatingPoint:
     """Choose (t1, t2) with the lowest false-positive rate at ``target_recall``.
 
@@ -162,6 +163,10 @@ def calibrate_cascade(
     caps the fraction of items sent to stage 2, for a stage 2 that is
     expensive to run. ``finite_sample=True`` uses the split-conformal count of
     positives (see ``threshold_for_recall``), which is slightly stricter.
+    ``stage1_recall`` fixes the stage-1 gate at that recall on the positives
+    and searches only ``t2``. Searching one threshold instead of two gives
+    the calibration less room to overfit, so recall holds up better on new
+    data.
 
     The returned point describes the calibration set. Report results on items
     the calibration never saw.
@@ -176,6 +181,10 @@ def calibrate_cascade(
 
     t1_max = threshold_for_recall(a[y], target_recall, finite_sample)
     candidates = np.unique(a[y][a[y] <= t1_max])[::-1]   # strictest first
+    if stage1_recall is not None:
+        if not target_recall <= stage1_recall <= 1.0:
+            raise ValueError("stage1_recall must be between target_recall and 1")
+        candidates = np.array([threshold_for_recall(a[y], stage1_recall, finite_sample)])
 
     best: Optional[OperatingPoint] = None
     for t1 in candidates:
@@ -247,9 +256,12 @@ class TwoStageDetector:
         )
 
 
-def save_cascade_config(path: str, stage1_probe: str, stage2_probe: str,
+def save_cascade_config(path: str, stage1_probe, stage2_probe,
                         point: OperatingPoint, **meta) -> dict:
     """Write the ``cascade.json`` that ``two_stage_probe`` reads.
+
+    A stage given as a list of probe paths becomes a ``product`` stage, whose score is the
+    product of its probes' probabilities.
 
     Probe paths inside the directory of ``path`` are stored relative to it, so the folder can
     be moved as a unit. ``meta`` (data, split, target) is stored under "calibration" with the
@@ -264,9 +276,14 @@ def save_cascade_config(path: str, stage1_probe: str, stage2_probe: str,
         p = os.path.abspath(p)
         return os.path.relpath(p, base) if os.path.commonpath([p, base]) == base else p
 
+    def stage(probe, threshold):
+        if isinstance(probe, (list, tuple)):
+            return {"product": [{"probe_path": rel(q)} for q in probe], "threshold": threshold}
+        return {"probe_path": rel(probe), "threshold": threshold}
+
     cfg = {
-        "stage1": {"probe_path": rel(stage1_probe), "threshold": point.stage1_threshold},
-        "stage2": {"probe_path": rel(stage2_probe), "threshold": point.stage2_threshold},
+        "stage1": stage(stage1_probe, point.stage1_threshold),
+        "stage2": stage(stage2_probe, point.stage2_threshold),
         "calibration": {"operating_point": point.to_dict(), **meta},
     }
     with open(path, "w") as f:

@@ -331,3 +331,105 @@ def test_finite_sample_threshold_is_conformal_and_stricter():
     assert strict.recall >= loose.recall
     with pytest.raises(ValueError, match="too few calibration positives"):
         calibrate_cascade(s1[:20], s2[:20], y[:20] | (np.arange(20) < 2), 0.99, finite_sample=True)
+
+
+def test_fixed_gate_calibration_keeps_stage1_recall():
+    s1, s2, y = _synthetic(1000, 9)
+    op = calibrate_cascade(s1, s2, y, 0.9, stage1_recall=0.97)
+    assert op.stage1_threshold == threshold_for_recall(s1[y], 0.97)
+    assert op.recall >= 0.9
+    free = calibrate_cascade(s1, s2, y, 0.9)
+    assert op.fpr >= free.fpr - 1e-12          # the joint search can only do as well or better in-sample
+    with pytest.raises(ValueError, match="stage1_recall"):
+        calibrate_cascade(s1, s2, y, 0.9, stage1_recall=0.8)
+
+
+# ---- r3: per-request captures, decode positions and product stages -----------------------
+
+from mia.analyzers.two_stage_probe_analyzer import request_features  # noqa: E402
+
+
+def _request(prompt_last, decode, layer=21, n_prefill=1):
+    """One request's own capture: prefill pass(es) then one pass per generated token."""
+    passes = [torch.from_numpy(prompt_last)] + [torch.from_numpy(d) for d in decode]
+    return {"hs_cache": {"model.layers.20": {"hidden_states": passes, "layer_num": layer,
+                                             "_n_prefill": n_prefill}}}
+
+
+def _write_positioned(d, layer, seed, position, decode_tokens=None):
+    path, params = _write_probe(d, layer, 0.5, seed)
+    meta = json.loads((d / "probe.json").read_text())
+    meta["position"] = position
+    if decode_tokens:
+        meta["decode_tokens"] = decode_tokens
+    (d / "probe.json").write_text(json.dumps(meta))
+    return path, params
+
+
+def test_request_features_positions():
+    rng = np.random.default_rng(10)
+    pl, dec = rng.normal(size=HIDDEN).astype(np.float32), rng.normal(size=(5, HIDDEN)).astype(np.float32)
+    req = _request(pl, list(dec))
+    np.testing.assert_allclose(request_features(req, 21), pl, rtol=1e-6)
+    np.testing.assert_allclose(request_features(req, 21, "decode_mean", 3), dec[:3].mean(0), rtol=1e-5)
+    np.testing.assert_allclose(request_features(req, 21, "decode_mean", 16), dec.mean(0), rtol=1e-5)
+    with pytest.raises(ValueError, match="hooks_on"):
+        request_features(_request(pl, []), 21, "decode_mean")
+
+
+def test_analyzer_serves_decode_product_stage_on_per_request_captures(tmp_path):
+    p1, a = _write_positioned(tmp_path / "s1", 21, 0, "prompt_last")
+    pp, b = _write_positioned(tmp_path / "pres", 21, 1, "prompt_last")
+    pd, c = _write_positioned(tmp_path / "dec", 21, 2, "decode_mean", decode_tokens=4)
+    rng = np.random.default_rng(11)
+    n = 40
+    pl = rng.normal(size=(n, HIDDEN)).astype(np.float32)
+    dec = rng.normal(size=(n, 6, HIDDEN)).astype(np.float32)
+    reqs = [_request(pl[i], list(dec[i])) for i in range(n)]
+    spec = {"stage1": {"probe_path": p1, "threshold": 0.4},
+            "stage2": {"product": [{"probe_path": pp}, {"probe_path": pd}], "threshold": 0.2},
+            "score_all": True}
+    out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(analyzer_spec=spec, probes=reqs)
+    q1 = _prob(pl, a)
+    q2 = _prob(pl, b) * _prob(dec[:, :4].mean(1), c)
+    np.testing.assert_allclose(out["stage1"]["probabilities"], q1, rtol=1e-5)
+    np.testing.assert_allclose(out["stage2"]["probabilities"], q2, rtol=1e-4)
+    assert out["verdicts"] == ["flag" if x >= 0.4 and y >= 0.2 else "pass" for x, y in zip(q1, q2)]
+    assert out["stage2"]["layer"] == [21, 21]
+
+
+def test_decode_position_on_merged_capture_names_the_fix(tmp_path):
+    p1, _ = _write_positioned(tmp_path / "s1", 21, 0, "prompt_last")
+    pd, _ = _write_positioned(tmp_path / "dec", 21, 2, "decode_mean")
+    merged = {"hs_cache": {"model.layers.20": {"hidden_states": [torch.zeros(HIDDEN)] * 3, "layer_num": 21}}}
+    with pytest.raises(ValueError, match="merge_probes=False"):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
+            analyzer_spec={"stage1": {"probe_path": p1, "threshold": 0.5},
+                           "stage2": {"probe_path": pd, "threshold": 0.5}}, probes=merged)
+
+
+def test_per_request_prompt_last_matches_merged_capture(tmp_path):
+    p1, _ = _write_probe(tmp_path / "s1", 21, 0.5, 0)
+    p2, _ = _write_probe(tmp_path / "s2", 21, 0.5, 1)
+    pl = np.random.default_rng(12).normal(size=(16, HIDDEN)).astype(np.float32)
+    merged = {"hs_cache": {"model.layers.20": {"hidden_states": [torch.from_numpy(r) for r in pl],
+                                               "layer_num": 21}}}
+    reqs = [_request(r, [np.zeros(HIDDEN, np.float32)]) for r in pl]
+    spec = {"stage1": {"probe_path": p1, "threshold": 0.5}, "stage2": {"probe_path": p2, "threshold": 0.3}}
+    an = TwoStageProbeAnalyzer(str(tmp_path), {})
+    merged_out = an.analyze(analyzer_spec=spec, probes=merged)
+    assert merged_out["verdicts"] == an.analyze(analyzer_spec=spec, probes=reqs)["verdicts"]
+
+
+def test_save_cascade_config_writes_product_stage(tmp_path):
+    p1, _ = _write_probe(tmp_path / "s1", 21, 0.5, 0)
+    pp, _ = _write_probe(tmp_path / "pres", 21, 0.5, 1)
+    pd, _ = _write_positioned(tmp_path / "dec", 21, 2, "decode_mean")
+    s1, s2, y = _synthetic(300, 13)
+    op = calibrate_cascade(s1, s2, y, 0.9)
+    cfg = save_cascade_config(str(tmp_path / "cascade.json"), p1, [pp, pd], op)
+    assert cfg["stage2"]["product"] == [{"probe_path": "pres/probe.npz"}, {"probe_path": "dec/probe.npz"}]
+    reqs = [_request(np.zeros(HIDDEN, np.float32), [np.ones(HIDDEN, np.float32)] * 3) for _ in range(4)]
+    out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
+        analyzer_spec={"cascade_path": str(tmp_path / "cascade.json"), "score_all": True}, probes=reqs)
+    assert len(out["verdicts"]) == 4 and all(p is not None for p in out["stage2"]["probabilities"])
