@@ -475,14 +475,24 @@ def test_find_tool_call_ignores_json_without_a_call_and_keeps_a_bare_tag():
 def test_tool_call_window_indexes_generated_tokens():
     text = 'I will look it up. <tool_call>{"name": "search", "arguments": {"q": "paris"}}</tool_call>'
     s, e = find_tool_call(text)
-    ids = [ord(c) for c in text]
+    ids = [ord(c) for c in text] + [0]               # an end-of-text token after the call
     assert tool_call_window(_CharTokenizer(), ids) == (s, e)
     assert tool_call_window(_CharTokenizer(), ids, max_tokens=8) == (s, s + 8)
-    tok = _ChunkTokenizer(text)
+    tok = _ChunkTokenizer(text + "...")
     w = tool_call_window(tok, list(range(len(tok.pieces))))
     assert w == (s // 3, (e - 1) // 3 + 1)
     assert tool_call_window(_CharTokenizer(), [ord(c) for c in "just text"]) is None
     assert tool_call_window(_CharTokenizer(), []) is None
+
+
+def test_tool_call_window_stops_before_the_last_token():
+    # The last generated token has no decode state, so a call cut off by max_tokens ends before it.
+    text = 'Sure. <tool_call>{"name": "x", "argu'
+    ids = [ord(c) for c in text]
+    s, e = tool_call_window(_CharTokenizer(), ids)
+    assert s == text.index("<tool_call>") and e == len(ids) - 1
+    assert tool_call_window(_CharTokenizer(), [ord(c) for c in "ab<tool_call>"[:3]]) is None
+    assert tool_call_window(_CharTokenizer(), [ord(c) for c in "<tool_call>"]) == (0, len("<tool_call>") - 1)
 
 
 def test_decode_window_reads_the_given_tokens_and_falls_back():
@@ -512,6 +522,9 @@ def test_analyzer_takes_per_request_decode_windows(tmp_path):
     out = TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(analyzer_spec=spec, probes=reqs)
     feats = np.stack([dec[i, w[0]:w[1]].mean(0) if w else dec[i, :4].mean(0) for i, w in enumerate(windows)])
     np.testing.assert_allclose(out["stage2"]["probabilities"], _prob(feats, c), rtol=1e-4)
+    with pytest.raises(ValueError, match="spec needs 'decode_windows'"):
+        TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(
+            analyzer_spec={k: v for k, v in spec.items() if k != "decode_windows"}, probes=reqs)
     with pytest.raises(ValueError, match="decode_windows has 3 entries for 12 requests"):
         TwoStageProbeAnalyzer(str(tmp_path), {}).analyze(analyzer_spec={**spec, "decode_windows": windows[:3]},
                                                          probes=reqs)

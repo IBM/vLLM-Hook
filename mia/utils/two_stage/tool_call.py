@@ -6,10 +6,11 @@ before the tool name, so a fixed window of the first generated tokens can miss i
 ``tool_call_window`` returns the token window of the first call, which a probe with
 ``"position": "decode_window"`` then reads (see ``mia.analyzers.two_stage_probe_analyzer``).
 
-A call is the first JSON object, or JSON list holding one, with a ``"name"`` and an
-``"arguments"`` or ``"parameters"`` key. It starts at a ``<tool_call>`` or ``<|tool_call|>`` tag
-written directly before that JSON. A tag with no parsable JSON after it still marks a call that
-runs to the end of the text.
+A call is the first top-level JSON value in the text that is an object, or a list holding one,
+with a ``"name"`` and an ``"arguments"`` or ``"parameters"`` key. A list of several calls gives one
+window over the whole list, and a call nested inside another JSON object is not found. The call
+starts at a ``<tool_call>`` or ``<|tool_call|>`` tag written directly before that JSON. A tag with
+no parsable JSON after it still marks a call that runs to the end of the text.
 """
 from __future__ import annotations
 
@@ -60,9 +61,11 @@ def tool_call_window(tokenizer, token_ids: Sequence[int], max_tokens: int = 64) 
     """Window ``(start, end)`` of generated-token indices covering the first tool call.
 
     ``start`` is the token holding the call's first character, ``end`` is one past the token
-    holding its last character, and the window is cut to ``max_tokens``. Returns None when the
-    action holds no call. Token positions come from decoding prefixes of ``token_ids``
-    (a binary search, about 2 log2(n) decodes), so they index the generated tokens themselves.
+    holding its last character, and the window is cut to ``max_tokens``. The last generated token
+    is never fed back to the model, so it has no decode state, and the window is also cut to end
+    before it. Returns None when the action holds no call, or when the call starts at the last
+    token. Token positions come from decoding prefixes of ``token_ids`` (a binary search, about
+    2 log2(n) decodes), so they index the generated tokens themselves.
     """
     token_ids = list(token_ids)
     if not token_ids:
@@ -73,4 +76,5 @@ def tool_call_window(tokenizer, token_ids: Sequence[int], max_tokens: int = 64) 
         return None
     start = _first_token_ending_after(tokenizer, token_ids, span[0])
     last = _first_token_ending_after(tokenizer, token_ids, span[1] - 1)
-    return start, min(last + 1, start + max_tokens)
+    end = min(last + 1, start + max_tokens, len(token_ids) - 1)
+    return (start, end) if start < end else None

@@ -13,9 +13,10 @@ Each probe reads one layer at one position:
                 ``probes=[o.probes for o in out]``.
   decode_window mean of the states for the generated tokens in a per-request window, given as
                 ``"decode_windows": [[start, end] or None, ...]`` in the spec, one entry per
-                request (0-based generated-token indices, end exclusive). A request without a
-                window falls back to tokens 1..decode_tokens. ``mia.utils.two_stage.tool_call_window``
-                finds the window of the first tool call. Same capture as decode_mean.
+                request (0-based generated-token indices, end exclusive; the spec must hold it).
+                A request whose entry is None falls back to the first decode_tokens tokens, as
+                decode_mean. ``mia.utils.two_stage.tool_call_window`` finds the window of the
+                first tool call. Same capture as decode_mean.
 ``position`` and ``decode_tokens`` default to the probe's probe.json and can be set in the spec.
 Nothing here depends on the task the probes were trained for.
 """
@@ -145,6 +146,11 @@ class TwoStageProbeAnalyzer:
                     "does not hold. Generate with merge_probes=False and pass "
                     "probes=[o.probes for o in outputs].")
             return last_token_features(probes["hs_cache"], probe.layer)
+        if position == "decode_window" and windows is None:
+            raise ValueError(
+                f"{member['probe_path']} reads position 'decode_window', so the spec needs "
+                "'decode_windows': one [start, end] or None per request, for example from "
+                "mia.utils.two_stage.tool_call_window(tokenizer, output.token_ids).")
         if windows is not None and len(windows) != len(probes):
             raise ValueError(f"decode_windows has {len(windows)} entries for {len(probes)} requests")
         return np.stack([request_features(p, probe.layer, position, k, windows[i] if windows is not None else None)
