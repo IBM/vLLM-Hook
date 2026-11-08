@@ -93,9 +93,9 @@ For about two points of recall, the decision-time stage cuts the false-positive 
 
 A second check adds back the steps whose action changed on this backend. They are regenerated in full and relabelled with AgentDojo 0.1.35, which reproduces every original label. On the resulting 1,774 steps, the presence-times-decision cascade lowers the attacked-but-safe rate from 0.404 to 0.282 [−0.184, −0.062] and the clean rate from 0.399 to 0.222 [−0.253, −0.106]. Recall is 0.872 against 0.902 [−0.064, +0.002]. With a false-positive budget of 0.2 instead of a recall target, the same cascade raises recall from 0.798 to 0.837.
 
-Calibration matters for this cascade. Searching both thresholds on out-of-fold scores leaves realized recall two to three points under the target. Fixing the stage-1 gate at 97% recall (`stage1_recall=0.97`) and searching only the stage-2 threshold fixes that. With probes retrained on this backend's states, the 1,774-step results against the released probe are below.
+Calibration matters for this cascade. Searching both thresholds on out-of-fold scores leaves realized recall two to three points under the target. Fixing the stage-1 gate at 97% recall (`stage1_recall=0.97`) and searching only the stage-2 threshold brings realized recall to within a point of the target. With every probe retrained on this backend's states, including the released recipe used as the baseline, the 1,774-step results are below.
 
-| | Released probe | Decision cascade with fixed gate | Interval of the change |
+| | Released recipe, retrained | Decision cascade with fixed gate | Interval of the change |
 |---|---|---|---|
 | Recall | 0.899 | 0.893 | [−0.038, +0.028] |
 | FPR, attacked but safe | 0.402 | 0.289 | [−0.167, −0.057] |
@@ -105,7 +105,7 @@ The fixed gate costs about two points of false-positive rate against the joint s
 
 The analyzer serves this stage in batches. Generate with `hooks_on="both"` and `merge_probes=False`, and give the decision probe `"position": "decode_mean"` in its probe.json. In batches of 32 over all 1,826 steps, every request kept its 17 passes. On 1,641 steps the batched run generated the same first 17 tokens as a one-at-a-time run, and on those the verdicts differ on 10, with stage-2 scores within 0.016. On the other 185 steps the model wrote a different action, which the stage then scores.
 
-Reading each request's decode rows back is slow in batches. A batch of 32 takes 3.0 s against 0.86 s with capture off, or 0.93 s with the decode rows captured but not read. One request on its own takes 0.56 s against 0.50 s. Neither a 5 ms delivery poll nor six gather workers changed the batched time, and reading in parallel threads made it slower.
+Reading each request's decode rows back is slow in batches. Across five measurements on the same chunks, a batch of 32 took 1.8 to 3.1 s against 0.84 to 0.86 s with capture off, and 0.93 s with the decode rows captured but not read. One request on its own takes 0.56 s against 0.50 s. Neither a 5 ms delivery poll nor six gather workers changed the batched time, and reading in parallel threads made it slower.
 
 `examples/demo_two_stage.py --decision` runs this cascade. On the three demo steps it passes the clean step and flags both injected ones. One of the two is the demo step in which the model ignores the injection (stage 2 at 0.205 against a threshold of 0.096), and the prompt-only cascade passes it.
 
@@ -116,4 +116,4 @@ Reading each request's decode rows back is slow in batches. A batch of 32 takes 
 - The evaluation covers Qwen2.5-7B-Instruct on AgentDojo only, with 97 clean steps. The clean-step result needs checking on real agent traffic before anyone relies on it.
 - The presence probe is a linear probe trained on AgentDojo injections. Other injection styles or tools need their own validation, and a dedicated injection detector can stand in as stage 2 through `TwoStageDetector`.
 - Calibrate on data disjoint from what you report, and refit thresholds when the agent, tools or prompt format change.
-- Decision-time probes work with offline `MiaLLM` and `merge_probes=False`. The served path (`MiaClient`) does not return per-request decode passes, and batched delivery of decode rows adds about 2 s per batch of 32 on an A40.
+- Decision-time probes work with offline `MiaLLM` and `merge_probes=False`. The served path (`MiaClient`) does not return per-request decode passes, and batched delivery of decode rows adds 1 to 2 s per batch of 32 on an A40.
