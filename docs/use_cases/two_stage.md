@@ -105,7 +105,7 @@ The fixed gate costs about two points of false-positive rate against the joint s
 
 The analyzer serves this stage in batches. Generate with `hooks_on="both"` and `merge_probes=False`, and give the decision probe `"position": "decode_mean"` in its probe.json. In batches of 32 over all 1,826 steps, every request kept its 17 passes. On 1,641 steps the batched run generated the same first 17 tokens as a one-at-a-time run, and on those the verdicts differ on 10, with stage-2 scores within 0.016. On the other 185 steps the model wrote a different action, which the stage then scores.
 
-Reading each request's decode rows back is slow in batches. Across five measurements on the same chunks, a batch of 32 took 1.8 to 3.1 s against 0.84 to 0.86 s with capture off, and 0.93 s with the decode rows captured but not read. One request on its own takes 0.56 s against 0.50 s. Neither a 5 ms delivery poll nor six gather workers changed the batched time, and reading in parallel threads made it slower.
+Reading each request's decode rows back is slow in batches. Across five measurements on two sets of 12 batches, a batch of 32 took 1.8 to 3.1 s against 0.84 to 0.86 s with capture off, and 0.93 s with the decode rows captured but not read. One request on its own takes 0.56 s against 0.50 s. Neither a 5 ms delivery poll nor six gather workers changed the batched time, and reading in parallel threads made it slower.
 
 `examples/demo_two_stage.py --decision` runs this cascade. On the three demo steps it passes the clean step and flags both injected ones. One of the two is the demo step in which the model ignores the injection (stage 2 at 0.205 against a threshold of 0.096), and the prompt-only cascade passes it.
 
