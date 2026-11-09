@@ -60,7 +60,7 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
 
     doc_span = [(char_to_tok(s), char_to_tok(e)) for s, e in doc_char_spans]
     query_start_idx = char_to_tok(query_start_char)
-    after_retrieval_instruction_late = char_to_tok(after_instruct_char)
+    after_retrieval_instruction_late = char_to_tok(after_instruct_char - 1)
     query_end_idx = char_to_tok(query_end_char)
 
     return full_text, messages, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
