@@ -76,6 +76,8 @@ def projection_target(stream: torch.Tensor, *, vector: torch.Tensor, threshold: 
     ``p = stream @ v̂`` (``v̂ = vector / ||vector||``) is strictly below
     ``threshold`` to ``p = target``; every other row is unchanged:
     ``out = stream + (target - p) * [p < threshold] * v̂``.
+    The spec parser requires ``target >= threshold``, so a steered row ends at
+    or above the threshold.
 
     The projection, gate and shift are computed in float32 and the shift is
     added once in the stream's dtype, so the gate does not depend on the
@@ -95,7 +97,9 @@ def projection_mirror(stream: torch.Tensor, *, vector: torch.Tensor, threshold: 
     ``p = stream @ v̂`` is strictly below ``threshold`` across it, scaled by
     ``coeff`` and capped at ``cap``:
     ``p' = min(p + coeff * 2 * (threshold - p), cap)``, ``out = stream + (p' - p) * v̂``.
-    Rows at or above ``threshold`` are unchanged. ``coeff = 1`` is the plain
+    Rows at or above ``threshold`` are unchanged. The spec parser requires
+    ``coeff >= 0`` and ``cap >= threshold``, so no row is pushed further below
+    the threshold. ``coeff = 1`` is the plain
     mirror image ``2 * threshold - p``. Computed in float32 like
     ``projection_target``.
     """

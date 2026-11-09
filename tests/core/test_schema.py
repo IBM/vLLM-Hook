@@ -274,6 +274,23 @@ def test_bool_rejected_for_numeric_param():
     )
 
 
+def _proj(kind, **params):
+    return {"ops": [_op(transform={"kind": kind, "artifact": VEC, **params})]}
+
+
+def test_projection_target_requires_target_at_or_above_threshold():
+    _reject(_proj("projection_target", threshold=1.0, target=0.5), "E_BAD_PARAM", "ops[0].transform.target")
+    _parse(_proj("projection_target", threshold=1.0, target=1.0))
+    _parse(_proj("projection_target", threshold=-40.0, target=20.0))
+
+
+def test_projection_mirror_requires_nonnegative_coeff_and_cap_at_or_above_threshold():
+    _reject(_proj("projection_mirror", threshold=1.0, coeff=-0.5, cap=5.0), "E_BAD_PARAM", "ops[0].transform.coeff")
+    _reject(_proj("projection_mirror", threshold=1.0, coeff=1.0, cap=0.5), "E_BAD_PARAM", "ops[0].transform.cap")
+    _parse(_proj("projection_mirror", threshold=1.0, coeff=0.0, cap=1.0))
+    _parse(_proj("projection_mirror", threshold=1.0, coeff=1.0, cap=5.0))
+
+
 def test_last_k_requires_positive_k():
     _reject({"ops": [_op(scope={"kind": "last_k", "k": 0})]}, "E_BAD_PARAM", "ops[0].scope.k")
 
