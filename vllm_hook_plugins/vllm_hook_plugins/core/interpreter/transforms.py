@@ -71,9 +71,46 @@ def head_additive(heads: torch.Tensor, *, vector: torch.Tensor, strength: float)
     return heads + strength * vector
 
 
+def projection_target(stream: torch.Tensor, *, vector: torch.Tensor, threshold: float, target: float) -> torch.Tensor:
+    """Steering to target projection (StTP): move each row whose projection
+    ``p = stream @ v̂`` (``v̂ = vector / ||vector||``) is strictly below
+    ``threshold`` to ``p = target``; every other row is unchanged:
+    ``out = stream + (target - p) * [p < threshold] * v̂``.
+
+    The projection, gate and shift are computed in float32 and the shift is
+    added once in the stream's dtype, so the gate does not depend on the
+    model's precision. Several layers each gate on their own projection; a
+    caller that wants one layer's gate to decide for later layers sets the
+    later thresholds at or below the target.
+    """
+    unit = vector.float() / vector.float().norm()
+    p = stream.float() @ unit
+    shift = torch.where(p < threshold, target - p, torch.zeros_like(p))
+    return stream + (shift.unsqueeze(-1) * unit).to(stream.dtype)
+
+
+def projection_mirror(stream: torch.Tensor, *, vector: torch.Tensor, threshold: float, coeff: float,
+                      cap: float) -> torch.Tensor:
+    """Steering to mirror projection (StMP): reflect each row whose projection
+    ``p = stream @ v̂`` is strictly below ``threshold`` across it, scaled by
+    ``coeff`` and capped at ``cap``:
+    ``p' = min(p + coeff * 2 * (threshold - p), cap)``, ``out = stream + (p' - p) * v̂``.
+    Rows at or above ``threshold`` are unchanged. ``coeff = 1`` is the plain
+    mirror image ``2 * threshold - p``. Computed in float32 like
+    ``projection_target``.
+    """
+    unit = vector.float() / vector.float().norm()
+    p = stream.float() @ unit
+    mirrored = torch.clamp(p + coeff * 2.0 * (threshold - p), max=cap)
+    shift = torch.where(p < threshold, mirrored - p, torch.zeros_like(p))
+    return stream + (shift.unsqueeze(-1) * unit).to(stream.dtype)
+
+
 TRANSFORMS = {
     "additive": additive,
     "projection": projection,
     "rotation": rotation,
     "head_additive": head_additive,
+    "projection_target": projection_target,
+    "projection_mirror": projection_mirror,
 }

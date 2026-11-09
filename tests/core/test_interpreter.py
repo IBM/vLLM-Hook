@@ -20,6 +20,8 @@ from vllm_hook_plugins.core.interpreter.transforms import (
     additive,
     head_additive,
     projection,
+    projection_mirror,
+    projection_target,
     rotation,
 )
 from vllm_hook_plugins.core.schema import ModifierSpec, OpSpec, ScopeSpec
@@ -51,6 +53,63 @@ def test_projection_removes_component_and_is_idempotent():
     assert torch.allclose(out @ unit, torch.zeros(6), atol=1e-5)
     again = projection(out, vector=vector)
     assert torch.allclose(out, again, atol=1e-6)
+
+
+def test_projection_target_golden():
+    vector = torch.tensor([0.0, 2.0, 0.0])  # unit direction e1, any scale
+    stream = torch.tensor([[1.0, -3.0, 5.0],   # p = -3 < 1 -> moved to 4
+                           [7.0, 1.0, -2.0],   # p = 1, not strictly below -> unchanged
+                           [0.0, 9.0, 1.0]])   # p = 9 >= 1 -> unchanged
+    out = projection_target(stream, vector=vector, threshold=1.0, target=4.0)
+    assert torch.equal(out, torch.tensor([[1.0, 4.0, 5.0], [7.0, 1.0, -2.0], [0.0, 9.0, 1.0]]))
+    assert torch.equal(stream[0], torch.tensor([1.0, -3.0, 5.0]))  # input untouched
+
+
+def test_projection_target_moves_only_the_direction_and_keeps_dtype():
+    stream = (torch.randn(8, 64) * 4).to(torch.bfloat16)
+    vector = torch.randn(64)
+    unit = vector / vector.norm()
+    threshold, target = 0.5, 6.0
+    out = projection_target(stream, vector=vector, threshold=threshold, target=target)
+    assert out.dtype == torch.bfloat16
+    p = stream.float() @ unit
+    moved = p < threshold
+    assert moved.any() and (~moved).any()
+    assert torch.allclose((out.float() @ unit)[moved], torch.full((int(moved.sum()),), target), atol=0.1)
+    assert torch.equal(out[~moved], stream[~moved])
+    # the orthogonal complement is untouched, up to bf16 rounding of the shift
+    rest = lambda x: x.float() - (x.float() @ unit).unsqueeze(-1) * unit
+    assert torch.allclose(rest(out), rest(stream), atol=0.1)
+
+
+def test_projection_target_negative_threshold():
+    vector = torch.tensor([1.0, 0.0])
+    stream = torch.tensor([[-50.0, 1.0], [-10.0, 1.0], [0.0, 1.0]])
+    out = projection_target(stream, vector=vector, threshold=-40.0, target=20.0)
+    assert torch.equal(out, torch.tensor([[20.0, 1.0], [-10.0, 1.0], [0.0, 1.0]]))
+
+
+def test_projection_mirror_golden():
+    vector = torch.tensor([3.0, 0.0])
+    stream = torch.tensor([[-1.0, 2.0],    # p = -1 < 1: -1 + 1.0 * 2 * 2 = 3
+                           [0.0, 2.0],     # p = 0: 0 + 2 * 1 = 2
+                           [-9.0, 2.0],    # p = -9: -9 + 20 = 11, capped at 5
+                           [4.0, 2.0]])    # p = 4 >= 1 -> unchanged
+    out = projection_mirror(stream, vector=vector, threshold=1.0, coeff=1.0, cap=5.0)
+    assert torch.equal(out, torch.tensor([[3.0, 2.0], [2.0, 2.0], [5.0, 2.0], [4.0, 2.0]]))
+    # coeff scales the reflection: p = -1 -> -1 + 0.5 * 2 * 2 = 1
+    half = projection_mirror(stream[:1], vector=vector, threshold=1.0, coeff=0.5, cap=5.0)
+    assert torch.equal(half, torch.tensor([[1.0, 2.0]]))
+
+
+def test_projection_target_through_apply_op():
+    vector = torch.tensor([1.0, 0.0])
+    op = OpSpec(layers=(0,), transform_kind="projection_target",
+                transform_params={"threshold": 0.0, "target": 2.0}, artifact=VEC,
+                modifiers=(), scope=ScopeSpec(kind="all"), gate=None)
+    stream = torch.tensor([[-1.0, 3.0], [1.0, 3.0]])
+    out = apply_op(op, stream, {VEC: {"vector": vector}})
+    assert torch.equal(out, torch.tensor([[2.0, 3.0], [1.0, 3.0]]))
 
 
 def test_rotation_offset_quarter_turn_maps_b1_to_b2():

@@ -482,7 +482,7 @@ class UnifiedHookWorker:
                 _fail(f"tensor {name!r} has non-finite values")
 
         hidden = self._hidden_size
-        if kind in ("additive", "projection", "alignment_adaptive"):
+        if kind in ("additive", "projection", "projection_target", "projection_mirror", "alignment_adaptive"):
             vector = tensors["vector"]
             if tuple(vector.shape) != (hidden,):
                 _fail(f"tensor 'vector' has shape {tuple(vector.shape)}; kind {kind!r} needs ({hidden},)")
@@ -764,15 +764,17 @@ class UnifiedHookWorker:
         if not relevant:
             return output
 
-        is_tuple = isinstance(output, tuple)
+        # vLLM decoder layers return (hidden_states, residual) with the
+        # residual add fused into the next layer's input layernorm; the true
+        # layer-boundary value is their sum. Some return (stream, None)
+        # (Gemma 4 in vLLM 0.32): the first element is then the stream itself,
+        # edited in place like a single-tensor output.
+        is_tuple = isinstance(output, tuple) and output[1] is not None
         if is_tuple:
             hidden, residual = output
         else:
             hidden = None
-            residual = output
-        # vLLM decoder layers return (hidden_states, residual) with the
-        # residual add fused into the next layer's input layernorm; the true
-        # layer-boundary value is their sum.
+            residual = output[0] if isinstance(output, tuple) else output
         stream = hidden + residual if is_tuple else residual  # (tokens, hidden)
 
         for view, state in relevant:

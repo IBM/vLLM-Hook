@@ -13,7 +13,9 @@ break, not repurposed; the permanence invariant applies to every name
 still listed here.
 """
 
-TRANSFORM_KINDS = frozenset({"additive", "projection", "rotation", "head_additive"})
+TRANSFORM_KINDS = frozenset({
+    "additive", "projection", "rotation", "head_additive", "projection_target", "projection_mirror",
+})
 MODIFIER_KINDS = frozenset({"norm_preserving", "alignment_adaptive"})
 SCOPE_KINDS = frozenset({"all", "after_prompt", "last_k", "from_position"})
 READOUT_KINDS = frozenset({"affine", "cosine", "projected_cosine"})
@@ -31,6 +33,8 @@ KIND_PARAMS = {
     "projection": {},
     "rotation": {"angle": float, "mode": str},
     "head_additive": {"strength": float},
+    "projection_target": {"threshold": float, "target": float},
+    "projection_mirror": {"threshold": float, "coeff": float, "cap": float},
     "norm_preserving": {},
     "alignment_adaptive": {"threshold": float, "use_cosine": bool},
     "last_k": {"k": int},
@@ -60,6 +64,8 @@ ARTIFACT_TENSORS = {
     "projection": ("vector",),
     "rotation": ("basis",),
     "head_additive": ("vector",),
+    "projection_target": ("vector",),
+    "projection_mirror": ("vector",),
     "alignment_adaptive": ("vector",),
     "affine": ("weights",),
     "cosine": ("directions",),
