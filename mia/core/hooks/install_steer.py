@@ -64,7 +64,10 @@ def _wrap_layer_class(cls: type) -> None:
             if host is not None and host.do_steer:
                 if (isinstance(out, tuple) and len(out) >= 2
                         and isinstance(out[1], torch.Tensor)):
-                    host.steer(out[1])
+                    # The residual stream is out[0] + out[1]. Steering modifies the
+                    # residual (out[1]); adjust_rs also needs out[0] to project on the sum.
+                    hidden = out[0] if isinstance(out[0], torch.Tensor) else None
+                    host.steer(out[1], hidden)
                 elif (isinstance(out, tuple) and len(out) >=2 and out[1] is None and isinstance(out[0], torch.Tensor)):
                     host.steer(out[0])
                 elif isinstance(out, torch.Tensor):

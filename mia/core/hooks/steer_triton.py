@@ -20,13 +20,19 @@ def steer_buffer_fused_kernel(
     vec_table_ptr,
     avg_proj_ptr,
     steer_mode_ptr,
+    hid_ptr,
     n,
     hidden,
     res_row_stride,
     vec_row_stride,
+    hid_row_stride,
     BLOCK: tl.constexpr,
     EARLY_EXIT: tl.constexpr,
+    HAS_HID: tl.constexpr,
 ):
+    # The residual stream is hidden_states + residual (the next vLLM layer adds them).
+    # When HAS_HID is set, adjust_rs computes the projection on that sum; the update is
+    # always written to the residual.
     t = tl.program_id(0)
 
     res_dtype = residual_ptr.dtype.element_ty
@@ -46,6 +52,11 @@ def steer_buffer_fused_kernel(
                     cols = off + tl.arange(0, BLOCK)
                     m = cols < hidden
                     r = tl.load(res_row + cols, mask=m, other=0.0).to(tl.float32)
+                    if HAS_HID:
+                        h = tl.load(hid_ptr + t * hid_row_stride + cols, mask=m,
+                                    other=0.0).to(tl.float32)
+                        # Round the sum to the model dtype to match the next layer's add.
+                        r = (r + h).to(res_dtype).to(tl.float32)
                     u = tl.load(vec_row + cols, mask=m, other=0.0).to(tl.float32)
                     acc += (r * u).to(res_dtype).to(tl.float32)
                 proj = tl.sum(acc, axis=0).to(res_dtype).to(tl.float32)
@@ -71,6 +82,10 @@ def steer_buffer_fused_kernel(
         cols = off + tl.arange(0, BLOCK)
         mask = cols < hidden
         r = tl.load(res_row + cols, mask=mask, other=0.0).to(tl.float32)
+        if HAS_HID:
+            h = tl.load(hid_ptr + t * hid_row_stride + cols, mask=mask,
+                        other=0.0).to(tl.float32)
+            r = (r + h).to(res_dtype).to(tl.float32)
         u = tl.load(vec_row + cols, mask=mask, other=0.0).to(tl.float32)
         acc += (r * u).to(res_dtype).to(tl.float32)
     proj = tl.sum(acc, axis=0).to(res_dtype).to(tl.float32)
@@ -89,21 +104,32 @@ def steer_buffer_fused_kernel(
         tl.store(res_row + cols, new.to(res_dtype), mask=mask)
 
 
-def steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n=None):
-    """Launch the fused steer kernel (in-place on ``residual[:n]``)."""
+def steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n=None,
+                       hidden=None):
+    """Launch the fused steer kernel (in-place on ``residual[:n]``).
+
+    ``hidden``: optional hidden states returned alongside ``residual``. Only ``adjust_rs``
+    reads it, to compute the projection on ``hidden + residual``.
+    """
     if n is None:
         n = residual.shape[0]
     n = int(n)
     if n == 0:
         return
-    hidden = int(residual.shape[1])
+    hidden_size = int(residual.shape[1])
+    has_hid = hidden is not None
+    if has_hid and (hidden.shape[-1] != hidden_size or hidden.dtype != residual.dtype
+                    or hidden.stride(-1) != 1):
+        raise RuntimeError("steer_buffer: hidden must match residual's width and dtype "
+                           "and be contiguous along the hidden dimension")
+    hid = hidden if has_hid else residual  # placeholder; not read when HAS_HID is False
     grid = (n,)
     steer_buffer_fused_kernel[grid](
-        residual, coeff, vec_id, vec_table, avg_proj, steer_mode,
-        n, hidden,
-        residual.stride(0), vec_table.stride(0),
+        residual, coeff, vec_id, vec_table, avg_proj, steer_mode, hid,
+        n, hidden_size,
+        residual.stride(0), vec_table.stride(0), hid.stride(0),
         BLOCK=_BLOCK,
         EARLY_EXIT=_EARLY_EXIT,
+        HAS_HID=has_hid,
         num_warps=_NUM_WARPS,
     )
-

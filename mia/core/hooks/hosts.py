@@ -140,10 +140,17 @@ class SteerHost(nn.Module):
         self.vec_table = vec_table
         self.avg_proj = avg_proj
 
-    def steer(self, residual: torch.Tensor) -> None:
-        """Apply the masked in-place steering add (single ``steer_buffer`` op)."""
+    def steer(self, residual: torch.Tensor, hidden: torch.Tensor | None = None) -> None:
+        """Apply the masked in-place steering add (single ``steer_buffer`` op).
+
+        Args:
+            residual: Tensor to modify in place.
+            hidden: Hidden states returned alongside ``residual``. When given, the
+                residual stream is ``hidden + residual`` and ``adjust_rs`` computes its
+                projection on that sum. Pass None if ``residual`` is the full stream.
+        """
         torch.ops.mia.steer_buffer(
             residual, self.coeff, self.vec_id, self.vec_table,
-            self.avg_proj, self.mode,
+            self.avg_proj, self.mode, hidden,
         )
 
