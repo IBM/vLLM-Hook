@@ -119,7 +119,8 @@ def steer_col_for(phase: str, positions: str, is_prefill: bool, is_final_chunk: 
     return lo
 
 
-def _steer_rows(rows: "torch.Tensor", cfg: Dict, data: Dict) -> "torch.Tensor":
+def _steer_rows(rows: "torch.Tensor", cfg: Dict, data: Dict,
+                hidden: "Optional[torch.Tensor]" = None) -> "torch.Tensor":
     method = cfg.get("method", "adjust_rs")
     steering_vec = data["dir"].to(rows.device, dtype=rows.dtype)
     if method == "add_vector":
@@ -128,7 +129,8 @@ def _steer_rows(rows: "torch.Tensor", cfg: Dict, data: Dict) -> "torch.Tensor":
     if method == "adjust_rs":
         unit_vec = steering_vec
         avg_proj = data["avg_proj"].to(rows.device, dtype=rows.dtype)
-        current_projections = torch.matmul(rows, unit_vec)
+        stream = rows if hidden is None else hidden + rows
+        current_projections = torch.matmul(stream, unit_vec)
         coeff = (avg_proj - current_projections).unsqueeze(-1)
         return rows + coeff * unit_vec.view(1, -1)
     raise ValueError(f"Unknown steering method: {method}")
@@ -235,7 +237,9 @@ class SteerWorker:
             PROF.incr("steer.fire")
 
             with PROF.timed("steer.apply", tier=2):
-                residuals = self._steer_per_request(residuals, entries, step)
+                # The next layer receives hidden_states + residuals, adjust_rs needs both.
+                residuals = self._steer_per_request(residuals, entries, step,
+                                                    hidden=hidden_states)
 
             if is_tuple:
                 return (hidden_states, residuals)
@@ -264,7 +268,7 @@ class SteerWorker:
             self._vector_cache[vector_path] = data
         return data
 
-    def _steer_per_request(self, residuals, entries, step: StepView):
+    def _steer_per_request(self, residuals, entries, step: StepView, hidden=None):
         qsl = step.query_start_loc_np
         n_rows = int(residuals.shape[0])
         mapped = int(qsl[step.num_reqs]) if len(qsl) > step.num_reqs else None
@@ -291,7 +295,7 @@ class SteerWorker:
 
         out = residuals
         for cfg, spans in groups.values():
-            steered = _steer_rows(residuals, cfg, self._vector_cache_for(cfg))
+            steered = _steer_rows(residuals, cfg, self._vector_cache_for(cfg), hidden=hidden)
             mask = np.zeros(n_rows, dtype=bool)
             for lo, hi in spans:
                 mask[lo:hi] = True

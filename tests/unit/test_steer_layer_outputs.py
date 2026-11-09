@@ -12,9 +12,11 @@ class _Host:
 
     def __init__(self):
         self.steered = None
+        self.hidden = None
 
-    def steer(self, t):
+    def steer(self, t, hidden=None):
         self.steered = t
+        self.hidden = hidden
 
 def _layer(output):
     cls = type(f"Layer{id(output)}", (torch.nn.Module,), {"forward": lambda self: output})
@@ -29,6 +31,8 @@ def test_hidden_and_residual_steers_residual():
     layer, host = _layer((h, r))
     layer()
     assert host.steered is r
+    # hidden states are passed too, so adjust_rs can project on hidden + residual
+    assert host.hidden is h
 
 def test_no_residual_steers_hidden():
     h = torch.zeros(2, 4)
