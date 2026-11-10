@@ -235,7 +235,30 @@ def _parse_kind_params(kind: str, obj: dict, path: str, *, extra_fields: set) ->
         if name not in obj:
             raise SpecError(E_BAD_PARAM, f"{path}.{name}", f"missing required parameter {name!r} for kind {kind!r}")
         params[name] = _parse_scalar_param(kind, name, obj[name], expected, f"{path}.{name}")
+    _check_param_relations(kind, params, path)
     return params
+
+
+def _check_param_relations(kind: str, params: dict, path: str) -> None:
+    """Reject parameter combinations that would push gated rows further
+    below the threshold instead of lifting them to or above it.
+
+    ``projection_target`` needs ``target >= threshold``; ``projection_mirror``
+    needs ``coeff >= 0`` and ``cap >= threshold``.
+    """
+    if kind == "projection_target" and params["target"] < params["threshold"]:
+        raise SpecError(
+            E_BAD_PARAM, f"{path}.target",
+            f"'target' for kind {kind!r} must be >= 'threshold' ({params['threshold']}); got {params['target']}",
+        )
+    if kind == "projection_mirror":
+        if params["coeff"] < 0:
+            raise SpecError(E_BAD_PARAM, f"{path}.coeff", f"'coeff' for kind {kind!r} must be >= 0; got {params['coeff']}")
+        if params["cap"] < params["threshold"]:
+            raise SpecError(
+                E_BAD_PARAM, f"{path}.cap",
+                f"'cap' for kind {kind!r} must be >= 'threshold' ({params['threshold']}); got {params['cap']}",
+            )
 
 
 def _parse_artifact_field(kind: str, obj: dict, path: str) -> str | None:

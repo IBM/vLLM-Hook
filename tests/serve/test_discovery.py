@@ -27,7 +27,9 @@ def test_capabilities_payload_shape(server):
     assert payload["vllm_version"]
 
     kinds = payload["intervention_kinds"]
-    assert set(kinds["transforms"]) == {"additive", "projection", "rotation", "head_additive"}
+    assert set(kinds["transforms"]) == {
+        "additive", "projection", "rotation", "head_additive", "projection_target", "projection_mirror",
+    }
     assert set(kinds["modifiers"]) == {"norm_preserving", "alignment_adaptive"}
     assert set(kinds["scopes"]) == {"all", "after_prompt", "last_k", "from_position"}
     assert set(kinds["readouts"]) == {"affine", "cosine", "projected_cosine"}

@@ -7,7 +7,7 @@ from vllm_hook_plugins.core import kinds
 
 def test_registries_are_frozen_and_closed():
     assert kinds.TRANSFORM_KINDS == frozenset(
-        {"additive", "projection", "rotation", "head_additive"}
+        {"additive", "projection", "rotation", "head_additive", "projection_target", "projection_mirror"}
     )
     assert kinds.MODIFIER_KINDS == frozenset({"norm_preserving", "alignment_adaptive"})
     assert kinds.SCOPE_KINDS == frozenset({"all", "after_prompt", "last_k", "from_position"})
@@ -48,6 +48,8 @@ def test_kind_params_covers_every_parameterized_kind():
     assert kinds.KIND_PARAMS["projection"] == {}
     assert kinds.KIND_PARAMS["rotation"] == {"angle": float, "mode": str}
     assert kinds.KIND_PARAMS["head_additive"] == {"strength": float}
+    assert kinds.KIND_PARAMS["projection_target"] == {"threshold": float, "target": float}
+    assert kinds.KIND_PARAMS["projection_mirror"] == {"threshold": float, "coeff": float, "cap": float}
     assert kinds.KIND_PARAMS["norm_preserving"] == {}
     assert kinds.KIND_PARAMS["alignment_adaptive"] == {"threshold": float, "use_cosine": bool}
     assert kinds.KIND_PARAMS["last_k"] == {"k": int}
@@ -82,6 +84,8 @@ def test_artifact_tensors_and_constraints_name_registered_kinds():
     for kind in kinds.CONSTRAINTS:
         assert kind in all_kinds
     assert kinds.ARTIFACT_TENSORS["projection"] == ("vector",)
+    assert kinds.ARTIFACT_TENSORS["projection_target"] == ("vector",)
+    assert kinds.ARTIFACT_TENSORS["projection_mirror"] == ("vector",)
     assert kinds.ARTIFACT_TENSORS["affine"] == ("weights",)
     assert kinds.ARTIFACT_TENSORS["cosine"] == ("directions",)
     assert kinds.ARTIFACT_TENSORS["projected_cosine"] == ("directions",)
