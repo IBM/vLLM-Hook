@@ -15,10 +15,10 @@ from vllm import SamplingParams, TokensPrompt
 
 from mia import MiaLLM
 from mia.analyzers.attnlink_analyzer import select_columns
+from _paths import config_path
 
-ROOT = Path(__file__).resolve().parents[1]
 MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
-CONFIG = ROOT / "model_configs/attnlink/Qwen2.5-Coder-7B-Instruct.json"
+CONFIG = config_path("attnlink/Qwen2.5-Coder-7B-Instruct.json")
 # BIRD dev example 128 (CC BY-SA 4.0, via Songjw133/AttnLink); see docs/use_cases/attnlink.md.
 INPUT_SEQ = """Task Overview:
 You are a data science expert. Your task is column-level schema linking. Given a natural language question and a database schema, identify the gold database tables and columns needed to write the SQL query for the question.

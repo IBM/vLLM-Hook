@@ -95,7 +95,7 @@ The engine. Its own modules are listed first, followed by its four subpackages.
 | Module | Role |
 |---|---|
 | `runner.py` | Adapter isolating every vLLM V2 model-runner access. |
-| `_plugin.py` | vLLM plugin entry point: patches engine, runner and serve path. Registered in `setup.py` as `mia.core._plugin:register`. |
+| `_plugin.py` | vLLM plugin entry point: patches engine, runner and serve path. Registered in `pyproject.toml` as `mia.core._plugin:register`. |
 
 #### `core/hooks/`
 

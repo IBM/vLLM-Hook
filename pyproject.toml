@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-hook"
+dynamic = ["version"]
+description = "vLLM-Hook: a vLLM plugin for capturing and steering model internals."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt"]
+dependencies = ["vllm==0.32.0", "zstandard"]
+
+[project.entry-points."vllm.general_plugins"]
+mia_registry = "mia:register_plugins"
+mia = "mia.core._plugin:register"
+
+[tool.hatch.version]
+source = "vcs"          # from the latest git tag, e.g. v1.0.1 -> 1.0.1
+
+[tool.hatch.build.targets.wheel]
+packages = ["mia"]   # every subpackage under mia/ is included automatically
+
+# The example configs and steering vectors live at the repo root; ship them as mia/data/*.
+[tool.hatch.build.targets.wheel.force-include]
+"model_configs" = "mia/data/model_configs"
+"steering_vectors" = "mia/data/steering_vectors"
+
+[tool.hatch.build.targets.sdist]
+include = ["/mia", "/model_configs", "/steering_vectors", "/README.md", "/LICENSE.txt"]

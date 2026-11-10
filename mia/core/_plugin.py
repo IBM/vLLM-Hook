@@ -119,6 +119,7 @@ from mia.core.runner import UnsupportedRunnerError
 from mia.workers._common import match_internal_ids
 from mia.workers.steer_worker import (
     _effective_key,
+    _existing_vector_path,
     _load_steering_vector,
     _parse_steer_layers,
     _resolve_steer_config,
@@ -1105,11 +1106,13 @@ def _mia_source_id() -> str:
     try:
         # lazy: as _v it would clash with the _v locals elsewhere in this module
         from importlib.metadata import version as _v
-        version = _v("mia")
+        version = _v("vllm-hook")
     except Exception:  # noqa: BLE001
         pass
     try:
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if not os.path.exists(os.path.join(root, ".git")):
+            raise RuntimeError("installed package, not a git checkout")  # version alone identifies it
         sha = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, timeout=5)
         if sha.returncode == 0:
@@ -2320,7 +2323,7 @@ def _steer_cache_salt(extra) -> str | None:
     if not isinstance(cfg, dict) or not cfg.get("vector_path"):
         return None
     try:
-        st = os.stat(cfg["vector_path"])
+        st = os.stat(_existing_vector_path(cfg["vector_path"]))
         ident = [st.st_size, st.st_mtime_ns]      # a file rewritten under the same path is new
     except (OSError, TypeError, ValueError):
         ident = None

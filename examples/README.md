@@ -8,9 +8,18 @@ commented block ([Server mode](#8-server-mode)).
 ## Getting started
 
 Install MIA as in the root [`README.md`](../README.md#-installation) (vLLM 0.32.0, torch 2.13.0),
-then run a demo from the repository root:
+then run a demo:
 
 ```bash
+python examples/demo_hiddenstate.py
+```
+
+Installed from PyPI (`pip install vllm-hook`)? The demos and notebooks are not in the wheel. Fetch
+them from the repository and run them against the installed package; they find the packaged
+configs and steering vectors on their own:
+
+```bash
+git clone --depth 1 https://github.com/IBM/vLLM-Hook.git && cd vLLM-Hook
 python examples/demo_hiddenstate.py
 ```
 
@@ -111,8 +120,7 @@ import os
 
 from vllm import SamplingParams
 
-from mia import MiaLLM
-from _paths import config_path          # resolves MIA's configs
+from mia import MiaLLM, config_path     # resolves MIA's configs, clone or pip install
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
@@ -229,8 +237,9 @@ returns what was captured, unchanged.
 ## 6. Gotchas
 
 - Set the `mp.set_start_method` / env lines **before** building the engine (`MiaLLM(...)`).
-- Run from the repo root: configs resolve from anywhere, but a config's `vector_path` and the
-  demos' `./cache/` are relative to the working directory (the server's, over `vllm serve`).
+- Configs and a config's `vector_path` resolve from anywhere, from a clone or from
+  `pip install vllm-hook`. The demos' `./cache/` output is relative to the working directory (the
+  server's, over `vllm serve`).
 - Graph mode is the default, offline and served; `enforce_eager=True` / `--enforce-eager` opts out.
 - Call `llm.llm_engine.reset_prefix_cache()` between prompts if you capture the same prefix twice.
   Steering needs no reset: a steered request shares cached prefixes only with requests steered

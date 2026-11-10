@@ -13,10 +13,10 @@ from typing import List
 from vllm import SamplingParams, TokensPrompt
 
 from mia import MiaLLM
-from _paths import REPO_ROOT
+from _paths import config_dir
 
 MODEL = 'mistralai/Mistral-7B-Instruct-v0.3'
-CONFIG_DIR = REPO_ROOT / "model_configs" / "core_reranker"
+CONFIG_DIR = config_dir("core_reranker")
 CONFIG_FILE = str(CONFIG_DIR / f'{MODEL.split("/")[-1]}.json')
 HOOK_DIR = "/dev/shm/mia"
 
