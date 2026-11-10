@@ -8,10 +8,22 @@ import torch
 
 from mia._profiler import PROF
 from mia.core.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
+from mia.resources import vector_path as packaged_vector_path
 from mia.workers._common import iter_matched_modules, match_layer
 
 
+def _existing_vector_path(vector_path: str) -> str:
+    """``vector_path`` as given, or the copy packaged in the wheel for a repo-relative path."""
+    if not os.path.exists(vector_path) and vector_path.startswith("steering_vectors/"):
+        try:  # a repo-relative path from a shipped config
+            return packaged_vector_path(vector_path.split("/", 1)[1])
+        except FileNotFoundError:
+            pass
+    return vector_path
+
+
 def _load_steering_vector(vector_path: str) -> Dict:
+    vector_path = _existing_vector_path(vector_path)
     if not os.path.exists(vector_path):
         raise FileNotFoundError(f"Steering vector not found at: {vector_path}")
     return torch.load(vector_path, weights_only=False)

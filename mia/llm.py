@@ -11,11 +11,10 @@ from vllm import LLM, SamplingParams
 
 from mia.optimizations import apply_optimizations
 from mia.registry import PluginRegistry
-from mia.resources import vector_path
 from mia.core.delivery.sizing import qk_score_size_select
 from mia.artifacts import dispatch_disk_analyze
 from mia._profiler import PROF
-from mia.workers.steer_worker import resolve_steer_modes
+from mia.workers.steer_worker import _existing_vector_path, resolve_steer_modes
 from mia.core.delivery.artifact_quant import dequantize_cache_inplace
 
 
@@ -207,12 +206,9 @@ class MiaLLM:
 
         if "steering" in config_data:
             self._steering_config = dict(config_data["steering"])
-            vp = self._steering_config.get("vector_path")
-            if vp and not os.path.exists(vp) and vp.startswith("steering_vectors/"):
-                try:  # a repo-relative path from a shipped config: use the packaged copy
-                    self._steering_config["vector_path"] = vector_path(vp.split("/", 1)[1])
-                except FileNotFoundError:
-                    pass
+            if self._steering_config.get("vector_path"):
+                self._steering_config["vector_path"] = _existing_vector_path(
+                    self._steering_config["vector_path"])
             resolve_steer_modes(self._steering_config)
 
         if "hidden_states" in config_data:
