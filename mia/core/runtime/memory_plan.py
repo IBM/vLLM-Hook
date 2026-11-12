@@ -8,6 +8,7 @@ import os
 
 from mia.errors import MiaConfigurationError, MiaSizingError
 from mia.core.aperture.aperture_sizing import DEFAULT_APERTURE_GPU_BYTES
+from mia.core.runtime.hs_target import hs_capture_width
 from mia.core.runtime.tp_shard import (hs_rows_for_mode, qk_layer_shards, resolve_hs_shard_mode,
                                        text_layer_geometry, text_layer_kv_sources)
 
@@ -91,6 +92,7 @@ def build_memory_plan(config, worker_kind: str, *, total_bytes: int, tp_rank: in
     n, h = int(tc.num_hidden_layers), int(tc.hidden_size)
     cap = int(config.scheduler_config.max_num_batched_tokens)
     tp = int(pc.tensor_parallel_size)
+    w = hs_capture_width(tc, tp) if worker_kind == 'hidden_states' else h
     dtype = str(mc.dtype).removeprefix('torch.')
     dtype = {'half': 'float16', 'float': 'float32'}.get(dtype, dtype)
     util = float(config.cache_config.gpu_memory_utilization)
@@ -116,7 +118,7 @@ def build_memory_plan(config, worker_kind: str, *, total_bytes: int, tp_rank: in
     if worker_kind == 'hidden_states':
         owned = tuple(hs_rows_for_mode(resolve_hs_shard_mode(tp), n, tp, tp_rank))
         symmetric = tp > 1 and os.environ.get('MIA_HS_TP_SYMMETRIC', '1') != '0'
-        captured = {layer: [('hs', h)] for layer in owned}
+        captured = {layer: [('hs', w)] for layer in owned}
     elif worker_kind == 'qk':
         shards = qk_layer_shards(text_layer_geometry(tc), tp_rank, tp)
         # a KV-shared layer's keys live in its source layer's k buffer
@@ -152,7 +154,7 @@ def build_memory_plan(config, worker_kind: str, *, total_bytes: int, tp_rank: in
         add('hs.sink_active', (n,), 'int32')
         for layer in range(n):
             if layer not in owned:
-                add(f'hs.sink.{layer}', (1, h))
+                add(f'hs.sink.{layer}', (1, w))
     if worker_kind == 'steer':
         try:
             vmax = int(os.environ.get('MIA_STEER_VMAX', '16'))
@@ -170,7 +172,7 @@ def build_memory_plan(config, worker_kind: str, *, total_bytes: int, tp_rank: in
                 add(f'steer.slot_{name}', (cap,), dt)
             add('steer.slot_layer_mask', (cap, n), 'bool')
     plan = MiaMemoryPlan(model_bytes, outside, aperture, offsets['auxiliary'],
-                         tuple(specs), rows, worker_kind, n, h, cap, dtype, owned)
+                         tuple(specs), rows, worker_kind, n, w, cap, dtype, owned)
     if offsets['aperture'] + offsets['aperture_k'] > aperture:
         raise MiaSizingError('Capture layout exceeds its exact aperture storage')
     if check_fit:
