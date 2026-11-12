@@ -1170,6 +1170,7 @@ def mia_graph_layout(engine_args, worker_kind: str) -> dict:
             "hs_owned_layers": owned,
             "hs_sinks": bool(tp_size > 1 and os.environ.get("MIA_HS_TP_SYMMETRIC", "1") != "0"),
             "hs_capture_mode": (os.environ.get("MIA_HS_CAPTURE", "buffer") or "").strip().lower(),
+            "hs_target": (os.environ.get("MIA_HS_TARGET", "layer") or "layer").strip().lower(),
         })
     elif kind == "qk":
         layout.update({
