@@ -131,6 +131,7 @@ class HSCaptureWorker:
 
         # lazy: keep mia.core.runtime out of import mia
         from mia.core.runtime.tp_shard import refuse_pipeline_parallel, resolve_tp_coords
+        from mia.core.runtime.hs_target import hs_capture_width, hs_match_fn
         refuse_pipeline_parallel(getattr(self.parallel_config, "pipeline_parallel_size", 1),
                                  "HS install_hooks")
         tp_rank, _tp_size = resolve_tp_coords(self)
@@ -147,7 +148,7 @@ class HSCaptureWorker:
 
         cfg = model.config
         text_cfg = getattr(cfg, "text_config", cfg)
-        hidden_size = int(getattr(text_cfg, "hidden_size"))
+        hidden_size = hs_capture_width(text_cfg, _tp_size)
         num_layers = int(getattr(text_cfg, "num_hidden_layers", 0))
         self._conf = {"hidden_size": hidden_size, "num_layers": num_layers}
 
@@ -269,7 +270,7 @@ class HSCaptureWorker:
 
         self._hooks = []
         matched = []
-        for name, module, layer_num in iter_matched_modules(model, match_layer):
+        for name, module, layer_num in iter_matched_modules(model, hs_match_fn(match_layer)):
             hook = module.register_forward_hook(
                 lambda m, i, o, n=name, ln=layer_num+1: hs_hook(o, n, ln)
             )
@@ -517,8 +518,9 @@ class HSCaptureWorker:
         names = getattr(self, "_mia_layer_names", None)
         if names is None:
             model = getattr(getattr(self, "model_runner", None), "model", None)
+            from mia.core.runtime.hs_target import hs_match_fn
             names = ([] if model is None else
-                     [[ln + 1, n] for n, _m, ln in iter_matched_modules(model, match_layer)])
+                     [[ln+1, n] for n, _m, ln in iter_matched_modules(model, hs_match_fn(match_layer))])
         gp = getattr(getattr(self, "_hs_drain", None), "_gather_proc", None)
         return {"names": [[int(ln), str(n)] for ln, n in names],
                 "config": dict(getattr(self, "_conf", None) or {}),
