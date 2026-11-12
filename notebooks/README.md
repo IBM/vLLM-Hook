@@ -18,6 +18,7 @@ Use the `_colab.ipynb` notebooks when running in Google Colab:
 - [demo_attntracker_colab.ipynb](demo_attntracker_colab.ipynb)
 - [demo_corer_colab.ipynb](demo_corer_colab.ipynb)
 - [demo_actsteer_colab.ipynb](demo_actsteer_colab.ipynb)
+- [demo_langneuron_colab.ipynb](demo_langneuron_colab.ipynb) 
 
 ## Local Notebook Setup
 
