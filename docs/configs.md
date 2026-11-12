@@ -81,6 +81,11 @@ your worker uses are read.
 Analyzer-specific sections (e.g. `scihal.clf_path`) are read by their demo. `score` capture of a
 layer with no listed heads uses the single head `MIA_QK_SCORE_HEAD` (env var, default 0).
 
+Steering vectors load with `torch.load(weights_only=True)`, so a file holding anything other
+than tensors, numpy arrays and plain containers is refused. To restrict which files a request
+can name, set `MIA_STEER_VECTOR_DIR` to one or more directories (`os.pathsep`-separated);
+paths that resolve outside them are refused.
+
 ---
 
 ## Selecting a configuration from user code
