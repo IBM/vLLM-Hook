@@ -16,6 +16,7 @@ Each row maps a use case to its paper, its demo under `examples/`, the plugin na
 | [Tool-Call Risk Probe](tool_call_risk.md) | — | `demo_toolcallrisk.py` | `tool_call_risk` | `capture_hs` † | [@rishabhsinha17](https://github.com/rishabhsinha17) |
 | [Spotlight](spotlight.md) | [Venkateswaran and Contractor, EACL 2026](https://aclanthology.org/2026.eacl-long.174/) | [`demo_spotlight.py`](https://github.com/IBM/vLLM-Hook/blob/v0.2.0/examples/demo_spotlight.py) | — | `probe_spotlight` ‡ | [@danishcontractor](https://github.com/danishcontractor) |
 | [Token Highlighter](TokenHighlighter.md) | [Token Highlighter: Inspecting and Mitigating Jailbreak Prompts for LLMs](https://arxiv.org/abs/2412.18171) | [`demo_token_highlighter.py`](https://github.com/IBM/vLLM-Hook/blob/v0.2.0/examples/demo_token_highlighter.py) | `token_highlighter` | `token_highlighter` ‡ | [@asanth7](https://github.com/asanth7) |
+| Language-Specific Neurons | [Language-Specific Neurons: The Key to Multilingual Capabilities in Large Language Models](https://aclanthology.org/2024.acl-long.309/) | `notebooks/demo_langneuron_colab.ipynb` | — | `capture_hs` † (`hs_target="mlp"`) | [@akshitsrivastava04](https://github.com/akshitsrivastava04) |
 
 > † Reuses an existing worker.
 >
