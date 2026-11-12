@@ -19,6 +19,7 @@ from mia.core.hooks.hosts import HSCaptureHost
 from mia.core.hooks.registry import HostRegistry, get_registry, set_registry
 from mia.core.aperture.aperture_metadata import ReqCaptureRecord
 from mia.core.aperture.aperture_sizing import aperture_bytes_is_explicit, resolve_aperture_bytes_auto
+from mia.core.runtime.hs_target import hs_capture_width, hs_match_fn
 from mia.core.runtime.tp_shard import (
     HS_ALL_RANKS_ENV, HS_MODE_RANK0, HS_MODE_ROUND_ROBIN, HS_MODE_SINGLE, HSShard, dp_layout,
     dp_run_base, hs_rows_for_mode, rank_dir_name, refuse_pipeline_parallel, resolve_hs_shard_mode,
@@ -132,10 +133,10 @@ def install_hs_hosts(worker) -> Optional[HostRegistry]:
 
     cfg = model.config
     text_cfg = getattr(cfg, "text_config", cfg)
-    hidden_size = int(getattr(text_cfg, "hidden_size"))
     num_layers = int(getattr(text_cfg, "num_hidden_layers", 0))
 
     tp_rank, tp_size = resolve_tp_coords(worker)
+    hidden_size = hs_capture_width(text_cfg, tp_size)
     shard_mode = resolve_hs_shard_mode(tp_size)
     owned_rows = hs_rows_for_mode(shard_mode, num_layers, tp_size, tp_rank)
     should_capture = (tp_rank == 0) if shard_mode == HS_MODE_SINGLE else bool(owned_rows)
@@ -168,7 +169,7 @@ def install_hs_hosts(worker) -> Optional[HostRegistry]:
     if not getattr(worker, "_disk_states", None):
         worker._disk_states = {}
 
-    matched = list(iter_matched_modules(model, match_layer))
+    matched = list(iter_matched_modules(model, hs_match_fn(match_layer)))
     validate_layer_matches(getattr(worker, "_mia_memory_owner", None), matched)
     worker._mia_layer_names = [[ln + 1, name] for name, _m, ln in matched]
     if not matched:
