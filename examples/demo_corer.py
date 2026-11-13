@@ -11,6 +11,7 @@ import sys
 from typing import List
 
 from vllm import SamplingParams, TokensPrompt
+from transformers import AutoTokenizer
 
 from mia import MiaLLM
 from _paths import REPO_ROOT
@@ -49,6 +50,9 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
     messages = [{"role": "user", "content": content}]
     full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
+    if content not in full_text:
+        raise ValueError("The chat template did not render the prompt as plain text;")
+
     content_start = full_text.index(content)
 
     def char_to_tok(char_pos):
@@ -56,7 +60,7 @@ def apply_chat_template_and_get_ranges(tokenizer, model_name: str, query: str, d
 
     doc_span = [(char_to_tok(s), char_to_tok(e)) for s, e in doc_char_spans]
     query_start_idx = char_to_tok(query_start_char)
-    after_retrieval_instruction_late = char_to_tok(after_instruct_char)
+    after_retrieval_instruction_late = char_to_tok(after_instruct_char - 1)
     query_end_idx = char_to_tok(query_end_char)
 
     return full_text, messages, (doc_span, query_start_idx, after_retrieval_instruction_late, query_end_idx)
@@ -208,10 +212,11 @@ def main():
                  config_file=CONFIG_FILE, hook_dir=HOOK_DIR,
                  gpu_memory_utilization=0.7, max_model_len=2048)
     sp = SamplingParams(max_tokens=1, temperature=0.1)
+    span_tok = AutoTokenizer.from_pretrained(MODEL)
 
     for case in TEST_CASES:
         print("=" * 50)
-        ids, query_spec, ids_na, na_spec = case_prompts(llm.tokenizer, case)
+        ids, query_spec, ids_na, na_spec = case_prompts(span_tok, case)
         llm.generate(TokensPrompt(prompt_token_ids=ids), sp, save_to_disk=True, run_id="corer-doc")
         llm.generate(TokensPrompt(prompt_token_ids=ids_na), sp, save_to_disk=True,
                      run_id="corer-na")
