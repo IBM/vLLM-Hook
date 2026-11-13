@@ -11,10 +11,35 @@ from mia.core.runner import StepView, install_request_arg_stash, require_v2_runn
 from mia.workers._common import iter_matched_modules, match_layer
 
 
+def _check_vector_dir(vector_path: str) -> None:
+    """Refuse a vector outside ``MIA_STEER_VECTOR_DIR``, if it is set."""
+    allowed = os.environ.get("MIA_STEER_VECTOR_DIR")
+    if not allowed:
+        return
+    real = os.path.realpath(vector_path)
+    roots = [os.path.realpath(d) for d in allowed.split(os.pathsep) if d]
+    if not any(os.path.commonpath([real, root]) == root for root in roots):
+        raise ValueError(f"steering vector {vector_path!r} is outside MIA_STEER_VECTOR_DIR")
+
+
+def _numpy_safe_globals() -> list:
+    """What weights_only needs to rebuild a numpy float array (e.g. phi3_format.pt)."""
+    try:
+        from numpy._core.multiarray import _reconstruct
+    except ImportError:  # numpy < 2
+        from numpy.core.multiarray import _reconstruct
+    import codecs
+    dtype_classes = {type(np.dtype(t)) for t in ("f2", "f4", "f8")}
+    return [_reconstruct, np.ndarray, np.dtype, codecs.encode, *dtype_classes]
+
+
 def _load_steering_vector(vector_path: str) -> Dict:
+    _check_vector_dir(vector_path) 
     if not os.path.exists(vector_path):
         raise FileNotFoundError(f"Steering vector not found at: {vector_path}")
-    return torch.load(vector_path, weights_only=False)
+    
+    with torch.serialization.safe_globals(_numpy_safe_globals()):
+        return torch.load(vector_path, weights_only=True)
 
 
 def _resolve_steer_config(steer_arg, env_default_path: Optional[str]) -> Optional[Dict]:
