@@ -91,6 +91,7 @@ class MiaLLM:
         enable_hook: bool = True,
         hook_dir: str = None,
         enforce_eager: bool = False,
+        hs_target: Optional[str] = None,
         **vllm_kwargs
     ):
         """Build the engine.
@@ -105,6 +106,9 @@ class MiaLLM:
             hook_dir: dir for ``save_to_disk`` runs; default ``<download_dir>/mia``, else
                 ``~/.cache/mia``.
             enforce_eager: run eagerly instead of with CUDA graphs.
+            hs_target: for "capture_hs" to determine the capture mode, "layer" (default,  each decoder
+                       layer's output) or "mlp" (each layer's MLP Neurons, down_proj, ``intermediate_size`` wide;
+                       dense MLPs at tensor_parallel_size=1). Sets ``MIA_HS_TARGET`` for this process and the engine it starts.
             **vllm_kwargs: passed to ``vllm.LLM``.
         """
         self.model_name = model
@@ -112,6 +116,13 @@ class MiaLLM:
         self.analyzer_name = analyzer_name
         self.enable_hook = enable_hook
         self.enforce_eager = enforce_eager
+
+        if hs_target is not None:
+            if worker_name != "capture_hs":
+                raise ValueError("hs_target applies only to worker_name='capture_hs'")
+            from mia.core.runtime.hs_target import HS_TARGET_ENV, hs_target as _resolve
+            os.environ[HS_TARGET_ENV] = str(hs_target)
+            _resolve()
 
         if download_dir is not None:
             download_dir = os.path.expanduser(download_dir)
