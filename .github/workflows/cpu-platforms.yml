@@ -1,0 +1,114 @@
+name: CPU platform validation
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test_sha:
+        description: Optional full commit SHA (defaults to the selected branch)
+        required: false
+      fresh_build:
+        description: Ignore wheel cache for a full build
+        type: boolean
+        default: false
+concurrency:
+  group: cpu-platforms-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  cpu:
+    name: CPU / ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+            experimental: false
+          - platform: macos
+            runner: macos-14
+            experimental: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    env:
+      TEST_SHA: ${{ inputs.test_sha || github.event.pull_request.head.sha || github.sha }}
+      CPU_PLATFORM: ${{ matrix.platform }}
+      TRITON_SHA: c8e7cc932320d05d08f39ffc99bfda32dc4f22fa
+      MAX_JOBS: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      TRITON_PARALLEL_LINK_JOBS: '1'
+      TRITON_BUILD_PROTON: 'OFF'
+      TRITON_APPEND_CMAKE_ARGS: '-DTRITON_BUILD_UT=OFF'
+      TRITON_DEFAULT_BACKEND: cpu
+      VLLM_TARGET_DEVICE: cpu
+      OMP_NUM_THREADS: '1'
+      VLLM_CPU_OMP_THREADS_BIND: nobind
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate revision input
+        run: '[[ "$TEST_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ inputs.test_sha || github.event.pull_request.head.sha || github.sha }}
+          path: target
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Record host and check compatibility
+        run: bash .github/scripts/cpu-platforms.sh host
+      - name: Wheel compatibility key
+        id: key
+        run: |
+          python .github/scripts/cpu-key.py
+      - uses: actions/cache/restore@v4
+        id: cache
+        if: ${{ !inputs.fresh_build }}
+        with:
+          path: wheelhouse
+          key: ${{ steps.key.outputs.key }}
+      - name: Install CPU dependencies
+        run: bash .github/scripts/cpu-platforms.sh setup
+      - name: Build or reuse Triton CPU wheel
+        id: wheel
+        run: bash .github/scripts/cpu-platforms.sh wheel
+      - uses: actions/cache/save@v4
+        if: ${{ steps.wheel.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: wheelhouse
+          key: ${{ steps.key.outputs.key }}
+      - name: Verify CPU backends and dependencies
+        run: bash .github/scripts/cpu-platforms.sh verify
+      - name: Run unchanged CPU scenarios
+        run: bash .github/scripts/cpu-platforms.sh scenarios
+      - name: Record installed packages even on setup failure
+        if: always()
+        run: |
+          mkdir -p evidence
+          if [ -x .venv/bin/python ]; then
+            .venv/bin/python -m pip freeze > evidence/dependencies-final.txt 2>&1
+            .venv/bin/python -m pip --version >> evidence/dependencies-final.txt 2>&1
+          fi
+      - name: Preserve evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-${{ matrix.platform }}-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Save reusable compiled wheel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-${{ matrix.platform }}-triton-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: wheelhouse/
+          retention-days: 30
+          if-no-files-found: warn

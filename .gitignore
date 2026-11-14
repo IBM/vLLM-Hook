@@ -13,3 +13,6 @@ hs_aperture_dump/
 qk_aperture_dump/
 
 ignore/
+
+# Local CPU dependency environment
+.venv-install-test-cpu/
