@@ -33,6 +33,28 @@ def unpack_hidden_states(entry: dict) -> "List[Any]":
     raise TypeError(f"Unexpected hidden_states type: {type(hs)}")
 
 
+def last_prompt_rows(entry: dict) -> "List[Any]":
+    """Each request's last prompt-token row (``last_token`` mode: each pass's row, as captured).
+
+    In ``all_tokens`` mode a request can span several passes (prefill chunks, then decode steps),
+    and a padded ``(passes, rows, hidden)`` tensor holds zero rows past each pass's ``pass_lens``.
+    ``req_passes`` splits the passes by request (a disk run, or a batch merged by ``generate``);
+    without it the entry is one output's probes, whose prompt is its ``prefill_passes`` passes.
+    A disk request's prompt is taken to end its passes (the default ``hooks_on="prefill"``).
+    """
+    passes = unpack_hidden_states(entry)
+    if not passes or passes[0].dim() == 1:
+        return passes
+    lens = entry.get("pass_lens") or [p.shape[0] for p in passes]
+    counts = entry.get("req_passes")
+    if counts is None:
+        prompt_passes = max(int(entry.get("prefill_passes") or 1), 1)
+        ends = [min(prompt_passes, len(passes))]
+    else:
+        ends = [sum(int(c) for c in counts[:i + 1]) for i, c in enumerate(counts) if int(c)]
+    return [passes[e - 1][int(lens[e - 1]) - 1] for e in ends]
+
+
 def unpack_qk(entry: dict) -> "tuple[List[Any], List[Any]]":
     """Return Q and K as lists of per-pass tensors."""
     def _unpack(t):

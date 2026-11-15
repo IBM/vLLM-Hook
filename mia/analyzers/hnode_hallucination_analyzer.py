@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from mia.artifacts import load_and_merge_hs_cache, unpack_hidden_states
+from mia.artifacts import last_prompt_rows, load_and_merge_hs_cache
 from mia.utils.hnode.score import HNodeProbe
 
 
@@ -64,8 +64,8 @@ class HNodeHallucinationAnalyzer:
                 f"to include layer {probe.best_layer} in 'hidden_states.layers'."
             )
 
-        tensors: List[torch.Tensor] = unpack_hidden_states(hs_cache[target_module])
-        rows = [t if t.dim() == 1 else t[-1] for t in tensors]
+        # The probe reads the last prompt token: one row per request in all_tokens mode.
+        rows: List[torch.Tensor] = last_prompt_rows(hs_cache[target_module])
         batch = torch.stack(rows).float().cpu().numpy()
 
         scores = probe.score(batch)
