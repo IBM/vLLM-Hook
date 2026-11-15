@@ -6,7 +6,7 @@ import torch
 
 pytest.importorskip("vllm")  # `import mia` pulls in vLLM; skip, never error the whole collection
 
-from mia import MiaLLM, register_plugins
+from mia import CorerAnalyzer, MiaLLM, register_plugins
 from tests.conftest import ensure_config_for_model, requires_gpu
 
 
@@ -108,3 +108,11 @@ def test_core_reranker(tmp_path, engines, model_id):
     assert "ranking" in stats
     assert len(stats["scores"][0]) == len(documents)
     assert len(stats["ranking"][0]) == len(documents)
+
+    # The configured heads, not just their layers, decide the scores: same runs, other heads.
+    other_heads = {layer: [h ^ 1 for h in heads] for layer, heads in llm.layer_to_heads.items()}
+    other = CorerAnalyzer(str(tmp_path / "hooks"), other_heads).analyze(
+        analyzer_spec={"query_spec": query_spec, "na_spec": na_spec},
+        run_ids=["corer-doc", "corer-na"],
+    )
+    assert other["scores"] != stats["scores"]
