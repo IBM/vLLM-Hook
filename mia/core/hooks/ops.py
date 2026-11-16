@@ -36,7 +36,16 @@ def _steer_buffer_impl(
     vec_table: torch.Tensor,
     avg_proj: torch.Tensor,
     steer_mode: torch.Tensor,
+    hidden: torch.Tensor | None = None,
 ) -> None:
+    """Steer ``residual[:n]`` in place.
+
+    vLLM decoder layers return ``(hidden_states, residual)``, and the next layer adds the
+    two, so the residual stream is their sum. When ``hidden`` is given, ``adjust_rs``
+    computes the projection on ``hidden + residual`` so that the stream's projection
+    equals ``avg_proj``. The update is always written to ``residual``. Pass None for
+    ``hidden`` if ``residual`` is the full stream.
+    """
     if coeff is None or vec_id is None or vec_table is None:
         return None
     _FIRE_COUNT[0] += 1
@@ -44,14 +53,16 @@ def _steer_buffer_impl(
     if _STEER_FUSED and residual.is_cuda:
         # lazy: Triton kernels load on first use; no CUDA fallback, it allocates temporaries
         from mia.core.hooks.steer_triton import steer_buffer_fused
-        steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n)
+        steer_buffer_fused(residual, coeff, vec_id, vec_table, avg_proj, steer_mode, n,
+                           hidden=hidden)
         return None
     if residual.is_cuda:
         raise RuntimeError("MIA CUDA steering requires MIA_STEER_FUSED=1")
     vids = vec_id[:n].to(torch.long)
     units = vec_table.index_select(0, vids).to(residual.dtype)
     c_add = coeff[:n].to(residual.dtype)
-    proj = (residual[:n] * units).sum(dim=-1)
+    stream = residual[:n] if hidden is None else hidden[:n] + residual[:n]
+    proj = (stream * units).sum(dim=-1)
     avg = avg_proj.index_select(0, vids).to(residual.dtype)
     c_adj = avg - proj
     is_adj = steer_mode[:n].to(torch.bool)
@@ -67,6 +78,7 @@ def _steer_buffer_fake(
     vec_table: torch.Tensor,
     avg_proj: torch.Tensor,
     steer_mode: torch.Tensor,
+    hidden: torch.Tensor | None = None,
 ) -> None:
     return None
 
