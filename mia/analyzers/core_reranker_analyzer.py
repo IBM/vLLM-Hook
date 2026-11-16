@@ -126,13 +126,15 @@ class CorerAnalyzer:
             k_heads, q_heads = [], []
             for i in range(bs):
                 query_len = q_query[i].shape[0]
-                seq_len = k_all[i].shape[0]
+                # keys stop at the query's last token, as in the reference ICR/CoRe code: the
+                # template after it (e.g. [/INST]) is not visible to any query row
+                seq_len = query_end_tok_idx[i] + 1
 
                 q_head = q_query[i].view(query_len, lc["num_attention_heads"], lc["head_dim"])
                 q_head = q_head.permute(1, 0, 2)
                 q_heads.append(q_head)
 
-                k_head = k_all[i].view(seq_len, lc["num_key_value_heads"], lc["head_dim"])
+                k_head = k_all[i][:seq_len].view(seq_len, lc["num_key_value_heads"], lc["head_dim"])
                 k_head = k_head.permute(1, 0, 2)
                 k_heads.append(k_head)
 
