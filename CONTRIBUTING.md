@@ -29,8 +29,8 @@ The CPU tests and the checks run without a GPU. Anything that boots an engine ne
 
 | You are adding | Put it in | Also |
 |---|---|---|
-| An analyzer | `mia/analyzers/` | Register it with `PluginRegistry.register_analyzer` ([how](README.md#adding-a-worker-or-analyzer)) |
-| A worker | `mia/workers/` | New workers use forward hooks, which run in eager mode only |
+| An analyzer | `mia/analyzers/` | Register it with `PluginRegistry.register_analyzer` in `mia/__init__.py` ([how](README.md#adding-a-worker-or-analyzer)) |
+| A worker | `mia/workers/` | A `worker_extension_cls` class; register it with `PluginRegistry.register_worker` in `mia/__init__.py`. New workers use forward hooks, which run in eager mode only |
 | A use case | `examples/demo_<name>.py`, `model_configs/<kind>/` | A row in [`docs/use_cases/README.md`](docs/use_cases/README.md) with your GitHub handle; a writeup in `docs/use_cases/<name>.md` if you have one |
 | A test without a GPU | `tests/unit/` | |
 | A test that boots an engine | `tests/use_cases/` | Mark it `@pytest.mark.gpu` and `@requires_gpu` (see `tests/conftest.py`) |
@@ -70,3 +70,17 @@ Put the results in the PR as a small table (mode, `main`, your branch), as in
   hidden_states + residual".
 - CI must pass: lint and CPU tests.
 - New behaviour comes with a test; a bug fix comes with a test that fails without it.
+- New features come with an example or notebook.
+
+### Bug fix PRs
+
+A bug fix PR should include the following (the template's Bug fix section lists the same):
+
+- A brief explanation of the bug and the fix.
+- Code or steps to reproduce the bug.
+- Error logs or outputs from the relevant settings: CPU or GPU, eager or CUDA graphs.
+- The fix itself, with as few unrelated changes as possible.
+- Tests showing the bug is fixed.
+- Test results showing other features still work.
+- Any performance or latency impact, if there is one.
+- Anything else a reviewer should know.
