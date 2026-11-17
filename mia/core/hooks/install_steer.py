@@ -535,7 +535,6 @@ def _steer_idle_key(step: StepView, registry):
 
 def _build_routing_steer(step: StepView, registry: SteerRegistry) -> list:
     worker = _ACTIVE_WORKER_STEER
-    req_ids = step.req_ids
     bs = step.num_reqs
     qsl = step.query_start_loc_np
     inc = registry.incremental_enabled
@@ -549,7 +548,6 @@ def _build_routing_steer(step: StepView, registry: SteerRegistry) -> list:
     plans: list = []
     assignments: list = []
     for i in range(bs):
-        req_id = req_ids[i]
         extra = step.extra_args_for(i)
         steer_arg = (extra or {}).get("steer")
         cfg = _resolve_steer_config(steer_arg, env_path)
