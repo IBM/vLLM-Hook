@@ -11,7 +11,7 @@
 <!-- List the files changed. -->
 
 The following files are **core infrastructure**. Please discuss with maintainers before modifying:
-`hook_llm.py`, `_hook_plugin.py`, `registry.py`, `hook_client.py`, `run_utils.py`, `shm_utils.py`, `workers/_common.py`
+`mia/llm.py`, `mia/client.py`, `mia/core/_plugin.py` and anything under `mia/core/`
 
 - [ ] I have NOT modified core files, OR I have discussed the change with maintainers
 - [ ] If I added a new worker/analyzer, I registered it in `__init__.py`
@@ -23,10 +23,15 @@ The following files are **core infrastructure**. Please discuss with maintainers
 - [ ] If I added a new use case, I appended a row to `docs/use_cases/README.md` with my GitHub handle. If the use case has a writeup, I placed it under `docs/use_cases/<name>.md` and linked it from the table.
 
 ## Testing
-<!-- Describe how you tested this. Which demo/example did you run? -->
+- [ ] `pre-commit run --all-files` passes
+- [ ] `pytest tests -q -m "not gpu"` passes
+- [ ] Touched capture, steering or delivery: ran it on a GPU
+      (CUDA graphs and eager, offline and served)
+
+What I ran:
 
 ## Related issue
-<!-- Link any related issue: Closes #123 -->
+Closes #
 
 ## Contribution acknowledgement
 If this contribution is included in a future version of the vLLM-Hook technical report, would you like to be credited as a co-author?

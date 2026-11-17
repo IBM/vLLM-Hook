@@ -1,0 +1,21 @@
+# Setup:  pip install pre-commit && pre-commit install
+# Run:    pre-commit run --all-files
+# CI runs the same hooks.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-ast                 # Python files must parse
+      - id: check-json                # mostly the model configs
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: debug-statements          # leftover breakpoint() or pdb
+      - id: detect-private-key
+      - id: check-added-large-files   # no new files over 1 MB, e.g. weights or dumps
+        args: ["--maxkb=1024"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff-check

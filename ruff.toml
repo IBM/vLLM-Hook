@@ -1,0 +1,12 @@
+# Ruff's default rules, minus three that the code breaks on purpose.
+target-version = "py311"
+line-length = 100
+extend-exclude = ["docs/archive", "notebooks"]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]   # Ruff's defaults
+ignore = [
+    "E702",  # a = 1; b = 2 on one line
+    "E731",  # f = lambda x: ...
+    "E741",  # variables named l, I or O
+]

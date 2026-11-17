@@ -325,7 +325,7 @@ Full detail: [`mia/README.md`](mia/README.md).
 
 ## 🤝 Contributing
 
-We welcome contributions from the community!  
+We welcome contributions from the community! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and what a PR needs; report security issues privately as described in [SECURITY.md](SECURITY.md).  
 
 ### To contribute:
 1. **Fork** this repository  

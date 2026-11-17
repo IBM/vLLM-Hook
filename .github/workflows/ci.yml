@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pre-commit
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  cpu-tests:
+    # GitHub's runners have no GPU, so this skips the tests marked gpu.
+    # Run those by hand on a GPU machine (see CONTRIBUTING.md).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirement.txt
+      - name: Install dependencies
+        run: |
+          # CPU-only torch first, so pip doesn't download the much larger CUDA build
+          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirement.txt
+          pip uninstall -y torchcodec
+          pip install -e . --no-deps
+          pip install pytest
+      - name: CPU tests
+        run: pytest tests -q -m "not gpu"
