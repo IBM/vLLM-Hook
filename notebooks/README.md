@@ -1,17 +1,15 @@
 # Running the Notebooks
 
-> **Outdated; these notebooks will be updated for MIA.** They still use the vLLM-Hook v0 API
-> (`vllm_hook_plugins`): run them from [v0.2.0](https://github.com/IBM/vLLM-Hook/tree/v0.2.0), and in Colab have the setup cell check out
-> `v0.2.0` instead of `main`.
-
 The `notebooks/` directory includes local notebooks and Google Colab variants
 for the same demos.
 
-Use the standard notebooks when running from a local checkout:
+Use the standard notebooks locally, from a clone or with `pip install vllm-hook` (their first cell
+installs MIA either way, and `mia.config_path` finds the example configs in both):
 
 - [demo_attntracker.ipynb](demo_attntracker.ipynb)
 - [demo_corer.ipynb](demo_corer.ipynb)
 - [demo_actsteer.ipynb](demo_actsteer.ipynb)
+- [demo_scihal.ipynb](demo_scihal.ipynb)
 
 Use the `_colab.ipynb` notebooks when running in Google Colab:
 
@@ -26,8 +24,11 @@ the repository root:
 
 ```bash
 pip install -r requirement.txt
-pip install -e vllm_hook_plugins
+pip install --no-deps -e .
 ```
+
+Installed from PyPI instead (`pip install vllm-hook`)? The notebooks are not in the wheel: fetch them
+with `git clone --depth 1 https://github.com/IBM/vLLM-Hook.git` and open them from `notebooks/`.
 
 Install the notebook-specific tools and register the environment as a Jupyter
 kernel:
@@ -63,7 +64,7 @@ The Colab install cell is designed to:
 - clone `https://github.com/IBM/vLLM-Hook.git`
 - check out the `main` branch
 - install `requirement.txt`
-- install `vllm_hook_plugins` in editable mode
+- install the repo in editable mode (`pip install --no-deps -e .`)
 - switch into the repo `notebooks/` directory
 
 Re-run that cell after a runtime reset before running the rest of the notebook.
@@ -100,7 +101,7 @@ Do not skip directly to later cells in a fresh runtime.
   - Free public Colab T4 runtimes can start with limited available GPU memory. The Colab notebooks use lower defaults (`gpu_memory_utilization=0.5` and `max_model_len=2048`) to reduce this, but repeated reruns can still leave less memory available.
 
 - `demo_actsteer_colab.ipynb` can still fail on free Colab T4 with a startup-memory error during generation
-  - This is a known limitation. The steering path builds a hooked vLLM engine after using the base engine, so constrained T4 sessions may temporarily need memory for both engine lifecycles in the same notebook run. This has been flagged for follow-up and is not yet changed in `HookLLM`.
+  - This is a known limitation. The steering path builds a hooked vLLM engine after using the base engine, so constrained T4 sessions may temporarily need memory for both engine lifecycles in the same notebook run. This has been flagged for follow-up and is not yet changed in `MiaLLM`.
 
 - Slow or inconsistent behavior after repeated experimentation
   - Use `Runtime -> Restart session` and re-run all cells in order.

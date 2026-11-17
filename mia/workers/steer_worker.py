@@ -8,6 +8,7 @@ import torch
 
 from mia._profiler import PROF
 from mia.core.runner import StepView, install_request_arg_stash, require_v2_runner, step_view
+from mia.resources import vector_path as packaged_vector_path
 from mia.workers._common import iter_matched_modules, match_layer
 
 

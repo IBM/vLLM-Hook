@@ -140,7 +140,8 @@ pytest tests/use_cases -m gpu
 
 ## ⚡ Quickstart
 
-Run these from the repo root (the configs name repo-relative steering vectors).
+`mia.config_path(...)` finds the example configs and steering vectors whether MIA came from a
+clone or from `pip install vllm-hook`, so these run from any directory.
 
 **Capture hidden states, offline:**
 
@@ -150,14 +151,14 @@ import os
 
 from vllm import SamplingParams
 
-from mia import MiaLLM
+from mia import MiaLLM, config_path
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     llm = MiaLLM(model="Qwen/Qwen2-1.5B-Instruct", worker_name="capture_hs",
                  analyzer_name="hidden_states",
-                 config_file="model_configs/hidden_states/Qwen2-1.5B-Instruct.json",
+                 config_file=config_path("hidden_states/Qwen2-1.5B-Instruct.json"),
                  gpu_memory_utilization=0.7, max_model_len=2048)
     out = llm.generate("The capital of France is", SamplingParams(temperature=0.0, max_tokens=10))
     stats = llm.analyze(analyzer_spec={"reduce": "none"}, probes=out[0].probes)
@@ -174,13 +175,13 @@ import os
 
 from vllm import SamplingParams
 
-from mia import MiaLLM
+from mia import MiaLLM, config_path
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     llm = MiaLLM(model="microsoft/Phi-3-mini-4k-instruct", worker_name="steer",
-                 config_file="model_configs/activation_steer/Phi-3-mini-4k-instruct.json",
+                 config_file=config_path("activation_steer/Phi-3-mini-4k-instruct.json"),
                  gpu_memory_utilization=0.7, max_model_len=4096)
     steer = {"method": "add_vector", "coefficient": 10}   # overrides the config's steering keys
     sp = SamplingParams(temperature=0.0, max_tokens=100, extra_args={"steer": steer})
@@ -198,10 +199,10 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn MIA_WORKER=hidden_states \
 ```
 
 ```python
-from mia import MiaClient
+from mia import MiaClient, config_path
 
 client = MiaClient(base_url="http://localhost:8770/v1", analyzer_name="hidden_states",
-                   config_file="model_configs/hidden_states/Qwen2-1.5B-Instruct.json")
+                   config_file=config_path("hidden_states/Qwen2-1.5B-Instruct.json"))
 client.generate(messages=[{"role": "user", "content": "The capital of France is"}],
                 model="Qwen/Qwen2-1.5B-Instruct", max_tokens=10, temperature=0.0)
 stats = client.analyze(analyzer_spec={"reduce": "none"})

@@ -2,6 +2,7 @@
 from mia.registry import PluginRegistry
 from mia.llm import MiaLLM
 from mia.client import MiaClient
+from mia.resources import config_path, vector_path
 from mia.workers.qk_capture_worker import QKCaptureWorker
 from mia.workers.steer_worker import SteerWorker
 from mia.workers.hs_capture_worker import HSCaptureWorker
@@ -32,6 +33,8 @@ __all__ = [
     "PluginRegistry",
     "MiaLLM",
     "MiaClient",
+    "config_path",
+    "vector_path",
     "QKCaptureWorker",
     "SteerWorker",
     "HSCaptureWorker",
