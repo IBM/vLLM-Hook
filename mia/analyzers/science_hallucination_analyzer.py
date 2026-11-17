@@ -15,6 +15,7 @@ class ScienceHallucinationAnalyzer:
         """``hook_dir`` holds the disk runs; ``layer_to_heads`` is unused."""
         self.hook_dir = hook_dir
         self._clf = None
+        self._clf_path: Optional[str] = None
         self.default_clf_path: Optional[str] = None
         self.default_model_id: Optional[str] = None
         self._norm_cache: Dict[str, Tuple[torch.Tensor, float]] = {}
@@ -30,17 +31,25 @@ class ScienceHallucinationAnalyzer:
             "model.safetensors.index.json",
             "*.safetensors",
         ])
-        with open(os.path.join(snap, "model.safetensors.index.json")) as f:
-            idx = json.load(f)
+        weight, eps = self._read_final_norm(snap)
+        self._norm_cache[model_id] = (weight, eps)
+        return weight, eps
+
+    @staticmethod
+    def _read_final_norm(snap: str) -> Tuple[torch.Tensor, float]:
+        """``model.norm.weight`` and ``rms_norm_eps`` from a sharded or single-file checkpoint."""
         key = "model.norm.weight"
-        shard = idx["weight_map"][key]
+        index = os.path.join(snap, "model.safetensors.index.json")
+        if os.path.exists(index):
+            with open(index) as f:
+                shard = json.load(f)["weight_map"][key]
+        else:
+            shard = "model.safetensors"
         with safe_open(os.path.join(snap, shard), framework="pt") as f:
             weight = f.get_tensor(key).to(torch.float32)
         with open(os.path.join(snap, "config.json")) as f:
             cfg = json.load(f)
-        eps = float(cfg.get("rms_norm_eps", 1e-5))
-        self._norm_cache[model_id] = (weight, eps)
-        return weight, eps
+        return weight, float(cfg.get("rms_norm_eps", 1e-5))
 
     @staticmethod
     def _apply_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -65,10 +74,11 @@ class ScienceHallucinationAnalyzer:
         clf_path = spec.get("clf_path") or self.default_clf_path
         if clf_path is None:
             raise ValueError("ScienceHallucinationAnalyzer requires analyzer_spec['clf_path'] or analyzer.default_clf_path to be set.")
-        if self._clf is None:
+        if self._clf is None or self._clf_path != clf_path:
             # lazy: optional dependency (joblib)
             import joblib  
             self._clf = joblib.load(clf_path)
+            self._clf_path = clf_path
         clf = self._clf
 
         model_id = spec.get("model_id") or self.default_model_id
