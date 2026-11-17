@@ -37,8 +37,11 @@ jobs:
           cache-dependency-path: requirement.txt
       - name: Install dependencies
         run: |
-          # CPU-only torch first, so pip doesn't download the much larger CUDA build
-          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          # CPU-only torch first, so pip doesn't download the much larger CUDA build.
+          # torchvision and torchaudio must come from the same index: the PyPI builds
+          # expect CUDA torch and fail at import. Versions are the ones vLLM 0.32.0 pins.
+          pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
+            --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirement.txt
           pip uninstall -y torchcodec
           pip install -e . --no-deps
