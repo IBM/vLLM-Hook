@@ -62,9 +62,37 @@ pytest tests/use_cases -m gpu      # boots a real engine for each test model
 Please run the tests relevant to your change and say in the pull request which ones you ran and on what hardware.
 
 
+### Adding files or subpackages
+
+The wheel contains everything under `mia/` automatically. The two repo-root data directories are mapped into the wheel by `force-include` in `pyproject.toml`:
+
+```toml
+[tool.hatch.build.targets.wheel.force-include]
+"model_configs" = "mia/data/model_configs"
+"steering_vectors" = "mia/data/steering_vectors"
+```
+
+After a packaging change, build the wheel and list its contents (`unzip -l dist/*.whl`) to confirm that what you expect is in it.
+
+### Troubleshooting builds
+
+- **`setuptools-scm was unable to detect version`:** the build cannot read git. Check that `.git` is present, the clone is not shallow (`git fetch --tags --unshallow`), and `git describe --tags` works. On an Intel (x86_64) Python running under Rosetta on an Apple Silicon Mac, the `/usr/bin/git` shim fails because `xcrun` is arm64 only. Put a real git first on `PATH` (for example `PATH=/opt/homebrew/bin:$PATH python -m build`), or recreate the environment as arm64.
+- **`Can't parse version from tag`:** the latest tag on the commit has no numeric version. Delete it (`git tag -d <tag>` and `git push origin --delete <tag>`) and tag again.
+- **`'2.5' is not a valid metadata version` from `twine check`:** the `twine` on your `PATH` is too old. Run `python -m twine` from an environment with a current `twine` and `packaging`.
+- **Pinning the version by hand:** `SETUPTOOLS_SCM_PRETEND_VERSION=1.2.3 python -m build` skips git detection. To be used for diagnosis only.
+
+## Submitting a pull request
+
+1. [Fork][fork] and clone the repository.
+2. Create a new branch: `git checkout -b my-branch-name`.
+3. Make your change with signed-off commits, push to your fork and [submit a pull request][pr]. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
+4. Wait for your pull request to be reviewed and merged.
+
 ## AI-assisted and agentic development
 
-AI-assisted and agentic development are allowed. PR owners remain responsible for understanding, testing, and explaining every change they submit. Please do not submit bulk generated code that you cannot explain or validate.
+AI-assisted and agentic development are allowed. PR owners remain responsible for understanding, testing, and explaining every change they submit. Please do not submit bulk generated code that you cannot explain or validate.  PR owners should always sign off using their own credential.
+
+
 
 ## Package name and versions
 
@@ -131,29 +159,3 @@ Rules for tags:
    ```
    Then run [`examples/check_testpypi_install.py`](examples/check_testpypi_install.py) on a Linux GPU machine to check the install. Install the dependencies from real PyPI and the package alone from TestPyPI: `pip install --no-deps --index-url https://test.pypi.org/simple/ vllm-hook==1.0.2`. Using `--extra-index-url` can pull in unrelated broken packages hosted on TestPyPI.
 5. Upload to PyPI: `python -m twine upload dist/*`.
-
-### Adding files or subpackages
-
-The wheel contains everything under `mia/` automatically. The two repo-root data directories are mapped into the wheel by `force-include` in `pyproject.toml`:
-
-```toml
-[tool.hatch.build.targets.wheel.force-include]
-"model_configs" = "mia/data/model_configs"
-"steering_vectors" = "mia/data/steering_vectors"
-```
-
-After a packaging change, build the wheel and list its contents (`unzip -l dist/*.whl`) to confirm that what you expect is in it.
-
-### Troubleshooting builds
-
-- **`setuptools-scm was unable to detect version`:** the build cannot read git. Check that `.git` is present, the clone is not shallow (`git fetch --tags --unshallow`), and `git describe --tags` works. On an Intel (x86_64) Python running under Rosetta on an Apple Silicon Mac, the `/usr/bin/git` shim fails because `xcrun` is arm64 only. Put a real git first on `PATH` (for example `PATH=/opt/homebrew/bin:$PATH python -m build`), or recreate the environment as arm64.
-- **`Can't parse version from tag`:** the latest tag on the commit has no numeric version. Delete it (`git tag -d <tag>` and `git push origin --delete <tag>`) and tag again.
-- **`'2.5' is not a valid metadata version` from `twine check`:** the `twine` on your `PATH` is too old. Run `python -m twine` from an environment with a current `twine` and `packaging`.
-- **Pinning the version by hand:** `SETUPTOOLS_SCM_PRETEND_VERSION=1.2.3 python -m build` skips git detection. To be used for diagnosis only.
-
-## Submitting a pull request
-
-1. [Fork][fork] and clone the repository.
-2. Create a new branch: `git checkout -b my-branch-name`.
-3. Make your change with signed-off commits, push to your fork and [submit a pull request][pr]. Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
-4. Wait for your pull request to be reviewed and merged.
