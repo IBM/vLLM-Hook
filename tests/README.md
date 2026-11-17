@@ -8,6 +8,7 @@ analyzers work correctly with vLLM models.
 ```
 tests/
 ├── conftest.py     shared fixtures, the `gpu` marker and `requires_gpu`
+├── unit/           CPU tests, no engine; CI runs them (`pytest tests -q -m "not gpu"`)
 └── use_cases/      one test per use case — these boot a real engine
 ```
 

@@ -16,9 +16,9 @@ from urllib.parse import quote
 import numpy as np
 import torch
 
-from .aperture_layout import HS_LAYOUT, QK_LAYOUT, QK_SIDECAR_NAME, layout as _layout
+from .aperture_layout import QK_LAYOUT, QK_SIDECAR_NAME, layout as _layout
 from .aperture_run_index import (INDEX_HEADER_KEYS, RUN_ID_KEY, ChainCursor, RunIndexError,
-                                 read_run_index, read_segment, segment_name, segment_paths)
+                                 read_segment, segment_paths)
 from .aperture_trim import (TRIM_ENV as GATHER_TRIM_ENV, TrimError, TrimLog, align_down,
                             floor_row_for_bytes, is_reclaimed, published_cursors, punch_hole,
                             punch_supported, trim_align, trim_chunk_bytes, trim_enabled,
